@@ -200,6 +200,24 @@ __thread u32 __afl_ijon_state = 0;
 __thread u32 __afl_ijon_state_log = 0;
 #endif
 
+/* Divergence scheduler globals */
+#define DIV_SHM_ENV_VAR "__AFL_DIV_SHM_ID"
+#define DIV_MAX_TRACE_LEN (1u << 16)
+#define DIV_BANDIT_SIZE (1u << 16)
+#define DIV_SHM_HEADER_SIZE 64
+
+#include <setjmp.h>
+
+u8 *__afl_div_shm_ptr;
+static u8  __afl_div_enabled;
+
+/* Jump buffer for divergence early return in persistent mode.
+   setjmp is called in the AFL driver before each LLVMFuzzerTestOneInput call.
+   longjmp is called from __sanitizer_cov_trace_pc_guard when the bandit kills.
+   This lets us skip remaining execution without destroying the persistent child. */
+jmp_buf    __afl_div_jmpbuf;
+volatile u8 __afl_div_jmpbuf_valid = 0;
+
 #ifdef __AFL_CODE_COVERAGE
 typedef struct afl_module_info_t afl_module_info_t;
 
@@ -296,6 +314,63 @@ static void (*old_sigterm_handler)(int) = 0;
 /* Running in persistent mode? */
 
 static u8 is_persistent;
+
+/* Cold-path divergence handler called from LLVM-inlined trace logic.
+   Only invoked on the FIRST divergence (hot path is fully inline).
+   Sets shm header fields, checks bandit, and kills if below threshold.
+   Called with the edge_id that diverged and the trace position. */
+void __afl_div_handle_divergence(u32 edge_id, u32 pos) {
+
+  u8 *shm = __afl_div_shm_ptr;
+  if (!shm) return;
+
+  u32 *hdr_threshold   = (u32 *)(shm + 8);
+  u8  *hdr_diverged    = (u8  *)(shm + 12);
+  u8  *hdr_killed      = (u8  *)(shm + 13);
+  u32 *hdr_diverge_pos = (u32 *)(shm + 16);
+  u32 *hdr_diverge_key = (u32 *)(shm + 20);
+
+  u32 *ref_trace = (u32 *)(shm + DIV_SHM_HEADER_SIZE);
+  u8  *bandit    = (u8 *)((u32 *)(shm + DIV_SHM_HEADER_SIZE) +
+                          DIV_MAX_TRACE_LEN * 2);
+
+  *hdr_diverged = 1;
+  *hdr_diverge_pos = pos;
+
+  u32 ref_len = *(u32 *)(shm + 0);
+
+  if (pos < ref_len) {
+
+    /* Mismatch divergence: key from the reference trace at this position */
+    u32 key = ref_trace[pos] & (DIV_BANDIT_SIZE - 1);
+    *hdr_diverge_key = key;
+
+    if (bandit[key] < *hdr_threshold) {
+
+      *hdr_killed = 1;
+
+      if (!is_persistent) {
+
+        _exit(0);
+
+      } else if (__afl_div_jmpbuf_valid) {
+
+        __afl_div_jmpbuf_valid = 0;
+        longjmp(__afl_div_jmpbuf, 1);
+
+      }
+
+    }
+
+  } else {
+
+    /* Length divergence: mutation trace is longer than seed reference */
+    *hdr_diverge_key = 0;
+    /* Don't kill for length divergence (conservative) */
+
+  }
+
+}
 
 /* Are we in sancov mode? */
 
@@ -955,6 +1030,49 @@ static void __afl_map_shm(void) {
 
   }
 
+  /* Map divergence shared memory if enabled */
+  {
+
+    char *div_id_str = getenv(DIV_SHM_ENV_VAR);
+
+    if (div_id_str) {
+
+#ifdef USEMMAP
+      size_t div_shm_size = DIV_SHM_HEADER_SIZE +
+                            DIV_MAX_TRACE_LEN * sizeof(u32) * 2 +
+                            DIV_BANDIT_SIZE;
+      int div_shm_fd = shm_open(div_id_str, O_RDWR, 0600);
+      if (div_shm_fd != -1) {
+
+        __afl_div_shm_ptr =
+            mmap(0, div_shm_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 div_shm_fd, 0);
+        if (__afl_div_shm_ptr == MAP_FAILED) { __afl_div_shm_ptr = NULL; }
+
+      }
+
+#else
+      u32 div_shm_id = atoi(div_id_str);
+      __afl_div_shm_ptr = (u8 *)shmat(div_shm_id, NULL, 0);
+      if (__afl_div_shm_ptr == (void *)-1) { __afl_div_shm_ptr = NULL; }
+#endif
+
+      if (__afl_div_shm_ptr) {
+
+        __afl_div_enabled = 1;
+        if (__afl_debug) {
+
+          fprintf(stderr, "DEBUG: Divergence shm mapped at %p\n",
+                  __afl_div_shm_ptr);
+
+        }
+
+      }
+
+    }
+
+  }
+
 }
 
 /* unmap SHM. */
@@ -1455,6 +1573,18 @@ int __afl_persistent_loop(unsigned int max_cnt) {
 
     memset_noasan(__afl_prev_loc, 0, NGRAM_SIZE_MAX * sizeof(PREV_LOC_T));
 
+    /* Reset divergence state between persistent loop iterations */
+    if (__afl_div_enabled && __afl_div_shm_ptr) {
+
+      u32 *hdr_actual_idx = (u32 *)(__afl_div_shm_ptr + 4);
+      u8  *hdr_diverged   = (u8  *)(__afl_div_shm_ptr + 12);
+      u8  *hdr_killed     = (u8  *)(__afl_div_shm_ptr + 13);
+      *hdr_actual_idx = 0;
+      *hdr_diverged = 0;
+      *hdr_killed = 0;
+
+    }
+
     return 1;
 
   } else {
@@ -1665,15 +1795,101 @@ void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
 
   */
 
+  u32 edge_id = *guard;
+
+  /* NOTE: When called from the divergence LLVM pass, the inline coverage
+     bitmap update has ALREADY been emitted by updateCoverageBitmap().
+     We skip the bitmap increment here to avoid double-counting.
+     When called from non-divergence builds (standard PCGUARD), the inline
+     code also handles bitmap updates, so this function only fires for
+     divergence-enabled builds. */
+
+  /* Divergence: record edge to actual trace and compare with reference */
+  if (__afl_div_enabled && __afl_div_shm_ptr) {
+
+    /* Shared memory layout:
+       [0..63]                          = div_shm_header
+       [64 .. 64+256K)                  = ref_trace[DIV_MAX_TRACE_LEN]
+       [64+256K .. 64+512K)             = actual_trace[DIV_MAX_TRACE_LEN]
+       [64+512K .. 64+512K+64K)         = bandit[DIV_BANDIT_SIZE]          */
+
+    u32 *hdr_ref_len       = (u32 *)(__afl_div_shm_ptr + 0);
+    u32 *hdr_actual_idx    = (u32 *)(__afl_div_shm_ptr + 4);
+    u32 *hdr_threshold     = (u32 *)(__afl_div_shm_ptr + 8);
+    u8  *hdr_diverged      = (u8  *)(__afl_div_shm_ptr + 12);
+    u8  *hdr_killed        = (u8  *)(__afl_div_shm_ptr + 13);
+    u32 *hdr_diverge_pos   = (u32 *)(__afl_div_shm_ptr + 16);
+    u32 *hdr_diverge_key   = (u32 *)(__afl_div_shm_ptr + 20);
+
+    u32 *ref_trace    = (u32 *)(__afl_div_shm_ptr + DIV_SHM_HEADER_SIZE);
+    u32 *actual_trace = ref_trace + DIV_MAX_TRACE_LEN;
+    u8  *bandit       = (u8 *)(actual_trace + DIV_MAX_TRACE_LEN);
+
+    u32 pos = (*hdr_actual_idx)++;
+
+    /* Record edge in actual trace (truncate if over limit) */
+    if (pos < DIV_MAX_TRACE_LEN) { actual_trace[pos] = edge_id; }
+
+    u32 ref_len = *hdr_ref_len;
+
+    if (!*hdr_diverged && ref_len > 0) {
+
+      if (pos < ref_len) {
+
+        if (ref_trace[pos] != edge_id) {
+
+          /* First divergence detected */
+          *hdr_diverged = 1;
+          *hdr_diverge_pos = pos;
+          u32 key = ref_trace[pos] & (DIV_BANDIT_SIZE - 1);
+          *hdr_diverge_key = key;
+
+          if (bandit[key] < *hdr_threshold) {
+
+            *hdr_killed = 1;
+
+            if (!is_persistent) {
+
+              _exit(0);  /* Non-persistent: terminate process */
+
+            } else if (__afl_div_jmpbuf_valid) {
+
+              /* Persistent mode: longjmp back to the driver's setjmp point,
+                 skipping remaining execution. The persistent child stays alive
+                 and can process the next iteration without re-forking. */
+              __afl_div_jmpbuf_valid = 0;
+              longjmp(__afl_div_jmpbuf, 1);
+
+            }
+
+          }
+
+        }
+
+      } else {
+
+        /* Divergence by length: mutation is longer than seed */
+        *hdr_diverged = 1;
+        *hdr_diverge_pos = pos;
+        *hdr_diverge_key = 0;
+        /* Don't kill for length divergence (conservative) */
+
+      }
+
+    }
+
+    return;
+
+  }
+
+  /* Non-divergence fallback: standard bitmap increment.
+     This path only runs in non-divergence builds that somehow
+     call this function (shouldn't happen with current LLVM pass). */
 #if (LLVM_VERSION_MAJOR < 9)
-
-  __afl_area_ptr[*guard]++;
-
+  __afl_area_ptr[edge_id]++;
 #else
-
-  __afl_area_ptr[*guard] =
-      __afl_area_ptr[*guard] + 1 + (__afl_area_ptr[*guard] == 255 ? 1 : 0);
-
+  __afl_area_ptr[edge_id] =
+      __afl_area_ptr[edge_id] + 1 + (__afl_area_ptr[edge_id] == 255 ? 1 : 0);
 #endif
 
 }

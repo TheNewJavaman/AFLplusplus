@@ -57,9 +57,15 @@ extern "C" {
   #include <sys/syscall.h>
 #endif
 
+#include <setjmp.h>
+
 #include "config.h"
 #include "types.h"
 #include "cmplog.h"
+
+/* Divergence early return: defined in afl-compiler-rt.o.c */
+extern jmp_buf     __afl_div_jmpbuf;
+extern volatile u8 __afl_div_jmpbuf_valid;
 
 #ifdef _DEBUG
   #include "hash.h"
@@ -456,12 +462,23 @@ __attribute__((weak)) int LLVMFuzzerRunDriver(
 
         prev_length = length;
 
-        if (unlikely(callback(__afl_fuzz_ptr, length) == -1)) {
+        /* setjmp returns 0 on initial call. If the divergence bandit kills
+           this iteration, longjmp returns non-zero and we skip to the next
+           iteration without destroying the persistent child. */
+        if (setjmp(__afl_div_jmpbuf) == 0) {
 
-          memset_noasan(__afl_area_ptr, 0, __afl_map_size);
-          __afl_area_ptr[0] = 1;
+          __afl_div_jmpbuf_valid = 1;
+
+          if (unlikely(callback(__afl_fuzz_ptr, length) == -1)) {
+
+            memset_noasan(__afl_area_ptr, 0, __afl_map_size);
+            __afl_area_ptr[0] = 1;
+
+          }
 
         }
+
+        __afl_div_jmpbuf_valid = 0;
 
       }
 
@@ -471,12 +488,20 @@ __attribute__((weak)) int LLVMFuzzerRunDriver(
 
     while (__afl_persistent_loop(N)) {
 
-      if (unlikely(callback(__afl_fuzz_ptr, *__afl_fuzz_len) == -1)) {
+      if (setjmp(__afl_div_jmpbuf) == 0) {
 
-        memset_noasan(__afl_area_ptr, 0, __afl_map_size);
-        __afl_area_ptr[0] = 1;
+        __afl_div_jmpbuf_valid = 1;
+
+        if (unlikely(callback(__afl_fuzz_ptr, *__afl_fuzz_len) == -1)) {
+
+          memset_noasan(__afl_area_ptr, 0, __afl_map_size);
+          __afl_area_ptr[0] = 1;
+
+        }
 
       }
+
+      __afl_div_jmpbuf_valid = 0;
 
     }
 

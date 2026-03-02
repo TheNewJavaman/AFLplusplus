@@ -623,6 +623,20 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     }
 
+    /* Disable divergence comparison during calibration. Calibration runs the
+       same input multiple times to detect instability — mid-execution kills
+       would cause false instability. */
+    if (unlikely(afl->div_enabled) && afl->div_state.div_shm) {
+
+      struct div_shm_header *hdr =
+          (struct div_shm_header *)afl->div_state.div_shm;
+      hdr->ref_len = 0;
+      hdr->actual_idx = 0;
+      hdr->diverged = 0;
+      hdr->killed = 0;
+
+    }
+
     u64 cksum;
 
     (void)write_to_testcase(afl, (void **)&use_mem, q->len, 1);
@@ -1477,7 +1491,42 @@ u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
 
   }
 
+  /* Prepare divergence shared memory before execution */
+  if (unlikely(afl->div_enabled)) { div_prepare_execution(afl); }
+
   fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+
+  /* Count edges hit by this execution (always, regardless of div mode) */
+  {
+
+    u8  *bits = afl->fsrv.trace_bits;
+    u32  map_sz = afl->fsrv.map_size;
+    u32  edges = 0;
+    u32  w = map_sz / sizeof(u64);
+    u64 *p = (u64 *)bits;
+
+    for (u32 i = 0; i < w; i++) {
+
+      u64 v = p[i];
+      if (v) {
+
+        u64 lo = v & 0x7f7f7f7f7f7f7f7fULL;
+        u64 nz = (lo + 0x7f7f7f7f7f7f7f7fULL) | v;
+        edges += __builtin_popcountll(nz & 0x8080808080808080ULL);
+
+      }
+
+    }
+
+    for (u32 i = w * sizeof(u64); i < map_sz; i++) {
+
+      if (bits[i]) edges++;
+
+    }
+
+    afl->total_edges_executed += edges;
+
+  }
 
   if (afl->stop_soon) { return 1; }
 
@@ -1507,9 +1556,46 @@ u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
 
   }
 
+  /* Divergence check: skip coverage analysis if mutation was uninteresting
+     (no divergence from seed) or killed by the bandit scheduler. */
+  if (unlikely(afl->div_enabled)) {
+
+    if (div_post_execution(afl)) {
+
+      /* Mutation was skipped (no divergence or killed). Still count the
+         execution for stats purposes. */
+      if (!(afl->stage_cur % afl->stats_update_freq) ||
+          afl->stage_cur + 1 == afl->stage_max) {
+
+        show_stats(afl);
+
+      }
+
+      return 0;
+
+    }
+
+  }
+
   /* This handles FAULT_ERROR for us: */
 
-  afl->queued_discovered += save_if_interesting(afl, out_buf, len, fault);
+  u8 saved = save_if_interesting(afl, out_buf, len, fault);
+  afl->queued_discovered += saved;
+
+  /* Update bandit: reward on corpus add, decay on miss */
+  if (unlikely(afl->div_enabled)) {
+
+    if (saved) {
+
+      div_reward_corpus_add(afl);
+
+    } else {
+
+      div_decay_bandit(afl);
+
+    }
+
+  }
 
   if (!(afl->stage_cur % afl->stats_update_freq) ||
       afl->stage_cur + 1 == afl->stage_max) {

@@ -137,5 +137,30 @@ inline llvm::Value *hoistMapPointerLoad(llvm::Function       &F,
 
 }
 
+/* Load __afl_div_shm_ptr once at function entry into the existing preamble
+   block created by hoistMapPointerLoad.  Must be called AFTER
+   hoistMapPointerLoad so the preamble already exists.
+   Returns the loaded value (or NULL if DivShmPtr is NULL). */
+inline llvm::Value *hoistDivShmPointerLoad(llvm::Function       &F,
+                                            llvm::GlobalVariable *DivShmPtr,
+                                            llvm::Type           *PtrTy) {
+
+  if (!DivShmPtr) return nullptr;
+
+  using namespace llvm;
+
+  /* The preamble is the current entry block (created by hoistMapPointerLoad). */
+  BasicBlock *Preamble = &F.getEntryBlock();
+
+  /* Insert before the terminator (the branch to the old entry). */
+  IRBuilder<> IRB(Preamble->getTerminator());
+  auto       *Load = IRB.CreateLoad(PtrTy, DivShmPtr);
+  setNoSanitizeMetadata(Load);
+  Load->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(F.getContext(), {}));
+
+  return Load;
+
+}
+
 #endif
 

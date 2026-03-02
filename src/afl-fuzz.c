@@ -2676,6 +2676,14 @@ int main(int argc, char **argv_orig, char **envp) {
       afl_shm_init(&afl->shm, afl->fsrv.map_size, afl->non_instrumented_mode,
                    afl->perm, afl->chown_needed ? afl->fsrv.gid : -1);
 
+  /* Initialize divergence scheduler if AFL_DIVERGENCE is set */
+  if (getenv("AFL_DIVERGENCE")) {
+
+    afl->div_enabled = 1;
+    div_init(afl);
+
+  }
+
   #ifdef __AFL_CODE_COVERAGE
   // Initialize pcmap and modmap before any forkserver starts
   if (getenv("AFL_DUMP_PC_MAP")) {
@@ -3074,6 +3082,37 @@ int main(int argc, char **argv_orig, char **envp) {
 
       }
 
+      /* Load divergence trace */
+      if (afl->div_enabled) {
+
+        ZLIBREAD(fr_fd, res, 1, "check div_trace");
+        if (res[0]) {
+
+          u32 div_len;
+          ZLIBREAD(fr_fd, (u8 *)&div_len, sizeof(u32), "div_trace_len");
+          if (div_len > 0 && div_len <= DIV_MAX_TRACE_LEN) {
+
+            q->div_trace = (u32 *)malloc(div_len * sizeof(u32));
+            if (q->div_trace) {
+
+              ZLIBREAD(fr_fd, (u8 *)q->div_trace, div_len * sizeof(u32),
+                       "div_trace");
+              q->div_trace_len = div_len;
+
+            }
+
+          }
+
+          r += 1 + sizeof(u32) + div_len * sizeof(u32);
+
+        } else {
+
+          r += 1;
+
+        }
+
+      }
+
       afl->total_bitmap_size += q->bitmap_size;
       ++afl->total_bitmap_entries;
       update_bitmap_score(afl, q, false);
@@ -3259,6 +3298,40 @@ int main(int argc, char **argv_orig, char **envp) {
     afl->q_testcase_cache =
         ck_alloc(afl->q_testcase_max_cache_entries * sizeof(size_t));
     if (!afl->q_testcase_cache) { PFATAL("malloc failed for cache entries"); }
+
+  }
+
+  /* Capture divergence traces for initial seeds. Seeds that came through
+     perform_dry_run don't have traces yet because calibrate_case doesn't
+     go through the divergence path. Execute each seed once to record its
+     ordered edge trace. Must run after testcase cache init. */
+  if (afl->div_enabled) {
+
+    OKF("DIV: Capturing traces for %u initial seeds...",
+        afl->queued_items);
+
+    for (u32 idx = 0; idx < afl->queued_items; idx++) {
+
+      struct queue_entry *q = afl->queue_buf[idx];
+      if (!q || q->disabled || q->div_trace) continue;
+
+      u8 *buf = queue_testcase_get(afl, q);
+      u32 len = q->len;
+
+      /* Set ref_len=0 so the target just records the trace without
+         comparing (no reference yet). */
+      afl->queue_cur = q;
+      div_prepare_execution(afl);
+
+      (void)write_to_testcase(afl, (void **)&buf, len, 0);
+      (void)fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+
+      div_capture_trace(afl, q);
+
+    }
+
+    afl->queue_cur = NULL;
+    OKF("DIV: Initial trace capture complete.");
 
   }
 
@@ -3956,6 +4029,23 @@ stop_fuzzing:
 
         }
 
+        /* Save divergence trace */
+        if (afl->div_enabled && q->div_trace && q->div_trace_len > 0) {
+
+          ZLIBWRITE(fr_fd, on, 1, "yes_div_trace");
+          ZLIBWRITE(fr_fd, (u8 *)&q->div_trace_len, sizeof(u32),
+                    "div_trace_len");
+          ZLIBWRITE(fr_fd, (u8 *)q->div_trace,
+                    q->div_trace_len * sizeof(u32), "div_trace");
+          w += 1 + sizeof(u32) + q->div_trace_len * sizeof(u32);
+
+        } else if (afl->div_enabled) {
+
+          ZLIBWRITE(fr_fd, off, 1, "no_div_trace");
+          w += 1;
+
+        }
+
       }
 
       ZLIBCLOSE(fr_fd);
@@ -3973,6 +4063,9 @@ stop_fuzzing:
   destroy_queue(afl);
   destroy_extras(afl);
   destroy_custom_mutators(afl);
+
+  if (afl->div_enabled) { div_deinit(afl); }
+
   afl_shm_deinit(&afl->shm);
 
   if (afl->shm_fuzz) {

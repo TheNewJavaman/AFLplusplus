@@ -818,6 +818,13 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
     }
 
+    /* Capture the ordered edge trace for divergence scheduling */
+    if (unlikely(afl->div_enabled)) {
+
+      div_capture_trace(afl, afl->queue_top);
+
+    }
+
     keeping = 1;
 
   }

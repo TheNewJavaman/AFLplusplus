@@ -109,6 +109,7 @@ const char SanCovLowestStackName[] = "__sancov_lowest_stack";
 static const char *skip_nozero;
 static const char *use_threadsafe_counters;
 static const char *ijon_enabled;
+static const char *divergence_enabled;
 
 namespace {
 
@@ -197,6 +198,9 @@ class ModuleSanitizerCoverageAFL
   GlobalVariable *AFLCovMapSize = NULL;
   GlobalVariable *AFLIJONState = NULL;
   Value          *HoistedMapPtr = NULL;
+  GlobalVariable *AFLDivShmPtr = NULL;
+  Value          *HoistedDivShmPtr = NULL;
+  FunctionCallee  DivHandleDivergence;
   ConstantInt    *One = NULL;
   ConstantInt    *Zero = NULL;
   bool            deny_exec = false;
@@ -375,6 +379,7 @@ void ModuleSanitizerCoverageAFL::setupEnvironmentVariables() {
   skip_nozero = getenv("AFL_LLVM_SKIP_NEVERZERO");
   use_threadsafe_counters = getenv("AFL_LLVM_THREADSAFE_INST");
   ijon_enabled = getenv("AFL_LLVM_IJON");
+  divergence_enabled = getenv("AFL_DIVERGENCE");
   if (getenv("AFL_LLVM_DENY_EXEC")) { deny_exec = true; }
 
 }
@@ -656,6 +661,17 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
 
   One = ConstantInt::get(IntegerType::getInt8Ty(Ctx), 1);
   Zero = ConstantInt::get(IntegerType::getInt8Ty(Ctx), 0);
+
+  // Initialize divergence symbols if enabled
+  if (divergence_enabled) {
+
+    AFLDivShmPtr = new GlobalVariable(M, PtrTy, false,
+                                      GlobalValue::ExternalLinkage,
+                                      0, "__afl_div_shm_ptr");
+    DivHandleDivergence = M.getOrInsertFunction(
+        "__afl_div_handle_divergence", VoidTy, Int32Ty, Int32Ty);
+
+  }
 
   // Initialize IJON symbols based on what functions are used
   if (ijon_enabled) { setupIJONSymbols(M, uses_ijon_state); }
@@ -1122,6 +1138,13 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
      already excluded. */
   if (AFLMapPtr) { HoistedMapPtr = hoistMapPointerLoad(F, AFLMapPtr, PtrTy); }
 
+  HoistedDivShmPtr = NULL;
+  if (divergence_enabled && AFLDivShmPtr) {
+
+    HoistedDivShmPtr = hoistDivShmPointerLoad(F, AFLDivShmPtr, PtrTy);
+
+  }
+
   uint32_t special = 0, local_selects = 0;
 
   for (auto &BB : F) {
@@ -1435,6 +1458,171 @@ void ModuleSanitizerCoverageAFL::InjectCoverageAtBlock(Function   &F,
     }
 
     updateCoverageBitmap(IRB, CoverageIndex, HoistedMapPtr);
+
+    /* When divergence mode is enabled, emit inline IR for the hot path
+       (trace recording + divergence check).  Only the cold path (actual
+       first divergence) calls a function (__afl_div_handle_divergence).
+
+       Key optimization: check the `diverged` flag FIRST.  Once divergence
+       has been detected (81% of mutations, typically early), every
+       subsequent BB in that mutation takes the fast path: 1 shm load +
+       1 branch → continuation.  This avoids the actual_idx increment,
+       actual_trace store, and ref_trace comparison on the post-divergence
+       tail (the vast majority of executed BBs). */
+    if (divergence_enabled && HoistedDivShmPtr) {
+
+      /*  Layout constants matching divergence.h / afl-compiler-rt.o.c:
+          offset  0: u32 ref_len
+          offset  4: u32 actual_idx
+          offset 12: u8  diverged
+          header = 64 bytes
+          ref_trace    = header + 0
+          actual_trace = header + MAX_TRACE * 4                         */
+
+      const uint64_t HDR_ACTUAL_IDX_OFF = 4;
+      const uint64_t HDR_DIVERGED_OFF   = 12;
+      const uint64_t HDR_REF_LEN_OFF    = 0;
+      const uint64_t HEADER_SIZE        = 64;
+      const uint64_t MAX_TRACE          = 1u << 16;
+      const uint64_t REF_TRACE_OFF      = HEADER_SIZE;
+      const uint64_t ACTUAL_TRACE_OFF   = HEADER_SIZE + MAX_TRACE * 4;
+
+      /* Load edge_id from the guard (already loaded as CurLoc above) */
+      Value *EdgeId = CurLoc;
+
+      /* Split the current block: everything after the divergence check
+         goes into a continuation block. */
+      BasicBlock *CurBB  = IRB.GetInsertBlock();
+      BasicBlock *ContBB = CurBB->splitBasicBlock(
+          IRB.GetInsertPoint(), "div.cont");
+
+      /* Remove the unconditional branch that splitBasicBlock inserted. */
+      CurBB->getTerminator()->eraseFromParent();
+
+      /* Create intermediate blocks for the inline logic. */
+      BasicBlock *DivEarlyBB = BasicBlock::Create(
+          *C, "div.early", &F, ContBB);
+      BasicBlock *DivMainBB = BasicBlock::Create(
+          *C, "div.main", &F, ContBB);
+      BasicBlock *ColdBB = BasicBlock::Create(
+          *C, "div.cold", &F, ContBB);
+
+      /* --- CurBB: null check on div_shm_ptr → skip if null --- */
+      IRB.SetInsertPoint(CurBB);
+      Value *ShmNull = IRB.CreateICmpEQ(
+          HoistedDivShmPtr,
+          ConstantPointerNull::get(cast<PointerType>(HoistedDivShmPtr->getType())));
+      setNoSanitizeMetadata(cast<Instruction>(ShmNull));
+      IRB.CreateCondBr(ShmNull, ContBB, DivEarlyBB);
+
+      /* --- DivEarlyBB: check diverged flag → fast exit if set ---
+         This is the hot path for post-divergence BBs: 1 load + 1 branch. */
+      IRB.SetInsertPoint(DivEarlyBB);
+      Value *DivergedPtr = IRB.CreateInBoundsGEP(
+          Int8Ty, HoistedDivShmPtr,
+          ConstantInt::get(Int32Ty, HDR_DIVERGED_OFF));
+      auto *DivergedVal = IRB.CreateLoad(Int8Ty, DivergedPtr);
+      setNoSanitizeMetadata(DivergedVal);
+      Value *AlreadyDiverged = IRB.CreateICmpNE(
+          DivergedVal, ConstantInt::get(Int8Ty, 0));
+      setNoSanitizeMetadata(cast<Instruction>(AlreadyDiverged));
+      IRB.CreateCondBr(AlreadyDiverged, ContBB, DivMainBB);
+
+      /* --- DivMainBB: trace recording + ref comparison (pre-divergence) --- */
+      IRB.SetInsertPoint(DivMainBB);
+
+      /* 1. Increment actual_idx to get our position (non-atomic: single
+            thread in persistent mode, no contention). */
+      Value *ActualIdxPtr = IRB.CreateInBoundsGEP(
+          Int8Ty, HoistedDivShmPtr,
+          ConstantInt::get(Int32Ty, HDR_ACTUAL_IDX_OFF));
+      auto *Pos = IRB.CreateLoad(Int32Ty, ActualIdxPtr);
+      setNoSanitizeMetadata(Pos);
+      Value *PosInc = IRB.CreateAdd(Pos, ConstantInt::get(Int32Ty, 1));
+      setNoSanitizeMetadata(cast<Instruction>(PosInc));
+      auto *IdxStore = IRB.CreateStore(PosInc, ActualIdxPtr);
+      setNoSanitizeMetadata(IdxStore);
+
+      /* Pre-compute pos*4 here so it dominates all later blocks. */
+      Value *PosBytes = IRB.CreateShl(
+          Pos, ConstantInt::get(Int32Ty, 2));
+      setNoSanitizeMetadata(cast<Instruction>(PosBytes));
+
+      /* 2. Store edge_id to actual_trace[pos] if pos < MAX_TRACE */
+      Value *InBounds = IRB.CreateICmpULT(
+          Pos, ConstantInt::get(Int32Ty, MAX_TRACE));
+      setNoSanitizeMetadata(cast<Instruction>(InBounds));
+
+      BasicBlock *StoreBB = BasicBlock::Create(
+          *C, "div.store", &F, ColdBB);
+      BasicBlock *RefCheckBB = BasicBlock::Create(
+          *C, "div.check_ref", &F, ColdBB);
+      IRB.CreateCondBr(InBounds, StoreBB, RefCheckBB);
+
+      /* --- StoreBB: store edge to actual trace --- */
+      IRB.SetInsertPoint(StoreBB);
+      Value *PosOff = IRB.CreateAdd(
+          PosBytes,
+          ConstantInt::get(Int32Ty, ACTUAL_TRACE_OFF));
+      setNoSanitizeMetadata(cast<Instruction>(PosOff));
+      Value *ActualSlotPtr = IRB.CreateInBoundsGEP(
+          Int8Ty, HoistedDivShmPtr, PosOff);
+      auto *TraceStore = IRB.CreateStore(EdgeId, ActualSlotPtr);
+      setNoSanitizeMetadata(TraceStore);
+      IRB.CreateBr(RefCheckBB);
+
+      /* --- RefCheckBB: compare pos against ref_len --- */
+      IRB.SetInsertPoint(RefCheckBB);
+      Value *RefLenPtr = IRB.CreateInBoundsGEP(
+          Int8Ty, HoistedDivShmPtr,
+          ConstantInt::get(Int32Ty, HDR_REF_LEN_OFF));
+      auto *RefLen = IRB.CreateLoad(Int32Ty, RefLenPtr);
+      setNoSanitizeMetadata(RefLen);
+
+      /* If ref_len == 0, no reference trace → skip (calibration) */
+      Value *HasRef = IRB.CreateICmpNE(
+          RefLen, ConstantInt::get(Int32Ty, 0));
+      setNoSanitizeMetadata(cast<Instruction>(HasRef));
+
+      BasicBlock *CmpPosBB = BasicBlock::Create(
+          *C, "div.cmp_pos", &F, ColdBB);
+      IRB.CreateCondBr(HasRef, CmpPosBB, ContBB);
+
+      /* --- CmpPosBB: pos >= ref_len → cold (length divergence) --- */
+      IRB.SetInsertPoint(CmpPosBB);
+      Value *PosInRef = IRB.CreateICmpULT(Pos, RefLen);
+      setNoSanitizeMetadata(cast<Instruction>(PosInRef));
+
+      BasicBlock *CmpEdgeBB = BasicBlock::Create(
+          *C, "div.cmp_edge", &F, ColdBB);
+      IRB.CreateCondBr(PosInRef, CmpEdgeBB, ColdBB);
+
+      /* --- CmpEdgeBB: compare ref_trace[pos] with edge_id --- */
+      IRB.SetInsertPoint(CmpEdgeBB);
+      Value *RefPosOff = IRB.CreateAdd(
+          PosBytes,
+          ConstantInt::get(Int32Ty, REF_TRACE_OFF));
+      setNoSanitizeMetadata(cast<Instruction>(RefPosOff));
+      Value *RefSlotPtr = IRB.CreateInBoundsGEP(
+          Int8Ty, HoistedDivShmPtr, RefPosOff);
+      auto *RefEdge = IRB.CreateLoad(Int32Ty, RefSlotPtr);
+      setNoSanitizeMetadata(RefEdge);
+      Value *Mismatch = IRB.CreateICmpNE(RefEdge, EdgeId);
+      setNoSanitizeMetadata(cast<Instruction>(Mismatch));
+      IRB.CreateCondBr(Mismatch, ColdBB, ContBB);
+
+      /* --- ColdBB: call __afl_div_handle_divergence(edge_id, pos) --- */
+      IRB.SetInsertPoint(ColdBB);
+      auto *ColdCall = IRB.CreateCall(
+          DivHandleDivergence, {EdgeId, Pos});
+      setNoSanitizeMetadata(ColdCall);
+      IRB.CreateBr(ContBB);
+
+      /* Continue inserting after the div.cont block's first instruction
+         for any subsequent instrumentation. */
+      IRB.SetInsertPoint(&*ContBB->getFirstInsertionPt());
+
+    }
 
     // done :)
 

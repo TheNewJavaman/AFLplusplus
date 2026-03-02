@@ -524,6 +524,21 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
 
   }
 
+  /* Edge work metrics (always available) */
+  {
+
+    u64 corpus_adds = afl->queued_items - afl->queued_at_start;
+    double edges_per_add = corpus_adds > 0
+                               ? (double)afl->total_edges_executed / corpus_adds
+                               : 0.0;
+    fprintf(f, "total_edges_executed : %llu\n", afl->total_edges_executed);
+    fprintf(f, "edges_per_add        : %.1f\n", edges_per_add);
+
+  }
+
+  /* Divergence scheduler metrics */
+  if (afl->div_enabled) { div_write_stats(afl, f); }
+
   fclose(f);
   rename(fn_tmp, fn_final);
 

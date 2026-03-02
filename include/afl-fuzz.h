@@ -316,7 +316,14 @@ struct queue_entry {
                       /*   1: explored                    */
   fs_meta_t *fs_meta;                   /* Frameshift metadata              */
 
+  u32 *div_trace;                       /* Ordered edge trace (edge IDs)    */
+  u32  div_trace_len;                   /* Number of entries in div_trace   */
+
 };
+
+/* Include divergence.h after struct queue_entry is defined, since
+   div_capture_trace() takes a struct queue_entry* parameter. */
+#include "divergence.h"
 
 struct extra_data {
 
@@ -965,6 +972,15 @@ typedef struct afl_state {
   u8              is_doing_ijon;      /* Flag to track IJON execution state */
   dynamic_shared_access_t
       *ijon_shared_access;         /* IJON shared access for dynamic offset */
+
+  /* Edge counting (always active) */
+  u64                     total_edges_executed; /* Sum of edges across all execs */
+
+  /* Divergence scheduler state */
+  u8                      div_enabled;         /* Divergence mode enabled?   */
+  u8                      div_last_diverged;   /* Did last mutation diverge? */
+  u32                     div_last_diverge_key; /* Bandit key of last div.  */
+  struct divergence_state div_state;
 
 } afl_state_t;
 

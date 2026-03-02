@@ -779,6 +779,7 @@ void destroy_queue(afl_state_t *afl) {
     ck_free(q->testcase_buf);
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    if (q->div_trace) { free(q->div_trace); }
     if (q->skipdet_e) {
 
       if (q->skipdet_e->done_inf_map) ck_free(q->skipdet_e->done_inf_map);
