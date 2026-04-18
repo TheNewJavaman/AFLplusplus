@@ -222,60 +222,112 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
 
 }
 
+/* Forward decl — defined in T6.4 */
+static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
+
+static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
+  coqui_ctx_t *ctx = afl->coqui;
+  CUstream s = (CUstream)b->stream;
+
+  /* H->D */
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_bytes,
+                             b->h_input_bytes, ctx->byte_budget, s));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_offsets,
+                             b->h_offsets, ctx->batch_size * 4, s));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_lens,
+                             b->h_input_lens, ctx->batch_size * 4, s));
+  CUCHECK(cuMemsetD32Async((CUdeviceptr)b->d_novelty, 0,
+                            ctx->batch_size / 32, s));
+  CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
+                           ctx->batch_size * sizeof(coqui_status_t), s));
+
+  /* Launch */
+  void *args[] = {
+    (void *)&b->d_input_bytes,
+    (void *)&b->d_offsets,
+    (void *)&b->d_input_lens,
+    (void *)&b->d_novelty,
+    (void *)&b->d_status,
+  };
+  unsigned grid = ctx->batch_size / 128;
+  CUCHECK(cuLaunchKernel((CUfunction)ctx->cu_kernel,
+                          grid, 1, 1,    /* grid */
+                          128, 1, 1,     /* block */
+                          0, s, args, NULL));
+
+  /* D->H */
+  CUCHECK(cuMemcpyDtoHAsync(b->h_novelty, (CUdeviceptr)b->d_novelty,
+                             ctx->batch_size / 8, s));
+  CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
+                             ctx->batch_size * sizeof(coqui_status_t), s));
+
+  CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
+  ctx->launch_count++;
+}
+
+static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
+  /* T6.4: full implementation. For now: sync the stream so at least
+     kernel completion happens before we reuse buffers. */
+  (void)afl;
+  cuStreamSynchronize((CUstream)b->stream);
+}
+
 u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
+  coqui_ctx_t *ctx = afl->coqui;
+  coqui_batch_t *b = ctx->pending;
 
-  coqui_ctx_t   *ctx = afl->coqui;
-  coqui_batch_t *b   = ctx->pending;
-
-  /* Reject inputs that alone exceed the byte budget. */
   if (len > ctx->byte_budget) {
     ctx->oversized_count++;
     return 0;
   }
 
-  /* 8-byte-align the next write cursor. */
   u32 off = (b->bytes_used + 7) & ~7u;
-
   if (off + len > ctx->byte_budget || b->n_inputs == ctx->batch_size) {
+    /* Launch the full batch async */
+    coqui_launch_batch(afl, b);
 
-    /* Stub launch: silently discard this full batch and flip to the other
-       ping-pong half. Real implementation: async cuLaunchKernel on d_*. */
-    b->n_inputs   = 0;
-    b->bytes_used = 0;
-
-    ctx->launch_count++;
-
-    /* Flip. */
+    /* Flip ping-pong */
     coqui_batch_t *tmp = ctx->pending;
-    ctx->pending   = ctx->executing;
+    ctx->pending = ctx->executing;
     ctx->executing = tmp;
 
-    b   = ctx->pending;
+    b = ctx->pending;
     off = 0;
 
+    /* If the new pending has in-flight work from a previous flip, drain it
+       before reusing */
+    if (b->n_inputs > 0) {
+      coqui_await_and_process(afl, b);
+      b->n_inputs = 0;
+      b->bytes_used = 0;
+    }
   }
 
   memcpy(b->h_input_bytes + off, buf, len);
-  b->h_offsets[b->n_inputs]    = off;
+  b->h_offsets[b->n_inputs] = off;
   b->h_input_lens[b->n_inputs] = len;
   b->n_inputs++;
   b->bytes_used = off + len;
-
   return 0;
-
 }
 
 void coqui_flush_batch(afl_state_t *afl) {
+  coqui_ctx_t *ctx = afl->coqui;
 
-  coqui_ctx_t   *ctx = afl->coqui;
-  coqui_batch_t *b   = ctx->pending;
+  /* Drain the executing batch if it has in-flight work */
+  if (ctx->executing->n_inputs > 0) {
+    coqui_await_and_process(afl, ctx->executing);
+    ctx->executing->n_inputs = 0;
+    ctx->executing->bytes_used = 0;
+  }
 
-  /* Stub: discard pending + executing contents; no real launch. */
-  b->n_inputs             = 0;
-  b->bytes_used           = 0;
-  ctx->executing->n_inputs   = 0;
-  ctx->executing->bytes_used = 0;
-
+  /* Launch + drain pending if partial */
+  if (ctx->pending->n_inputs > 0) {
+    coqui_launch_batch(afl, ctx->pending);
+    coqui_await_and_process(afl, ctx->pending);
+    ctx->pending->n_inputs = 0;
+    ctx->pending->bytes_used = 0;
+  }
 }
 
 u8 coqui_calibrate_one(afl_state_t *afl, u8 *buf, u32 len) {
