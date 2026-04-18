@@ -52,6 +52,18 @@ fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
                                                        afl_forkserver_t *fsrv,
                                                        u32 timeout) {
 
+  if (unlikely(afl->gpu_mode)) {
+
+    /* coqui_mode: no real executor at this layer. Populate trace_bits with
+       trivial coverage (edge 0 hit) so calibrate/trim/sync paths don't
+       flag the input as FSRV_RUN_NOINST. common_fuzz_stuff() handles the
+       actual batched execution via coqui_submit_input(). */
+    memset(afl->fsrv.trace_bits, 0, afl->fsrv.map_size);
+    afl->fsrv.trace_bits[0] = 1;
+    return FSRV_RUN_OK;
+
+  }
+
 #ifdef PROFILING
   static u64      time_spent_start = 0;
   struct timespec spec;
