@@ -25,7 +25,7 @@ This design supersedes the hollow-stub approach of the earlier cuAFL spec by def
 2. **Port on demand.** The day-1 pass set is the minimum needed to produce a working cubin from cjson. Additional transforms from coqui are ported as error-driven needs surface, collaboratively (human-in-the-loop).
 3. **Hard-fail on every unsupported feature.** No silent codegen of incorrect behavior. Gatekeeping passes detect setjmp/longjmp, pthreads, non-trivial inline asm, unsupported intrinsics, and unresolved externals. All errors loud and specific.
 4. **AFL contract fidelity.** Coverage uses AFL's hash formula with bucketing so the broker's re-verification is semantically comparable. The GPU maintains its own virgin map device-side; only the per-input novelty bit crosses PCIe.
-5. **Reuse existing AFL++ infrastructure.** The `-G` instance runs a standard CPU forkserver over the same target the broker runs, via `afl->fsrv` and `afl_fsrv_run_target`. GPU flagged inputs go through the CPU forkserver for real `trace_bits` before `save_if_interesting`. No bypass of AFL internals.
+5. **Reuse existing AFL++ infrastructure.** The `--coqui` instance runs a standard CPU forkserver over the same target the broker runs, via `afl->fsrv` and `afl_fsrv_run_target`. GPU flagged inputs go through the CPU forkserver for real `trace_bits` before `save_if_interesting`. No bypass of AFL internals.
 
 ### 1.3 Test targets (probe-driven development)
 
@@ -162,7 +162,7 @@ User-supplied `--stack-size` is baked into the cubin as a `.conf` sidecar (`<out
 ### 3.4 Transforms explicitly eliminated (never ported)
 
 - `Target` — NVPTX-from-start removes the need.
-- `AddressSpaces` — clang with NVPTX target places globals in addr space 1 automatically (to be verified; re-add if needed).
+- `AddressSpaces` — **confirmed empirically unnecessary**. With `--target=nvptx64-nvidia-cuda`, clang emits globals without explicit `addrspace(1)` decoration in IR, but the NVPTX backend correctly emits `.global .align N .u32 <name>` in PTX and accesses via `ld.global.*`. No transform needed.
 - `LineTrace` — oracle tracing, not in cuAFL scope.
 - `SancovCount` — replaced by new `Coverage` transform.
 
@@ -178,7 +178,15 @@ User-supplied `--stack-size` is baked into the cubin as a `.conf` sidecar (`<out
 
 Each port gets a log entry in `docs/coqui_port_log.md` for reproducibility (§9.4).
 
-### 3.6 Empirical findings on NVPTX native support
+**The process also handles unforeseen issues.** This spec is informed by empirical clang+NVPTX testing (see §3.6), but not every interaction has been validated — e.g., how clang handles C++ struct returns via NVPTX ABI, how it handles `_Float16`/`__bf16` types, whether certain libc macros expand into NVPTX-incompatible inline asm, whether any library in the target's dependency chain emits thread-local-storage access (not supported on NVPTX). These surface as compile errors, runtime traps, or wrong results. The same port-on-demand loop applies: surface the issue, propose a fix (a new transform, a compile flag, or a workaround in the target), user approves, execute. Expect several such issues during libpng bring-up; the loop is designed to absorb them without redesign.
+
+### 3.6 Empirical findings on NVPTX native support (clang 18 + llc 18, confirmed)
+
+**Targeting basics** (verified by compiling and inspecting PTX):
+
+- `--target=nvptx64-nvidia-cuda` without `-x cuda` is the correct invocation. All plain-C functions compile to `.visible .func` in PTX — device-callable, no `__device__` annotation required. The harness's helpers, target library functions, etc. all become device functions by default.
+- Globals: no explicit `addrspace(1)` decoration needed in IR; NVPTX backend auto-places in `.global` in PTX.
+- Kernel marking: `FuzzEntry` adds `!nvvm.annotations = !{!X}` with `!X = !{ptr @__coqui_fuzz_kernel, !"kernel", i32 1}`. NVPTX backend then emits `.visible .entry` for that function. Pattern ported from coqui.
 
 Verified experimentally (`clang --target=nvptx64-nvidia-cuda -O2 -emit-llvm` + `llc -march=nvptx64 -mcpu=sm_75`):
 
@@ -577,7 +585,7 @@ cuMemcpyDtoHAsync(h_status,  d_status,  batch_size * sizeof(coqui_status_t), str
 
 ### 8.1 Coexistence model
 
-The `-G` instance runs TWO executors:
+The `--coqui` instance runs TWO executors:
 1. **Standard AFL CPU forkserver** at `afl->fsrv` — over the ELF target. Used for calibration, trim, sync-in, and post-batch flagged-input re-execution.
 2. **GPU batch executor** at `afl->coqui` — over the cubin. Used for havoc/splice via `common_fuzz_stuff` batch sink.
 
