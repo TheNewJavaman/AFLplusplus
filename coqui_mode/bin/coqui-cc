@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+coqui-cc --- cuAFL compiler driver.
+
+Compiles C/C++ sources targeting NVPTX, runs the coqui pass plugin,
+links the device runtime, produces a .cubin.
+
+Simplified from /coqui/driver/coqui: no --test/--oracle modes, no
+CPU-binary emission, no --heap-size (derived at runtime).
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+PREFIX = os.environ.get("COQUI_PREFIX", "/usr/local")
+RUNTIME_BC = f"{PREFIX}/lib/coqui-cc/runtime.bc"
+PASS_PLUGIN = f"{PREFIX}/lib/coqui-cc/CoquiPassPlugin.so"
+
+
+def detect_arch(device: int) -> str:
+    """Query nvidia-smi for the compute capability of the device."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--id={device}",
+             "--query-gpu=compute_cap", "--format=csv,noheader"],
+            text=True)
+        cap = out.strip().replace(".", "")
+        return f"sm_{cap}"
+    except Exception:
+        return "sm_75"
+
+
+def run(cmd, check=True, **kw):
+    print("[coqui-cc]", " ".join(str(c) for c in cmd), file=sys.stderr)
+    return subprocess.run(cmd, check=check, **kw)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cuAFL compiler driver")
+    ap.add_argument("sources", nargs="+", help="C/C++ source files")
+    ap.add_argument("-o", "--output", required=True, help="output base name")
+    ap.add_argument("-arch", default=None, help="target GPU arch (e.g., sm_75)")
+    ap.add_argument("--device", type=int, default=0, help="device for arch detection")
+    ap.add_argument("--stack-size", type=int, default=16384,
+                    help="real stack bytes per thread (default 16384)")
+    ap.add_argument("--slab-pool-size", type=int, default=0,
+                    help="optional shared slab pool size (0 = disabled)")
+    ap.add_argument("-I", dest="includes", action="append", default=[])
+    ap.add_argument("-D", dest="defines", action="append", default=[])
+    ap.add_argument("--emit-ptx", action="store_true",
+                    help="stop after PTX (don't run ptxas)")
+    ap.add_argument("--emit-bc", action="store_true",
+                    help="stop after IR transform")
+    ap.add_argument("-v", action="store_true", help="verbose")
+    args = ap.parse_args()
+
+    arch = args.arch or detect_arch(args.device)
+    out = Path(args.output)
+    workdir = out.parent / f".{out.name}.build"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Compile each source to .bc with NVPTX target
+    bcs = []
+    for src in args.sources:
+        src_p = Path(src)
+        bc = workdir / (src_p.stem + ".bc")
+        cmd = [
+            "clang", "--target=nvptx64-nvidia-cuda",
+            "-O2", "-emit-llvm", "-c",
+            "-g0", "-fno-stack-protector", "-fno-pic",
+        ]
+        for inc in args.includes:
+            cmd += ["-I", inc]
+        for d in args.defines:
+            cmd += ["-D", d]
+        cmd += [str(src_p), "-o", str(bc)]
+        run(cmd)
+        bcs.append(str(bc))
+
+    # 2. llvm-link with runtime.bc
+    linked_bc = workdir / "linked.bc"
+    run(["llvm-link", *bcs, RUNTIME_BC, "-o", str(linked_bc)])
+
+    # 3. opt with coqui-link pipeline
+    transformed_bc = workdir / "transformed.bc"
+    run([
+        "opt", "-load-pass-plugin", PASS_PLUGIN,
+        "-passes=coqui-link",
+        str(linked_bc), "-o", str(transformed_bc),
+    ])
+
+    if args.emit_bc:
+        print(f"[coqui-cc] BC written: {transformed_bc}")
+        sys.exit(0)
+
+    # 4. llc -> .ptx
+    ptx_path = out.with_suffix(".ptx") if args.emit_ptx else workdir / "out.ptx"
+    run([
+        "llc", f"-march=nvptx64", f"-mcpu={arch}",
+        str(transformed_bc), "-o", str(ptx_path),
+    ])
+
+    if args.emit_ptx:
+        sys.exit(0)
+
+    # 5. ptxas -> .cubin
+    cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
+    run([
+        "ptxas", f"-arch={arch}", "-O1",
+        str(ptx_path), "-o", str(cubin),
+    ])
+
+    # 6. Write .conf sidecar
+    conf = cubin.with_suffix(".conf")
+    conf.write_text(
+        f"stack_size={args.stack_size}\n"
+        f"slab_pool_size={args.slab_pool_size}\n"
+        f"arch={arch}\n"
+    )
+
+    print(f"[coqui-cc] cubin written: {cubin}")
+    print(f"[coqui-cc] config: {conf}")
+
+
+if __name__ == "__main__":
+    main()
