@@ -71,11 +71,14 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->map_size       = afl->fsrv.map_size;
 
   /* Default byte budget: batch_size * max_input_size / 4 (assume 25% fill),
-     with a floor of max_input_size * 256 so tiny batches still work. */
-  ctx->byte_budget = ctx->batch_size * ctx->max_input_size / 4;
-  if (ctx->byte_budget < ctx->max_input_size * 256) {
-    ctx->byte_budget = ctx->max_input_size * 256;
-  }
+     with a floor of max_input_size * 256 so tiny batches still work.
+     Promote to u64 to avoid overflow for large max_input_size, then cap at
+     MAX_ALLOC (1 GB) so ck_alloc never sees an oversized request. */
+  u64 budget = ((u64)ctx->batch_size * ctx->max_input_size) / 4;
+  u64 floor  = (u64)ctx->max_input_size * 256;
+  if (budget < floor) { budget = floor; }
+  if (budget > MAX_ALLOC) { budget = MAX_ALLOC; }
+  ctx->byte_budget = (u32)budget;
 
   alloc_batch_half(&ctx->ping, ctx->batch_size, ctx->byte_budget);
   alloc_batch_half(&ctx->pong, ctx->batch_size, ctx->byte_budget);
