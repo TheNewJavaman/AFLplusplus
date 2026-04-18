@@ -222,7 +222,27 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
 
 }
 
-/* Forward decl — defined in T6.4 */
+/* Translate GPU status fields to an AFL fault code. */
+static u8 translate_gpu_status(coqui_status_t *s) {
+  if (s->asan_error) return FSRV_RUN_CRASH;
+  if (s->ubsan_fatal) return FSRV_RUN_CRASH;
+  if (s->signal) return FSRV_RUN_CRASH;
+  if (s->timeout_flag) return FSRV_RUN_TMOUT;
+  return FSRV_RUN_OK;
+}
+
+/* Run a GPU-flagged or GPU-crashed input through the CPU forkserver for
+   real trace_bits, then call save_if_interesting. */
+static void process_input_via_cpu_fsrv(afl_state_t *afl,
+                                        u8 *input, u32 len) {
+  u32 new_size = write_to_testcase(afl, (void **)&input, len, 0);
+  if (new_size == 0) return;
+
+  u8 cpu_fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+  afl->queued_discovered += save_if_interesting(afl, input, len, cpu_fault);
+}
+
+/* Forward decl — defined below */
 static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
 
 static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
@@ -266,10 +286,63 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
 }
 
 static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
-  /* T6.4: full implementation. For now: sync the stream so at least
-     kernel completion happens before we reuse buffers. */
-  (void)afl;
-  cuStreamSynchronize((CUstream)b->stream);
+  coqui_ctx_t *ctx = afl->coqui;
+  CUstream s = (CUstream)b->stream;
+
+  /* Wait with timeout */
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  unsigned long long deadline_us =
+    ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec)
+    + ctx->batch_timeout_us;
+
+  while (1) {
+    CUresult r = cuStreamQuery(s);
+    if (r == CUDA_SUCCESS) break;
+    if (r != CUDA_ERROR_NOT_READY) {
+      CUCHECK(r);   /* FATAL for unexpected errors */
+    }
+    gettimeofday(&tv, NULL);
+    unsigned long long now =
+      ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
+    if (now >= deadline_us) {
+      WARNF("coqui batch timeout after %llu us; salvaging completed threads",
+            ctx->batch_timeout_us);
+      cuCtxSynchronize();  /* best-effort: drain what we can */
+      break;
+    }
+    usleep(100);
+  }
+
+  /* Process flagged inputs (novelty bitmap bits set) */
+  for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
+    u32 bits = ((u32 *)b->h_novelty)[word_i];
+    while (bits) {
+      u32 bit_pos = __builtin_ctz(bits);
+      bits &= bits - 1;
+      u32 i = word_i * 32 + bit_pos;
+      if (b->h_input_lens[i] == 0) continue;
+
+      u8 *input = b->h_input_bytes + b->h_offsets[i];
+      u32 len = b->h_input_lens[i];
+      process_input_via_cpu_fsrv(afl, input, len);
+    }
+  }
+
+  /* Also process crashes not flagged as novel.
+     A GPU crash may not set new coverage bits but still needs to be saved. */
+  for (u32 i = 0; i < ctx->batch_size; i++) {
+    if (b->h_input_lens[i] == 0) continue;
+    u8 nov = (b->h_novelty[i / 8] >> (i % 8)) & 1;
+    if (nov) continue;   /* already processed above */
+
+    u8 gpu_fault = translate_gpu_status(&b->h_status[i]);
+    if (gpu_fault == FSRV_RUN_CRASH || gpu_fault == FSRV_RUN_TMOUT) {
+      u8 *input = b->h_input_bytes + b->h_offsets[i];
+      u32 len = b->h_input_lens[i];
+      process_input_via_cpu_fsrv(afl, input, len);
+    }
+  }
 }
 
 u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
