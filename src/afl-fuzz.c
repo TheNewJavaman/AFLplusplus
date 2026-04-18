@@ -595,6 +595,14 @@ static void maybe_sync_fuzzers(afl_state_t *afl, u64 cur_time,
 
 }
 
+/* Long-option table for getopt_long().  Short-option string is unchanged. */
+enum { LONGOPT_COQUI = 256 };
+
+static struct option afl_fuzz_long_options[] = {
+    {"coqui", required_argument, NULL, LONGOPT_COQUI},
+    {NULL,    0,                 NULL, 0}
+};
+
 /* Main entry point */
 
 int main(int argc, char **argv_orig, char **envp) {
@@ -719,15 +727,6 @@ int main(int argc, char **argv_orig, char **envp) {
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
   // still available: HjJkqrv
-  enum {
-    LONGOPT_COQUI = 256,   /* > CHAR_MAX so it doesn't collide with short opts */
-  };
-
-  static struct option afl_fuzz_long_options[] = {
-    {"coqui", required_argument, NULL, LONGOPT_COQUI},
-    {NULL,    0,                 NULL, 0}
-  };
-
   while ((opt = getopt_long(
               argc, argv,
               "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:K:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
