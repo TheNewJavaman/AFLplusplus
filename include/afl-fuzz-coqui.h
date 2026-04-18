@@ -42,14 +42,16 @@ typedef struct coqui_batch {
   u8             *h_novelty;      /* 1 bit per slot */
   coqui_status_t *h_status;
 
-  /* Device mirrors (NULL in stub; non-NULL in real GPU). */
-  void *d_input_bytes;
-  void *d_offsets;
-  void *d_input_lens;
-  void *d_coverage;
-  void *d_novelty;
-  void *d_virgin;
-  void *d_status;
+  /* Device buffers (CUdeviceptr values); 0 in stub, non-zero in real GPU. */
+  unsigned long long d_input_bytes;
+  unsigned long long d_offsets;
+  unsigned long long d_input_lens;
+  unsigned long long d_novelty;
+  unsigned long long d_status;
+
+  /* Stream + completion event (CUstream / CUevent) */
+  void *stream;
+  void *completion_event;
 
   /* Fill state. */
   u32 n_inputs;    /* slots used so far */
@@ -70,6 +72,22 @@ typedef struct coqui_ctx {
 
   u64 oversized_count; /* inputs skipped because they alone exceed byte_budget */
   u64 launch_count;    /* batches launched so far */
+
+  /* CUDA handles (populated by coqui_init). void* avoids cuda.h dependency. */
+  void *cu_ctx;       /* CUcontext */
+  void *cu_module;    /* CUmodule */
+  void *cu_kernel;    /* CUfunction */
+  void *stream_a;     /* CUstream */
+  void *stream_b;     /* CUstream */
+
+  /* Device-persistent buffers (CUdeviceptr = u64) */
+  unsigned long long d_virgin_map;
+  unsigned long long d_global_statics_pool;
+  unsigned long long d_slab_pool;
+
+  /* Config from .conf sidecar */
+  unsigned int real_stack_size;
+  unsigned long long batch_timeout_us;
 } coqui_ctx_t;
 
 /* ------------------------------------------------------------------------

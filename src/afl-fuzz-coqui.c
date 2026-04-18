@@ -27,13 +27,15 @@ static void alloc_batch_half(coqui_batch_t *b, u32 batch_size, u32 byte_budget) 
   b->h_novelty     = (u8  *)ck_alloc((batch_size + 7) / 8);
   b->h_status      = (coqui_status_t *)ck_alloc(batch_size * sizeof(coqui_status_t));
 
-  b->d_input_bytes = NULL;
-  b->d_offsets     = NULL;
-  b->d_input_lens  = NULL;
-  b->d_coverage    = NULL;
-  b->d_novelty     = NULL;
-  b->d_virgin      = NULL;
-  b->d_status      = NULL;
+  /* Device buffers (CUdeviceptr); 0 in stub, non-zero in real GPU. */
+  b->d_input_bytes = 0;
+  b->d_offsets     = 0;
+  b->d_input_lens  = 0;
+  b->d_novelty     = 0;
+  b->d_status      = 0;
+
+  b->stream           = NULL;
+  b->completion_event = NULL;
 
   b->n_inputs     = 0;
   b->bytes_used   = 0;
