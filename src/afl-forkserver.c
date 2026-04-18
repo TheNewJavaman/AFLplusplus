@@ -949,15 +949,6 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
 #endif
 
-  if (fsrv->coqui_mode) {
-
-    /* coqui_mode owns execution via the afl-fuzz-coqui.c path.
-       The forkserver is never launched in this mode; coqui_init() was
-       called earlier from afl-fuzz.c main(). */
-    return;
-
-  }
-
   if (!be_quiet) { ACTF("Spinning up the fork server..."); }
 
 #ifdef AFL_PERSISTENT_RECORD
