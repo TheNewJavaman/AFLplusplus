@@ -76,20 +76,6 @@ static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
 
 }
 
-static void free_batch_half(coqui_batch_t *b) {
-
-  /* Note: in CUDA path these are pinned host buffers freed via cuMemFreeHost;
-     kept as stub for functions (coqui_shutdown) that still reference it.
-     Will be replaced by free_batch_half_cuda in T6.3+. */
-  ck_free(b->h_input_bytes);
-  ck_free(b->h_offsets);
-  ck_free(b->h_input_lens);
-  ck_free(b->h_novelty);
-  ck_free(b->h_status);
-
-  memset(b, 0, sizeof(*b));
-
-}
 
 /* ------------------------------------------------------------------------
  * API implementation
@@ -404,27 +390,56 @@ void coqui_flush_batch(afl_state_t *afl) {
 }
 
 u8 coqui_calibrate_one(afl_state_t *afl, u8 *buf, u32 len) {
-
-  (void)buf;
-  (void)len;
-
-  /* Trivial coverage: touch edge 0 so calibration doesn't flag the seed
-     as FSRV_RUN_NOINST. Real implementation runs the input on the GPU. */
-  memset(afl->fsrv.trace_bits, 0, afl->fsrv.map_size);
-  afl->fsrv.trace_bits[0] = 1;
-
+  (void)afl; (void)buf; (void)len;
+  /* Deprecated under the coexistence model (coqui internals spec §8.10).
+     Calibration now flows through AFL's standard fuzz_run_target on the
+     CPU forkserver at afl->fsrv. Kept as a no-op for ABI compatibility;
+     reserved for future GPU-side calibration optimization. */
   return FSRV_RUN_OK;
+}
 
+static void free_batch_half_cuda(coqui_batch_t *b) {
+  if (b->h_input_bytes) cuMemFreeHost(b->h_input_bytes);
+  if (b->h_offsets)     cuMemFreeHost(b->h_offsets);
+  if (b->h_input_lens)  cuMemFreeHost(b->h_input_lens);
+  if (b->h_novelty)     cuMemFreeHost(b->h_novelty);
+  if (b->h_status)      cuMemFreeHost(b->h_status);
+
+  if (b->d_input_bytes) cuMemFree((CUdeviceptr)b->d_input_bytes);
+  if (b->d_offsets)     cuMemFree((CUdeviceptr)b->d_offsets);
+  if (b->d_input_lens)  cuMemFree((CUdeviceptr)b->d_input_lens);
+  if (b->d_novelty)     cuMemFree((CUdeviceptr)b->d_novelty);
+  if (b->d_status)      cuMemFree((CUdeviceptr)b->d_status);
+
+  if (b->completion_event) cuEventDestroy((CUevent)b->completion_event);
+
+  memset(b, 0, sizeof(*b));
 }
 
 void coqui_shutdown(afl_state_t *afl) {
-
   if (!afl->coqui) return;
+  coqui_ctx_t *ctx = afl->coqui;
 
-  free_batch_half(&afl->coqui->ping);
-  free_batch_half(&afl->coqui->pong);
+  /* Drain streams */
+  if (ctx->stream_a) cuStreamSynchronize((CUstream)ctx->stream_a);
+  if (ctx->stream_b) cuStreamSynchronize((CUstream)ctx->stream_b);
 
-  ck_free(afl->coqui);
+  /* Free ping-pong */
+  free_batch_half_cuda(&ctx->ping);
+  free_batch_half_cuda(&ctx->pong);
+
+  /* Free persistent device buffers */
+  if (ctx->d_global_statics_pool)
+    cuMemFree((CUdeviceptr)ctx->d_global_statics_pool);
+  if (ctx->d_slab_pool)
+    cuMemFree((CUdeviceptr)ctx->d_slab_pool);
+
+  /* Destroy streams, unload module, destroy context */
+  if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);
+  if (ctx->stream_b) cuStreamDestroy((CUstream)ctx->stream_b);
+  if (ctx->cu_module) cuModuleUnload((CUmodule)ctx->cu_module);
+  if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
+
+  ck_free(ctx);
   afl->coqui = NULL;
-
 }
