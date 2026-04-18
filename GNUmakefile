@@ -61,6 +61,17 @@ ifdef MSAN_BUILD
   override CFLAGS += -fsanitize=memory -fno-omit-frame-pointer
   override LDFLAGS += -fsanitize=memory
 endif
+# CUDA detection for --coqui mode
+CUDA_PATH ?= /usr/local/cuda
+HAVE_CUDA := $(shell test -d $(CUDA_PATH)/lib64/stubs && echo yes || echo no)
+ifeq "$(HAVE_CUDA)" "yes"
+  CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64/stubs -lcuda
+  $(info [+] CUDA detected at $(CUDA_PATH); linking -lcuda for --coqui support)
+else
+  CUDA_LDFLAGS =
+  $(warning [-] CUDA not found at $(CUDA_PATH)/lib64/stubs; --coqui mode will fail at runtime)
+endif
+
 ifdef NO_SPLICING
   $(info The NO_SPLICING parameter is deprecated)
 endif
@@ -498,7 +509,7 @@ src/afl-sharedmem.o: $(COMM_HDR) src/afl-sharedmem.c include/android-ashmem.h in
 	$(CC) $(CFLAGS) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) -c src/afl-sharedmem.c -o src/afl-sharedmem.o
 
 afl-fuzz: $(COMM_HDR) include/afl-fuzz.h $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o include/cmplog.h include/envs.h | test_x86
-	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm
+	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm $(CUDA_LDFLAGS)
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
