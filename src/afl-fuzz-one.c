@@ -24,6 +24,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "afl-fuzz-coqui.h"
 #include "afl-ijon-min.h"
 #include <string.h>
 #include <limits.h>
@@ -3530,6 +3531,8 @@ havoc_stage:
 
   }
 
+  if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
+
   new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
   if (!splice_cycle) {
@@ -3668,6 +3671,8 @@ retry_splicing:
   plot_profile_data(afl, afl->queue_cur);
 
 #endif
+
+  if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
 
 /* we are through with this queue entry - for this iteration */
 abandon_entry:
@@ -6031,6 +6036,8 @@ pacemaker_fuzzing:
 
            ++afl->stage_cur) { */
 
+      if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
+
       new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
       if (MOpt_globals.is_pilot_mode) {
@@ -6134,6 +6141,8 @@ pacemaker_fuzzing:
 #endif                                                     /* !IGNORE_FINDS */
 
       ret_val = 0;
+
+      if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
 
     abandon_entry:
     abandon_entry_puppet:
