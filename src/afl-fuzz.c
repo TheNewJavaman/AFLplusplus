@@ -1064,7 +1064,8 @@ int main(int argc, char **argv_orig, char **envp) {
 
         }
 
-        if (afl->fsrv.qemu_mode || afl->fsrv.frida_mode || afl->fsrv.nyx_mode) {
+        if (afl->fsrv.qemu_mode || afl->fsrv.frida_mode || afl->fsrv.nyx_mode
+            || afl->unicorn_mode) {
 
           FATAL("--coqui is mutually exclusive with -Q/-O/-U/-X");
 
