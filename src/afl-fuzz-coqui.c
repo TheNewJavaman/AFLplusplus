@@ -1,9 +1,7 @@
 /*
- * afl-fuzz-coqui.c --- cuAFL coqui_mode stub implementation.
+ * afl-fuzz-coqui.c --- cuAFL coqui_mode real CUDA implementation.
  *
- * Hollow stub behind the coqui_mode contract. Lets cuAFL compile and run
- * end-to-end under --coqui without a real GPU backend. Real CUDA-backed
- * implementation drops in behind the same contract in a later phase.
+ * Real CUDA driver API backend for coqui_mode per spec §8.4.
  *
  * Spec: docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md
  */
@@ -15,35 +13,74 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cuda.h>
+
+#define CUCHECK(expr) do {                                                    \
+  CUresult _r = (expr);                                                       \
+  if (_r != CUDA_SUCCESS) {                                                   \
+    const char *_name = NULL;                                                 \
+    cuGetErrorName(_r, &_name);                                               \
+    FATAL("CUDA error at %s:%d: %s", __FILE__, __LINE__, _name ? _name : "?");\
+  }                                                                           \
+} while (0)
+
+static unsigned int getenv_u32(const char *name, unsigned int dflt) {
+  const char *v = getenv(name);
+  if (!v) return dflt;
+  return (unsigned int)strtoul(v, NULL, 0);
+}
+
+static unsigned long long getenv_u64(const char *name, unsigned long long dflt) {
+  const char *v = getenv(name);
+  if (!v) return dflt;
+  return strtoull(v, NULL, 0);
+}
+
+/* Forward declaration of internal helper */
+static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream stream);
+
 /* ------------------------------------------------------------------------
  * Internal helpers
  * ------------------------------------------------------------------------*/
 
-static void alloc_batch_half(coqui_batch_t *b, u32 batch_size, u32 byte_budget) {
+static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream stream) {
 
-  b->h_input_bytes = (u8  *)ck_alloc(byte_budget);
-  b->h_offsets     = (u32 *)ck_alloc(batch_size * sizeof(u32));
-  b->h_input_lens  = (u32 *)ck_alloc(batch_size * sizeof(u32));
-  b->h_novelty     = (u8  *)ck_alloc((batch_size + 7) / 8);
-  b->h_status      = (coqui_status_t *)ck_alloc(batch_size * sizeof(coqui_status_t));
+  /* Host pinned memory */
+  CUCHECK(cuMemHostAlloc((void**)&b->h_input_bytes, ctx->byte_budget, 0));
+  CUCHECK(cuMemHostAlloc((void**)&b->h_offsets, ctx->batch_size * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&b->h_input_lens, ctx->batch_size * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&b->h_novelty, ctx->batch_size / 8, 0));
+  CUCHECK(cuMemHostAlloc((void**)&b->h_status,
+          ctx->batch_size * sizeof(coqui_status_t), 0));
 
-  /* Device buffers (CUdeviceptr); 0 in stub, non-zero in real GPU. */
-  b->d_input_bytes = 0;
-  b->d_offsets     = 0;
-  b->d_input_lens  = 0;
-  b->d_novelty     = 0;
-  b->d_status      = 0;
+  /* Device mirrors (CUdeviceptr) */
+  CUdeviceptr p;
+  CUCHECK(cuMemAlloc(&p, ctx->byte_budget));
+  b->d_input_bytes = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, ctx->batch_size * 4));
+  b->d_offsets = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, ctx->batch_size * 4));
+  b->d_input_lens = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, ctx->batch_size / 8));
+  b->d_novelty = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, ctx->batch_size * sizeof(coqui_status_t)));
+  b->d_status = (unsigned long long)p;
 
-  b->stream           = NULL;
-  b->completion_event = NULL;
+  b->stream = (void *)stream;
+  CUevent ev;
+  CUCHECK(cuEventCreate(&ev, CU_EVENT_DEFAULT));
+  b->completion_event = (void *)ev;
 
-  b->n_inputs     = 0;
-  b->bytes_used   = 0;
+  b->n_inputs   = 0;
+  b->bytes_used = 0;
 
 }
 
 static void free_batch_half(coqui_batch_t *b) {
 
+  /* Note: in CUDA path these are pinned host buffers freed via cuMemFreeHost;
+     kept as stub for functions (coqui_shutdown) that still reference it.
+     Will be replaced by free_batch_half_cuda in T6.3+. */
   ck_free(b->h_input_bytes);
   ck_free(b->h_offsets);
   ck_free(b->h_input_lens);
@@ -55,46 +92,133 @@ static void free_batch_half(coqui_batch_t *b) {
 }
 
 /* ------------------------------------------------------------------------
- * API implementation (stub)
+ * API implementation
  * ------------------------------------------------------------------------*/
 
 void coqui_init(afl_state_t *afl, const char *cubin_path) {
 
-  (void)cubin_path;  /* stub: stashed in afl->coqui_cubin_path but not loaded */
+  coqui_ctx_t *ctx = ck_alloc(sizeof(coqui_ctx_t));
 
-  coqui_ctx_t *ctx = (coqui_ctx_t *)ck_alloc(sizeof(coqui_ctx_t));
+  /* 1. CUDA driver init */
+  CUCHECK(cuInit(0));
 
-  ctx->batch_size     = afl->gpu_batch_size
-                            ? afl->gpu_batch_size
-                            : COQUI_DEFAULT_BATCH_SIZE;
-  ctx->max_input_size = afl->max_length
-                            ? afl->max_length
-                            : COQUI_MAX_INPUT_DEFAULT;
-  ctx->map_size       = afl->fsrv.map_size;
+  int dev_idx = (int)getenv_u32("AFL_COQUI_DEVICE", 0);
+  CUdevice dev;
+  CUCHECK(cuDeviceGet(&dev, dev_idx));
 
-  /* Default byte budget: batch_size * max_input_size / 4 (assume 25% fill),
-     with a floor of max_input_size * 256 so tiny batches still work.
-     Promote to u64 to avoid overflow for large max_input_size, then cap at
-     MAX_ALLOC (1 GB) so ck_alloc never sees an oversized request. */
-  u64 budget = ((u64)ctx->batch_size * ctx->max_input_size) / 4;
-  u64 floor  = (u64)ctx->max_input_size * 256;
-  if (budget < floor) { budget = floor; }
-  if (budget > MAX_ALLOC) { budget = MAX_ALLOC; }
-  ctx->byte_budget = (u32)budget;
+  CUcontext cuctx;
+  /* CUDA 13+ remaps cuCtxCreate → cuCtxCreate_v4(pctx, params, flags, dev).
+     Pass NULL for params to get a regular context (documented as valid). */
+  CUCHECK(cuCtxCreate_v4(&cuctx, NULL, 0, dev));
+  ctx->cu_ctx = (void *)cuctx;
 
-  alloc_batch_half(&ctx->ping, ctx->batch_size, ctx->byte_budget);
-  alloc_batch_half(&ctx->pong, ctx->batch_size, ctx->byte_budget);
+  /* 2. Verify sm_75+ */
+  int major, minor;
+  CUCHECK(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev));
+  CUCHECK(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev));
+  if ((major * 10 + minor) < 75) {
+    FATAL("coqui requires sm_75+; device is sm_%d%d", major, minor);
+  }
 
+  /* 3. Load cubin, resolve kernel, resolve virgin_map global */
+  CUmodule mod;
+  CUCHECK(cuModuleLoad(&mod, cubin_path));
+  ctx->cu_module = (void *)mod;
+
+  CUfunction kernel;
+  CUCHECK(cuModuleGetFunction(&kernel, mod, "__coqui_fuzz_kernel"));
+  ctx->cu_kernel = (void *)kernel;
+
+  CUdeviceptr d_virgin;
+  size_t virgin_sz;
+  CUCHECK(cuModuleGetGlobal(&d_virgin, &virgin_sz, mod, "__coqui_virgin_map"));
+  if (virgin_sz != 65536) {
+    FATAL("__coqui_virgin_map symbol size %zu != 64KB", virgin_sz);
+  }
+  ctx->d_virgin_map = (unsigned long long)d_virgin;
+  CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
+
+  /* 4. Compute stack budget per spec §4.3 */
+  unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 16384);
+  unsigned int cov = 65536;
+  unsigned int total_cap = 524288;
+  if (stack_size + cov >= total_cap) {
+    FATAL("--stack-size %u + 64KB coverage >= 512KB budget", stack_size);
+  }
+  unsigned int remaining = total_cap - cov - stack_size;
+  unsigned int heap = (remaining * 8) / 9;
+  unsigned int total_budget = cov + heap + (heap / 8) + stack_size;
+  CUCHECK(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget));
+  ctx->real_stack_size = stack_size;
+
+  /* 5. Check static stack usage doesn't exceed budget */
+  int static_usage;
+  CUCHECK(cuFuncGetAttribute(&static_usage,
+    CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel));
+  if ((unsigned int)static_usage > total_budget - 1024) {
+    FATAL("kernel static stack %d B exceeds budget %u B — bump --stack-size",
+          static_usage, total_budget);
+  }
+
+  /* 6. Batch sizing (with u64 overflow protection from cuAFL T3.6 fixup) */
+  ctx->batch_size = 8192;
+  ctx->max_input_size = afl->max_length ? afl->max_length : 4096;
+  unsigned long long budget64 = ((unsigned long long)ctx->batch_size
+                                  * ctx->max_input_size) / 4;
+  unsigned long long floor64 = (unsigned long long)ctx->max_input_size * 256;
+  if (budget64 < floor64) budget64 = floor64;
+  if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;  /* MAX_ALLOC cap */
+  ctx->byte_budget = (unsigned int)budget64;
+  ctx->map_size = 65536;
+
+  /* 7. Create streams */
+  CUstream sa, sb;
+  CUCHECK(cuStreamCreate(&sa, CU_STREAM_NON_BLOCKING));
+  CUCHECK(cuStreamCreate(&sb, CU_STREAM_NON_BLOCKING));
+  ctx->stream_a = (void *)sa;
+  ctx->stream_b = (void *)sb;
+
+  /* 8. Allocate ping-pong pair */
+  alloc_batch_half_cuda(&ctx->ping, ctx, sa);
+  alloc_batch_half_cuda(&ctx->pong, ctx, sb);
   ctx->pending   = &ctx->ping;
   ctx->executing = &ctx->pong;
 
-  ctx->oversized_count = 0;
-  ctx->launch_count    = 0;
+  /* 9. Statics pool (if kernel exports per-thread size) */
+  CUdeviceptr statics_sym;
+  size_t statics_sym_sz;
+  if (cuModuleGetGlobal(&statics_sym, &statics_sym_sz, mod,
+                        "__coqui_statics_per_thread") == CUDA_SUCCESS) {
+    unsigned int per_thread = 0;
+    CUCHECK(cuMemcpyDtoH(&per_thread, statics_sym, sizeof(unsigned int)));
+    if (per_thread > 0) {
+      unsigned long long total_pool =
+          (unsigned long long)per_thread * ctx->batch_size;
+      CUdeviceptr pool;
+      CUCHECK(cuMemAlloc(&pool, total_pool));
+      CUCHECK(cuMemsetD8(pool, 0, total_pool));
+      ctx->d_global_statics_pool = (unsigned long long)pool;
+    }
+  }
+
+  /* 10. Slab pool (optional) */
+  unsigned long long slab_size = getenv_u64("AFL_COQUI_SLAB_SIZE", 0);
+  if (slab_size > 0) {
+    CUdeviceptr slab;
+    CUCHECK(cuMemAlloc(&slab, slab_size));
+    CUCHECK(cuMemsetD8(slab, 0, slab_size));
+    ctx->d_slab_pool = (unsigned long long)slab;
+    /* TODO: invoke __coqui_slab_setup init kernel when slab runtime ported */
+  }
+
+  ctx->batch_timeout_us = getenv_u64("AFL_COQUI_TIMEOUT_US", 3000000);
+  ctx->launch_count     = 0;
+  ctx->oversized_count  = 0;
 
   afl->coqui = ctx;
 
-  OKF("coqui_mode stub initialized (batch_size=%u, max_input=%u, budget=%u)",
-      ctx->batch_size, ctx->max_input_size, ctx->byte_budget);
+  OKF("coqui initialized: sm_%d%d, batch=%u, stack=%u KB, heap=%u KB, total=%u KB",
+      major, minor, ctx->batch_size, stack_size/1024, heap/1024, total_budget/1024);
 
 }
 

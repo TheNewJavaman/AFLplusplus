@@ -65,9 +65,11 @@ endif
 CUDA_PATH ?= /usr/local/cuda
 HAVE_CUDA := $(shell test -d $(CUDA_PATH)/lib64/stubs && echo yes || echo no)
 ifeq "$(HAVE_CUDA)" "yes"
+  CUDA_CFLAGS  = -I$(CUDA_PATH)/include
   CUDA_LDFLAGS = -L$(CUDA_PATH)/lib64/stubs -lcuda
   $(info [+] CUDA detected at $(CUDA_PATH); linking -lcuda for --coqui support)
 else
+  CUDA_CFLAGS  =
   CUDA_LDFLAGS =
   $(warning [-] CUDA not found at $(CUDA_PATH)/lib64/stubs; --coqui mode will fail at runtime)
 endif
@@ -509,7 +511,7 @@ src/afl-sharedmem.o: $(COMM_HDR) src/afl-sharedmem.c include/android-ashmem.h in
 	$(CC) $(CFLAGS) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) -c src/afl-sharedmem.c -o src/afl-sharedmem.o
 
 afl-fuzz: $(COMM_HDR) include/afl-fuzz.h $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o include/cmplog.h include/envs.h | test_x86
-	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm $(CUDA_LDFLAGS)
+	$(CC) $(CFLAGS) $(CUDA_CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(SPECIAL_PERFORMANCE) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm $(CUDA_LDFLAGS)
 ifdef IS_IOS
 	@ldid -Sentitlements.plist $@ && echo "[+] Signed $@" || { echo "[-] Failed to sign $@"; }
 endif
