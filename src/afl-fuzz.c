@@ -25,6 +25,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "afl-fuzz-coqui.h"
 #include "afl-ijon-min.h"
 #include "alloc-inl.h"
 #include "cmplog.h"
@@ -670,6 +671,9 @@ int main(int argc, char **argv_orig, char **envp) {
   afl_state_init(afl, map_size);
   afl->debug = debug;
   afl_fsrv_init(&afl->fsrv);
+  if (afl->gpu_mode) {
+    coqui_init(afl, afl->coqui_cubin_path);
+  }
   if (debug) { afl->fsrv.debug = true; }
   read_afl_environment(afl, envp);
   if (afl->shm.map_size) { afl->fsrv.map_size = afl->shm.map_size; }
@@ -1695,6 +1699,13 @@ int main(int argc, char **argv_orig, char **envp) {
 
     usage(argv[0], show_help);
 
+  }
+
+  if (afl->gpu_mode) {
+    if (optind >= argc) {
+      FATAL("--coqui requires a target cubin path after '--'");
+    }
+    afl->coqui_cubin_path = ck_strdup(argv[optind]);
   }
 
   if (unlikely(afl->afl_env.afl_persistent_record)) {
@@ -4028,6 +4039,10 @@ stop_fuzzing:
 
     }
 
+  }
+
+  if (afl->gpu_mode) {
+    coqui_shutdown(afl);
   }
 
   destroy_queue(afl);
