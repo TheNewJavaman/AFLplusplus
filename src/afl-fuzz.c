@@ -32,6 +32,7 @@
 #include <errno.h>
 #include "asanfuzz.h"
 #include "common.h"
+#include <getopt.h>
 #include <limits.h>
 #include <stdlib.h>
 #ifndef USEMMAP
@@ -300,6 +301,8 @@ static void usage(u8 *argv0, int more_help) {
       "  -M/-S id      - distributed mode (-M sets -Z and disables trimming)\n"
       "                  see docs/fuzzing_in_depth.md#c-using-multiple-cores\n"
       "                  for effective recommendations for parallel fuzzing.\n"
+      "  --coqui id    - GPU secondary mode (coqui_mode), sync id analogous to -S.\n"
+      "                  Requires a cubin target produced by coqui-cc.\n"
       "  -F path       - sync to a foreign fuzzer queue directory (requires "
       "-M, can\n"
       "                  be specified up to %u times)\n"
@@ -716,10 +719,20 @@ int main(int argc, char **argv_orig, char **envp) {
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
   // still available: HjJkqrv
-  while ((opt = getopt(
+  enum {
+    LONGOPT_COQUI = 256,   /* > CHAR_MAX so it doesn't collide with short opts */
+  };
+
+  static struct option afl_fuzz_long_options[] = {
+    {"coqui", required_argument, NULL, LONGOPT_COQUI},
+    {NULL,    0,                 NULL, 0}
+  };
+
+  while ((opt = getopt_long(
               argc, argv,
               "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:K:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
-              "uUV:w:WXx:YzZ")) > 0) {
+              "uUV:w:WXx:YzZ",
+              afl_fuzz_long_options, NULL)) > 0) {
 
     switch (opt) {
 
@@ -1034,6 +1047,48 @@ int main(int argc, char **argv_orig, char **envp) {
 
         afl->sync_id = ck_strdup(optarg);
         afl->is_secondary_node = 1;
+        break;
+
+      case LONGOPT_COQUI:                               /* GPU (coqui) sync id */
+
+        if (afl->non_instrumented_mode) {
+
+          FATAL("--coqui is not supported in non-instrumented mode");
+
+        }
+
+        if (afl->fsrv.cs_mode) {
+
+          FATAL("--coqui is not supported in ARM CoreSight mode");
+
+        }
+
+        if (afl->fsrv.qemu_mode || afl->fsrv.frida_mode || afl->fsrv.nyx_mode) {
+
+          FATAL("--coqui is mutually exclusive with -Q/-O/-U/-X");
+
+        }
+
+        if (afl->sync_id) {
+
+          FATAL("Multiple -S/-M/--coqui options not supported");
+
+        }
+
+        if (optarg && *optarg == '-') {
+
+          FATAL(
+              "argument for --coqui started with a dash '-', which is "
+              "used for options");
+
+        }
+
+        afl->sync_id            = ck_strdup(optarg);
+        afl->is_secondary_node  = 1;
+        afl->gpu_mode           = 1;
+        afl->fsrv.coqui_mode    = 1;
+        afl->skip_deterministic = 1;  /* det stages gated off under --coqui */
+
         break;
 
       case 'F':                                         /* foreign sync dir */
