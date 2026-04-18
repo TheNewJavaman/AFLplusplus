@@ -1,15 +1,15 @@
 /*
  * coqui_coverage.c --- AFL hash coverage bucketing + virgin comparison.
  *
- * Bucketing: 256-entry lookup table in __constant__ memory; walks the
- *   64 KB coverage map 8 bytes at a time with zero-chunk early exit.
- * Virgin compare: atomic-OR the bucketed map into shared virgin_map;
- *   set the novelty bit if any new bits appeared.
+ * Bucketing: 256-entry lookup table; 8-byte-stride zero-skip walk.
+ * Virgin compare: C11 atomic_fetch_or lowers to PTX atom.or.b64 on NVPTX.
+ * No inline asm.
  */
 
 #include "coqui_runtime.h"
+#include <stdatomic.h>
 
-/* Bucket lookup table — matches AFL's count_class_lookup16. */
+/* Bucket lookup — matches AFL's count_class_lookup16. */
 __attribute__((section(".const"), used))
 u8 __coqui_count_class_lookup[256] = {
     [0]   = COQUI_BUCKET_0,
@@ -23,7 +23,6 @@ u8 __coqui_count_class_lookup[256] = {
     [128 ... 255] = COQUI_BUCKET_128_UP,
 };
 
-/* Bucket the map in place. Walks 8-byte chunks with zero-skip. */
 void __coqui_classify_counts(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
@@ -45,39 +44,22 @@ void __coqui_classify_counts(u8 *map) {
     }
 }
 
-/* 64-bit atomic OR — PTX atom.or.b64 on global memory. */
-static u64 atom_or_64(u64 *addr, u64 val) {
-    u64 old;
-    __asm__ volatile("atom.or.b64 %0, [%1], %2;"
-                     : "=l"(old) : "l"(addr), "l"(val));
-    return old;
-}
-
-/* 32-bit atomic OR — for the novelty bitmap. */
-static u32 atom_or_32(u32 *addr, u32 val) {
-    u32 old;
-    __asm__ volatile("atom.or.b32 %0, [%1], %2;"
-                     : "=r"(old) : "l"(addr), "r"(val));
-    return old;
-}
-
-/* Compare the thread's bucketed map against the shared virgin map.
-   Set the novelty bit for this thread if any new bits appeared. */
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
+    _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
-    u64 *v64 = (u64 *)virgin;
     const u32 n = COQUI_COV_MAP_SIZE / 8;
 
     int novel = 0;
     for (u32 i = 0; i < n; i++) {
         u64 mine = m64[i];
         if (mine == 0) continue;
-        u64 was = atom_or_64(&v64[i], mine);
+        u64 was = atomic_fetch_or_explicit(&v64[i], mine, memory_order_relaxed);
         if (mine & ~was) { novel = 1; }
     }
 
     if (novel) {
         u32 tid = __coqui_fuzz_tid();
-        atom_or_32(&novelty_bitmap[tid >> 5], 1u << (tid & 31u));
+        _Atomic u32 *nov32 = (_Atomic u32 *)&novelty_bitmap[tid >> 5];
+        atomic_fetch_or_explicit(nov32, 1u << (tid & 31u), memory_order_relaxed);
     }
 }

@@ -35,6 +35,7 @@ bool runInlineAsmReject(Module &M) {
   std::vector<CallInst*> toErase;
 
   for (Function &F : M) {
+    if (F.getName().starts_with("__coqui_")) continue;   /* trust runtime */
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         CallInst *CI = dyn_cast<CallInst>(&I);

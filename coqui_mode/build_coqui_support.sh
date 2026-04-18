@@ -24,7 +24,11 @@ for f in coqui_runtime coqui_coverage coqui_memory coqui_asan; do
 done
 
 echo "[*] Linking runtime bitcode..."
-llvm-link "$COQUI_DIR/runtime/build/"*.bc -o "$COQUI_DIR/runtime/build/runtime.bc"
+llvm-link "$COQUI_DIR/runtime/build/coqui_runtime.bc" \
+          "$COQUI_DIR/runtime/build/coqui_coverage.bc" \
+          "$COQUI_DIR/runtime/build/coqui_memory.bc" \
+          "$COQUI_DIR/runtime/build/coqui_asan.bc" \
+          -o "$COQUI_DIR/runtime/build/runtime.bc"
 
 echo "[*] Install..."
 install -m 755 "$COQUI_DIR/bin/coqui-cc" "$PREFIX/bin/coqui-cc"
