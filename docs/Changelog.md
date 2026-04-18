@@ -4,6 +4,13 @@
   release of the tool. See README.md for the general instruction manual.
 
 
+### Version ++cuAFL (dev)
+  - Added `--coqui <sync_id>` flag: runs afl-fuzz as a GPU secondary
+    (coqui_mode). Currently ships a hollow stub; real GPU backend lands
+    in a follow-up phase. See
+    docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md.
+
+
 ### Version ++4.40c (release)
   - afl-fuzz:
     - FrameShift integrated and enabled by default, disable with
