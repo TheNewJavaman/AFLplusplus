@@ -155,6 +155,9 @@ extern s16 interesting_16[INTERESTING_8_LEN + INTERESTING_16_LEN];
 extern s32
     interesting_32[INTERESTING_8_LEN + INTERESTING_16_LEN + INTERESTING_32_LEN];
 
+/* Forward declaration — full type in afl-fuzz-coqui.h. */
+struct coqui_ctx;
+
 struct tainted {
 
   u32             pos;
@@ -679,6 +682,11 @@ typedef struct afl_state {
       cycle_schedules,                  /* cycle power schedules?           */
       old_seed_selection,               /* use vanilla afl seed selection   */
       reinit_table;                     /* reinit the queue weight table    */
+
+  u8               gpu_mode;         /* 1 if --coqui was given */
+  struct coqui_ctx *coqui;           /* opaque coqui_mode context, NULL otherwise */
+  u32              gpu_batch_size;   /* default 8192, tunable */
+  char            *coqui_cubin_path; /* path to cubin from CLI trailing arg */
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
