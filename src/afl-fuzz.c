@@ -1702,9 +1702,28 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (afl->gpu_mode) {
     if (optind >= argc) {
-      FATAL("--coqui requires a target cubin path after '--'");
+      FATAL("--coqui requires a target ELF path after '--'");
     }
-    afl->coqui_cubin_path = ck_strdup(argv[optind]);
+
+    /* Resolve cubin companion path */
+    const char *env_cubin = getenv("AFL_COQUI_CUBIN");
+    if (env_cubin) {
+      afl->coqui_cubin_path = ck_strdup((u8 *)env_cubin);
+    } else {
+      /* Convention: <elf>.cubin */
+      size_t elf_len = strlen(argv[optind]);
+      char *path = ck_alloc(elf_len + 7);  /* ".cubin\0" = 7 bytes */
+      memcpy(path, argv[optind], elf_len);
+      memcpy(path + elf_len, ".cubin", 7);
+      afl->coqui_cubin_path = path;
+    }
+
+    /* Verify cubin exists */
+    if (access(afl->coqui_cubin_path, R_OK) != 0) {
+      FATAL("--coqui: cubin not found at '%s' (set AFL_COQUI_CUBIN to override)",
+            afl->coqui_cubin_path);
+    }
+
     coqui_init(afl, afl->coqui_cubin_path);
   }
 
