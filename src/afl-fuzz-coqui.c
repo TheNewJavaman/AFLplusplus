@@ -190,7 +190,11 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->pending   = &ctx->ping;
   ctx->executing = &ctx->pong;
 
-  /* 9. Statics pool (if kernel exports per-thread size) */
+  /* 9. Statics pool — allocate AND bind to the cubin's pool-base symbol.
+   *    StaticGlobals pass emits per-thread accesses as `pool_base + tid * size + offset`,
+   *    where `pool_base` is the extern global `__coqui_global_statics_pool_base`.
+   *    We allocate the backing storage here AND write its device address into
+   *    that symbol so the kernel can compute correct per-thread addresses. */
   CUdeviceptr statics_sym;
   size_t statics_sym_sz;
   if (cuModuleGetGlobal(&statics_sym, &statics_sym_sz, mod,
@@ -204,6 +208,25 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
       CUCHECK(cuMemAlloc(&pool, total_pool));
       CUCHECK(cuMemsetD8(pool, 0, total_pool));
       ctx->d_global_statics_pool = (unsigned long long)pool;
+
+      /* Bind: write `pool` (a CUdeviceptr) into the kernel's
+       * `__coqui_global_statics_pool_base` symbol so device-side accesses
+       * see the correct base. The symbol is declared as `ptr` (8 bytes). */
+      CUdeviceptr pool_base_sym;
+      size_t pool_base_sz;
+      CUresult br = cuModuleGetGlobal(&pool_base_sym, &pool_base_sz, mod,
+                                       "__coqui_global_statics_pool_base");
+      if (br != CUDA_SUCCESS) {
+        FATAL("StaticGlobals pool allocated but kernel exports no "
+              "__coqui_global_statics_pool_base symbol — pass/runtime mismatch");
+      }
+      if (pool_base_sz != sizeof(CUdeviceptr)) {
+        FATAL("__coqui_global_statics_pool_base symbol size %zu != %zu",
+              pool_base_sz, sizeof(CUdeviceptr));
+      }
+      CUCHECK(cuMemcpyHtoD(pool_base_sym, &pool, sizeof(CUdeviceptr)));
+      OKF("coqui statics pool: %llu bytes, bound to __coqui_global_statics_pool_base",
+          total_pool);
     }
   }
 
