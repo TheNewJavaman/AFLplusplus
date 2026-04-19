@@ -42,7 +42,12 @@ void __coqui_memory_init(void) {
     hdr->bump_top  = HEAP_HDR_SIZE;
 }
 
-void *__coqui_malloc(unsigned long size) {
+/* The actual allocator lives in __coqui_malloc_raw / __coqui_free_raw so that
+ * the Asan pass's bulk RAUW (__coqui_malloc → __coqui_asan_malloc) does not
+ * rewrite calls inside the allocator implementation itself. The asan-internal
+ * redirect in the pass rewires __coqui_asan_malloc's call from __coqui_malloc
+ * to __coqui_malloc_raw, so all paths terminate at _raw with no recursion. */
+void *__coqui_malloc_raw(unsigned long size) {
     if (size == 0) size = 1;
     u32 need = align8((u32)size) + BLOCK_HDR_SIZE;
     if (need < HEAP_MIN_ALLOC + BLOCK_HDR_SIZE) need = HEAP_MIN_ALLOC + BLOCK_HDR_SIZE;
@@ -76,7 +81,7 @@ void *__coqui_malloc(unsigned long size) {
     return block + BLOCK_HDR_SIZE;
 }
 
-void __coqui_free(void *ptr) {
+void __coqui_free_raw(void *ptr) {
     if (!ptr) return;
 
     u8 *block = (u8 *)ptr - BLOCK_HDR_SIZE;
@@ -102,6 +107,18 @@ void __coqui_free(void *ptr) {
 
     *(void **)((u8 *)block + BLOCK_HDR_SIZE) = cur;
     *prev_next = block;
+}
+
+/* Public allocator names. After the Asan pass's RAUW these have no callers
+ * (every __coqui_malloc/__coqui_free site is rewritten to the asan version)
+ * and the bodies are dropped from the linked module. They remain here as the
+ * source-level entry points users / libc shims call before the pass runs. */
+void *__coqui_malloc(unsigned long size) {
+    return __coqui_malloc_raw(size);
+}
+
+void __coqui_free(void *ptr) {
+    __coqui_free_raw(ptr);
 }
 
 /* Internal byte-wise memset / memcpy for runtime use. User-facing memcpy/memset

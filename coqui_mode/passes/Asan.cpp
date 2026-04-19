@@ -218,9 +218,59 @@ bool runAsan(Module &M) {
     errs() << "[coqui-asan] Instrumented " << LoadCount << " load(s) and "
            << StoreCount << " store(s) (" << SkipCount << " skipped)\n";
 
-  // ── Phase 2: RAUW allocators (after instrumentation so the instrumented
-  //             code already calls __coqui_asan_malloc/__coqui_asan_free;
-  //             the RAUW here covers any remaining direct references). ──────
+  // ── Phase 2: RAUW allocators with bootstrap protection. ────────────────────
+  //
+  // Naive RAUW replaces __coqui_malloc → __coqui_asan_malloc EVERYWHERE,
+  // including the call FROM __coqui_asan_malloc TO __coqui_malloc, causing
+  // infinite recursion at runtime. Coqui's pattern: clone the raw allocator
+  // to __coqui_*_raw, redirect asan-internal calls to the clone, THEN do the
+  // global RAUW. Asan-internal functions (allocator implementations + check
+  // helpers) are on a small allowlist.
+
+  static const char *kAsanInternal[] = {
+      "__coqui_asan_malloc",
+      "__coqui_asan_free",
+      "__coqui_asan_check_load_1",
+      "__coqui_asan_check_load_2",
+      "__coqui_asan_check_load_4",
+      "__coqui_asan_check_load_8",
+      "__coqui_asan_check_store_1",
+      "__coqui_asan_check_store_2",
+      "__coqui_asan_check_store_4",
+      "__coqui_asan_check_store_8",
+  };
+
+  // For each allocator we'll RAUW: declare the _raw alias as a separate
+  // function declaration with the same type, then redirect calls inside
+  // the asan-internal functions to use _raw. The alias resolves at link
+  // time to the same symbol the runtime defines as __coqui_*_raw —
+  // for v1 we'll just have the runtime expose __coqui_malloc as the raw
+  // implementation under both names via a thin wrapper.
+  auto redirectInternalCalls = [&](StringRef OldName, StringRef RawName) {
+    Function *OldF = M.getFunction(OldName);
+    if (!OldF) return;
+    Function *RawF = M.getFunction(RawName);
+    if (!RawF) {
+      RawF = cast<Function>(
+        M.getOrInsertFunction(RawName, OldF->getFunctionType()).getCallee());
+    }
+    for (const char *InternalName : kAsanInternal) {
+      Function *F = M.getFunction(InternalName);
+      if (!F || F->isDeclaration()) continue;
+      for (BasicBlock &BB : *F) {
+        for (Instruction &I : BB) {
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI) continue;
+          if (CI->getCalledFunction() == OldF) {
+            CI->setCalledFunction(RawF);
+          }
+        }
+      }
+    }
+  };
+
+  redirectInternalCalls("__coqui_malloc", "__coqui_malloc_raw");
+  redirectInternalCalls("__coqui_free",   "__coqui_free_raw");
 
   bool AllocChanged = false;
   AllocChanged |= rawReplace(M, "__coqui_malloc", "__coqui_asan_malloc");
