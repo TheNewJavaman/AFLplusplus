@@ -337,7 +337,21 @@ static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     if (now >= deadline_us) {
       WARNF("coqui batch timeout after %llu us; salvaging completed threads",
             ctx->batch_timeout_us);
-      cuCtxSynchronize();  /* best-effort: drain what we can */
+      /* Best-effort drain. If the kernel actually faulted (one thread hit
+       * an OOB) the timeout fires because the kernel never completes —
+       * cuCtxSynchronize then returns the underlying error. Surface it
+       * loudly: a subsequent silent-poisoned-context failure later would
+       * look like an ILLEGAL_ADDRESS at cuStreamQuery in the *next* batch,
+       * which is much harder to diagnose. */
+      CUresult sync_r = cuCtxSynchronize();
+      if (sync_r != CUDA_SUCCESS) {
+        const char *en = NULL;
+        cuGetErrorName(sync_r, &en);
+        FATAL("coqui timeout-recovery cuCtxSynchronize failed: %s — "
+              "kernel probably hit a real GPU fault (likely OOB or trap "
+              "in a thread that was the slowest in the batch). Re-run "
+              "under compute-sanitizer to locate.", en ? en : "?");
+      }
       break;
     }
     usleep(100);
