@@ -271,8 +271,12 @@ static void process_input_via_cpu_fsrv(afl_state_t *afl,
   afl->queued_discovered += save_if_interesting(afl, input, len, cpu_fault);
 }
 
-/* Forward decl — defined below */
-static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
+/* Forward decl — defined below. Returns 1 if the CUDA context was reset
+ * (caller's `ctx` / `b` snapshots are stale; re-fetch from afl->coqui
+ * and abandon the current ping-pong operation). Returns 0 on normal
+ * completion. */
+static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
+static void coqui_force_reset(afl_state_t *afl, const char *cubin_path);
 
 static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
@@ -314,48 +318,71 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   ctx->launch_count++;
 }
 
-static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
+static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
 
-  /* Wait with timeout */
+  /* Two-phase bounded wait with seed culling. Coqui's strategy (driver
+   * 2248-2256): when a batch times out, the culprit is usually a single
+   * pathological input; deprioritize the queue entry it came from so the
+   * same mutations aren't retried. Then grant extra time for the kernel to
+   * finish naturally (cuCtxSynchronize-style drain) bounded by a hard
+   * ceiling that forces a FATAL instead of an open-ended block. */
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  unsigned long long deadline_us =
-    ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec)
-    + ctx->batch_timeout_us;
+  unsigned long long start_us =
+    ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
+  unsigned long long cull_deadline_us = start_us + ctx->batch_timeout_us;
+  /* Hard ceiling: if the kernel hasn't finished 5s after culling, assume an
+   * infinite loop and force-reset the context (kills the kernel). Reset
+   * costs ~1s (cuCtxDestroy + cuCtxCreate + cuModuleLoad + allocs), which
+   * is cheaper than waiting minutes for a pathological kernel to finish. */
+  unsigned long long hard_deadline_us = cull_deadline_us + 5000000ULL;
 
+  int culled = 0;
   while (1) {
     CUresult r = cuStreamQuery(s);
     if (r == CUDA_SUCCESS) break;
     if (r != CUDA_ERROR_NOT_READY) {
-      CUCHECK(r);   /* FATAL for unexpected errors */
+      CUCHECK(r);   /* genuine GPU fault */
     }
     gettimeofday(&tv, NULL);
     unsigned long long now =
       ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
-    if (now >= deadline_us) {
-      WARNF("coqui batch timeout after %llu us; salvaging completed threads",
-            ctx->batch_timeout_us);
-      /* Best-effort drain. If the kernel actually faulted (one thread hit
-       * an OOB) the timeout fires because the kernel never completes —
-       * cuCtxSynchronize then returns the underlying error. Surface it
-       * loudly: a subsequent silent-poisoned-context failure later would
-       * look like an ILLEGAL_ADDRESS at cuStreamQuery in the *next* batch,
-       * which is much harder to diagnose. */
-      CUresult sync_r = cuCtxSynchronize();
-      if (sync_r != CUDA_SUCCESS) {
-        const char *en = NULL;
-        cuGetErrorName(sync_r, &en);
-        FATAL("coqui timeout-recovery cuCtxSynchronize failed: %s — "
-              "kernel probably hit a real GPU fault (likely OOB or trap "
-              "in a thread that was the slowest in the batch). Re-run "
-              "under compute-sanitizer to locate.", en ? en : "?");
+
+    if (!culled && now >= cull_deadline_us) {
+      WARNF("coqui batch timeout after %llu us — disabling queue entry "
+            "'%s' and extending wait by 15s",
+            ctx->batch_timeout_us,
+            afl->queue_cur ? (const char *)afl->queue_cur->fname : "(none)");
+      if (afl->queue_cur) {
+        /* Hard-skip from future selection. `disabled` sets weight=0 and
+         * perf_score=0 in the scheduler, so AFL bypasses this entry
+         * entirely. fuzz_level bump is kept as a secondary signal. */
+        afl->queue_cur->disabled = 1;
+        afl->queue_cur->fuzz_level += 1000;
       }
-      break;
+      culled = 1;
+      continue;
     }
-    usleep(100);
+
+    if (now >= hard_deadline_us) {
+      /* Kernel still running after cull + grace period. Force-kill via
+       * context destroy and rebuild: we need the kernel dead NOW so the
+       * queue entry we culled can't keep blocking throughput. Any pending
+       * work in this batch is lost; caller must re-fetch ctx pointers. */
+      WARNF("coqui kernel stuck past %llu us — force-resetting CUDA context "
+            "to kill runaway kernel. In-flight inputs lost.",
+            (hard_deadline_us - start_us));
+      char *cubin_path = ck_strdup(afl->coqui_cubin_path);
+      coqui_force_reset(afl, cubin_path);
+      ck_free(cubin_path);
+      return 1;
+    }
+
+    usleep(1000);   /* 1ms poll — matches coqui driver */
   }
+  (void)ctx;  /* silence unused-after-reset-path warnings */
 
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
@@ -386,6 +413,8 @@ static void coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       process_input_via_cpu_fsrv(afl, input, len);
     }
   }
+
+  return 0;
 }
 
 u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
@@ -413,7 +442,12 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
     /* If the new pending has in-flight work from a previous flip, drain it
        before reusing */
     if (b->n_inputs > 0) {
-      coqui_await_and_process(afl, b);
+      if (coqui_await_and_process(afl, b) == 1) {
+        /* Context was reset under us; ctx/b are stale. Drop this input —
+         * the context is now functional but the old batch pointers are
+         * freed. Caller (havoc loop) will retry on the next iteration. */
+        return 0;
+      }
       b->n_inputs = 0;
       b->bytes_used = 0;
     }
@@ -432,7 +466,7 @@ void coqui_flush_batch(afl_state_t *afl) {
 
   /* Drain the executing batch if it has in-flight work */
   if (ctx->executing->n_inputs > 0) {
-    coqui_await_and_process(afl, ctx->executing);
+    if (coqui_await_and_process(afl, ctx->executing) == 1) return;
     ctx->executing->n_inputs = 0;
     ctx->executing->bytes_used = 0;
   }
@@ -440,7 +474,7 @@ void coqui_flush_batch(afl_state_t *afl) {
   /* Launch + drain pending if partial */
   if (ctx->pending->n_inputs > 0) {
     coqui_launch_batch(afl, ctx->pending);
-    coqui_await_and_process(afl, ctx->pending);
+    if (coqui_await_and_process(afl, ctx->pending) == 1) return;
     ctx->pending->n_inputs = 0;
     ctx->pending->bytes_used = 0;
   }
@@ -453,6 +487,36 @@ u8 coqui_calibrate_one(afl_state_t *afl, u8 *buf, u32 len) {
      CPU forkserver at afl->fsrv. Kept as a no-op for ABI compatibility;
      reserved for future GPU-side calibration optimization. */
   return FSRV_RUN_OK;
+}
+
+/* Force teardown + rebuild for the stuck-kernel path. Destroys the CUDA
+ * context unconditionally (which kills the runaway kernel, all streams, and
+ * all context-bound device memory), frees host pinned memory (process-scoped,
+ * so safe post-destroy), then rebuilds via coqui_init. Does NOT call the
+ * regular coqui_shutdown because that cuStreamSynchronizes the stuck streams
+ * and would block forever. */
+static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
+  if (!afl->coqui) return;
+  coqui_ctx_t *ctx = afl->coqui;
+
+  if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
+
+  /* Host pinned buffers are independent of context lifecycle. */
+  if (ctx->ping.h_input_bytes) cuMemFreeHost(ctx->ping.h_input_bytes);
+  if (ctx->ping.h_offsets)     cuMemFreeHost(ctx->ping.h_offsets);
+  if (ctx->ping.h_input_lens)  cuMemFreeHost(ctx->ping.h_input_lens);
+  if (ctx->ping.h_novelty)     cuMemFreeHost(ctx->ping.h_novelty);
+  if (ctx->ping.h_status)      cuMemFreeHost(ctx->ping.h_status);
+  if (ctx->pong.h_input_bytes) cuMemFreeHost(ctx->pong.h_input_bytes);
+  if (ctx->pong.h_offsets)     cuMemFreeHost(ctx->pong.h_offsets);
+  if (ctx->pong.h_input_lens)  cuMemFreeHost(ctx->pong.h_input_lens);
+  if (ctx->pong.h_novelty)     cuMemFreeHost(ctx->pong.h_novelty);
+  if (ctx->pong.h_status)      cuMemFreeHost(ctx->pong.h_status);
+
+  ck_free(ctx);
+  afl->coqui = NULL;
+
+  coqui_init(afl, cubin_path);
 }
 
 static void free_batch_half_cuda(coqui_batch_t *b) {
