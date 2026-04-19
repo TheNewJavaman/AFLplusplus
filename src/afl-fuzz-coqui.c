@@ -392,14 +392,19 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
 
     if (!culled && now >= cull_deadline_us) {
       WARNF("coqui batch timeout after %llu us — disabling queue entry "
-            "'%s' and extending wait by 15s",
+            "'%s' and extending wait by 5s",
             ctx->batch_timeout_us,
             afl->queue_cur ? (const char *)afl->queue_cur->fname : "(none)");
       if (afl->queue_cur) {
-        /* Hard-skip from future selection. `disabled` sets weight=0 and
-         * perf_score=0 in the scheduler, so AFL bypasses this entry
-         * entirely. fuzz_level bump is kept as a secondary signal. */
+        /* Hard skip from scheduling. Also set exec_us so the information
+         * survives in AFL's stats dump and the weight formula treats the
+         * entry as expensive even if it's later re-enabled. disabled=1
+         * and exec_us both persist in fastresume.bin (they live in the
+         * queue_entry block serialized at shutdown), so restarts keep
+         * the cull — no need to rediscover pathological entries every
+         * session. */
         afl->queue_cur->disabled = 1;
+        afl->queue_cur->exec_us = (u64)ctx->batch_timeout_us;
         afl->queue_cur->fuzz_level += 1000;
       }
       culled = 1;
