@@ -2107,13 +2107,6 @@ void __attribute__((hot)) afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv,
 fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
     afl_forkserver_t *fsrv, u32 timeout, volatile u8 *stop_soon_p) {
 
-  if (unlikely(fsrv->coqui_mode)) {
-
-    FATAL("BUG: afl_fsrv_run_target called in coqui_mode — should have been "
-          "short-circuited at fuzz_run_target");
-
-  }
-
   s32 res;
   u32 exec_ms;
   u32 write_value = fsrv->last_run_timed_out;
