@@ -81,13 +81,15 @@ def main():
         run(cmd)
         bcs.append(str(bc))
 
-    # 2. llvm-link with runtime.bc
+    # 2. llvm-link user BCs only (runtime added after prune; see step 3b).
     linked_bc = workdir / "linked.bc"
-    run(["llvm-link", *bcs, RUNTIME_BC, "-o", str(linked_bc)])
+    run(["llvm-link", *bcs, "-o", str(linked_bc)])
 
     # 3a. Prune unreachable code: internalize everything except the user entry
     # point, then run globaldce. Strips library functions (e.g., cJSON's
     # print_value, which pulls in sprintf) that the harness never actually calls.
+    # Runtime is NOT included here so the coqui pass-injected calls to runtime
+    # helpers (__coqui_fuzz_tid, etc.) are not subject to premature DCE.
     pruned_bc = workdir / "pruned.bc"
     run([
         "opt", "-passes=internalize,globaldce",
@@ -95,12 +97,19 @@ def main():
         str(linked_bc), "-o", str(pruned_bc),
     ])
 
-    # 3b. opt with coqui-link pipeline
+    # 3b. Re-link runtime after prune so runtime symbols survive DCE.
+    #     The coqui passes inject calls to __coqui_fuzz_tid and other helpers;
+    #     those definitions must be present when the pass runs (for InternalLinkage
+    #     function creation) and when ptxas resolves the final PTX.
+    with_runtime_bc = workdir / "with_runtime.bc"
+    run(["llvm-link", str(pruned_bc), RUNTIME_BC, "-o", str(with_runtime_bc)])
+
+    # 3c. opt with coqui-link pipeline
     transformed_bc = workdir / "transformed.bc"
     run([
         "opt", "-load-pass-plugin", PASS_PLUGIN,
         "-passes=coqui-link",
-        str(pruned_bc), "-o", str(transformed_bc),
+        str(with_runtime_bc), "-o", str(transformed_bc),
     ])
 
     if args.emit_bc:

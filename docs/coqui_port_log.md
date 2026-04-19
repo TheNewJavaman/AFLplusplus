@@ -34,3 +34,22 @@
   installed on this machine (not a symbol-resolution error)
 - PTX output: 337 KB / 15420 lines; all 20 .extern declarations are
   __coqui_* (no bare libc names remain)
+
+### Port: addrspace(5) module globals → tid-indexed .global pools
+- Trigger: ptxas error "Module-scoped variables in .local state space are not allowed with ABI"
+- Fix: per-thread storage moved from addrspace(5) module globals (which PTX
+  disallows) to a single addrspace(0) `__coqui_thread_slots` array indexed
+  by tid. Region accessors (__coqui_cov_base etc.) compute
+  `slots + tid * 32 + offset`. prev_loc moved to a separate
+  `__coqui_prev_loc_pool[BATCH_SIZE]` array, indexed by tid.
+- Footprint: 32 bytes/thread × 8192 batch = 256 KB in cubin .global section
+  (negligible vs. typical cubin size).
+- Secondary fix (coqui-cc driver): runtime.bc was being linked before
+  internalize+globaldce, causing all __coqui_* runtime helpers to be DCE'd
+  before the pass added references to them. Fixed by linking runtime.bc
+  after the prune step (new with_runtime.bc intermediate).
+- Secondary fix (MemoryLayout.cpp emitGetter): forward declarations of
+  __coqui_cov/heap/shadow_base from coqui_runtime.h caused the "already
+  exists" guard to skip defining the functions. Fixed by checking
+  isDeclaration() and filling in the body if needed.
+- Result: cjson_fuzzer.cubin produced (277 KB, sm_75).

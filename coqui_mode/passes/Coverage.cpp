@@ -2,14 +2,18 @@
  * Coverage.cpp --- AFL hash-based edge instrumentation.
  *
  * At each BB entry (after PHIs), inserts the 6-instruction AFL sequence:
- *   prev = load prev_loc
+ *   prev = load prev_loc_pool[tid]
  *   idx = prev XOR cur_loc
  *   cov[idx]++
- *   prev_loc = cur_loc >> 1
+ *   prev_loc_pool[tid] = cur_loc >> 1
  *
  * Per-BB cur_loc constants are deterministic via xxhash of module+
  * function+block index, so recompilation yields identical edge IDs.
  * Runtime helpers (__coqui_*) are not instrumented.
+ *
+ * prev_loc lives in __coqui_prev_loc_pool[BATCH_SIZE] (addrspace 0 / .global),
+ * indexed by tid. PTX disallows module-scope variables in .local (addrspace 5),
+ * so the per-thread state uses a tid-indexed .global array instead.
  */
 
 #include "Transforms.h"
@@ -23,6 +27,8 @@ using namespace llvm;
 
 namespace coqui {
 
+static constexpr unsigned BATCH_SIZE_FOR_COVERAGE = 8192;
+
 bool runCoverage(Module &M) {
   LLVMContext &C = M.getContext();
   Type *i8  = Type::getInt8Ty(C);
@@ -33,18 +39,23 @@ bool runCoverage(Module &M) {
   FunctionType *GetBaseType = FunctionType::get(i8p, false);
   FunctionCallee CovBase = M.getOrInsertFunction("__coqui_cov_base", GetBaseType);
 
-  /* Declare __coqui_prev_loc as i32 in addrspace 5 (.local) — one per thread */
-  GlobalVariable *PrevLoc = M.getGlobalVariable("__coqui_prev_loc");
-  if (!PrevLoc) {
-    PrevLoc = new GlobalVariable(
-        M, i32, /*isConstant=*/false,
-        GlobalValue::InternalLinkage,
-        Constant::getNullValue(i32),
-        "__coqui_prev_loc",
-        /*InsertBefore=*/nullptr,
-        GlobalValue::NotThreadLocal,
-        /*AddressSpace=*/5);
+  /* Declare __coqui_prev_loc_pool as u32[BATCH_SIZE] in addrspace 0 (.global).
+   * Each thread accesses element [tid]. PTX does not allow module-scope
+   * variables in addrspace 5 (.local); addrspace 0 (.global) + tid index
+   * is the standard NVPTX pattern for per-thread state. */
+  GlobalVariable *PrevLocPool = M.getGlobalVariable("__coqui_prev_loc_pool");
+  if (!PrevLocPool) {
+    ArrayType *T = ArrayType::get(i32, BATCH_SIZE_FOR_COVERAGE);
+    PrevLocPool = new GlobalVariable(
+        M, T, /*isConstant=*/false,
+        GlobalValue::ExternalLinkage,
+        Constant::getNullValue(T),
+        "__coqui_prev_loc_pool"); /* default addrspace 0 = .global */
   }
+
+  /* Declare __coqui_fuzz_tid() -> i32 */
+  FunctionType *TidT = FunctionType::get(i32, /*isVarArg=*/false);
+  FunctionCallee Tid = M.getOrInsertFunction("__coqui_fuzz_tid", TidT);
 
   /* Stable per-module seed: hash the module name once */
   uint64_t moduleSeed = llvm::xxh3_64bits(M.getName());
@@ -70,8 +81,14 @@ bool runCoverage(Module &M) {
 
       IRBuilder<> B(insertPt);
 
-      /* prev = load i32 @__coqui_prev_loc */
-      Value *prev = B.CreateLoad(i32, PrevLoc, "cov_prev");
+      /* tid = __coqui_fuzz_tid() */
+      Value *tid = B.CreateCall(Tid, {}, "tid");
+
+      /* prevPtr = gep i32, PrevLocPool, tid */
+      Value *prevPtr = B.CreateGEP(i32, PrevLocPool, tid, "prev_ptr");
+
+      /* prev = load i32, prevPtr */
+      Value *prev = B.CreateLoad(i32, prevPtr, "cov_prev");
 
       /* idx = prev ^ cur_loc */
       Value *idx = B.CreateXor(prev, ConstantInt::get(i32, curLoc), "cov_idx");
@@ -91,8 +108,8 @@ bool runCoverage(Module &M) {
       /* store i8 inc, cov_ptr */
       B.CreateStore(inc, covPtr);
 
-      /* store i32 (cur_loc >> 1), @__coqui_prev_loc */
-      B.CreateStore(ConstantInt::get(i32, curLoc >> 1), PrevLoc);
+      /* store i32 (cur_loc >> 1), prevPtr */
+      B.CreateStore(ConstantInt::get(i32, curLoc >> 1), prevPtr);
     }
   }
 
