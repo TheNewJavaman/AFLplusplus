@@ -71,6 +71,7 @@ def main():
             "clang", "--target=nvptx64-nvidia-cuda",
             "-O2", "-emit-llvm", "-c",
             "-g0", "-fno-stack-protector", "-fno-pic",
+            "-D__COQUI_DEVICE__=1",
         ]
         for inc in args.includes:
             cmd += ["-I", inc]
@@ -84,12 +85,22 @@ def main():
     linked_bc = workdir / "linked.bc"
     run(["llvm-link", *bcs, RUNTIME_BC, "-o", str(linked_bc)])
 
-    # 3. opt with coqui-link pipeline
+    # 3a. Prune unreachable code: internalize everything except the user entry
+    # point, then run globaldce. Strips library functions (e.g., cJSON's
+    # print_value, which pulls in sprintf) that the harness never actually calls.
+    pruned_bc = workdir / "pruned.bc"
+    run([
+        "opt", "-passes=internalize,globaldce",
+        "-internalize-public-api-list=LLVMFuzzerTestOneInput",
+        str(linked_bc), "-o", str(pruned_bc),
+    ])
+
+    # 3b. opt with coqui-link pipeline
     transformed_bc = workdir / "transformed.bc"
     run([
         "opt", "-load-pass-plugin", PASS_PLUGIN,
         "-passes=coqui-link",
-        str(linked_bc), "-o", str(transformed_bc),
+        str(pruned_bc), "-o", str(transformed_bc),
     ])
 
     if args.emit_bc:

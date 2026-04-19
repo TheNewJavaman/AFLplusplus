@@ -24,6 +24,7 @@ struct CoquiLinkPass : public PassInfoMixin<CoquiLinkPass> {
     coqui::runIntrinsicReject(M);
     coqui::runFuzzEntry(M);
     coqui::runHeap(M);
+    coqui::runLibc(M);              /* NEW: minimum libc string/math replacements */
     coqui::runStaticGlobals(M);
     coqui::runMemoryLayout(M);
     coqui::runCoverage(M);

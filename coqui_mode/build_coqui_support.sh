@@ -19,7 +19,7 @@ cd "$COQUI_DIR"
 echo "[*] Compiling device runtime to bitcode..."
 RUNTIME_FLAGS="--target=nvptx64-nvidia-cuda -O2 -ffreestanding -emit-llvm -c -I $COQUI_DIR/runtime"
 mkdir -p "$COQUI_DIR/runtime/build"
-for f in coqui_runtime coqui_coverage coqui_memory coqui_asan; do
+for f in coqui_runtime coqui_coverage coqui_memory coqui_asan coqui_libc; do
     clang $RUNTIME_FLAGS "$COQUI_DIR/runtime/$f.c" -o "$COQUI_DIR/runtime/build/$f.bc"
 done
 
@@ -28,6 +28,7 @@ llvm-link "$COQUI_DIR/runtime/build/coqui_runtime.bc" \
           "$COQUI_DIR/runtime/build/coqui_coverage.bc" \
           "$COQUI_DIR/runtime/build/coqui_memory.bc" \
           "$COQUI_DIR/runtime/build/coqui_asan.bc" \
+          "$COQUI_DIR/runtime/build/coqui_libc.bc" \
           -o "$COQUI_DIR/runtime/build/runtime.bc"
 
 echo "[*] Install..."
