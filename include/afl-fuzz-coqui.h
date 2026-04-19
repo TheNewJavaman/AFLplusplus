@@ -11,6 +11,8 @@
 #ifndef _HAVE_AFL_FUZZ_COQUI_H
 #define _HAVE_AFL_FUZZ_COQUI_H
 
+#include <sys/time.h>
+
 #include "types.h"
 #include "forkserver.h"
 
@@ -72,6 +74,14 @@ typedef struct coqui_ctx {
 
   u64 oversized_count; /* inputs skipped because they alone exceed byte_budget */
   u64 launch_count;    /* batches launched so far */
+  u64 total_submits;   /* diagnostic: total coqui_submit_input calls */
+
+  /* Per-second throughput logger state (opt-in via AFL_COQUI_RATE_LOG=1). */
+  u8             rate_log_enabled;
+  u8             rate_log_init;
+  struct timeval rate_log_t0;
+  u64            rate_log_last_launches;
+  u64            rate_log_last_submits;
 
   /* CUDA handles (populated by coqui_init). void* avoids cuda.h dependency. */
   void *cu_ctx;       /* CUcontext */
