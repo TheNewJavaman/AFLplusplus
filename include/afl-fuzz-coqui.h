@@ -76,6 +76,14 @@ typedef struct coqui_ctx {
   u64 launch_count;    /* batches launched so far */
   u64 total_submits;   /* diagnostic: total coqui_submit_input calls */
 
+  /* CPU-side speed gate (ported from coqui driver 9d85772). Blocks corpus
+   * admission of inputs that verify >10× slower than baseline, preventing
+   * pathologically slow inputs from becoming havoc parents. */
+  u64 verify_baseline_us;  /* fixed baseline from first 10 verifications */
+  u64 verify_baseline_sum; /* accumulator while building baseline */
+  u32 verify_baseline_n;   /* number of verifications seen so far (capped 10) */
+  u64 slow_skipped;        /* inputs rejected by the speed gate */
+
   /* Per-second throughput logger state (always on). */
   u8             rate_log_init;
   struct timeval rate_log_t0;

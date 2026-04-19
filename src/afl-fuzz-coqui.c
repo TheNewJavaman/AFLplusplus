@@ -247,6 +247,10 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->rate_log_init    = 0;
   ctx->rate_log_last_launches = 0;
   ctx->rate_log_last_submits  = 0;
+  ctx->verify_baseline_us  = 0;
+  ctx->verify_baseline_sum = 0;
+  ctx->verify_baseline_n   = 0;
+  ctx->slow_skipped        = 0;
 
   afl->coqui = ctx;
 
@@ -265,13 +269,41 @@ static u8 translate_gpu_status(coqui_status_t *s) {
 }
 
 /* Run a GPU-flagged or GPU-crashed input through the CPU forkserver for
-   real trace_bits, then call save_if_interesting. */
+   real trace_bits, then call save_if_interesting.
+
+   CPU-side speed gate (ported from coqui 9d85772): establish a fixed
+   baseline verify time from the first 10 CPU verifications. Any later
+   input that takes >10× that baseline to verify is rejected from corpus
+   admission. Pathologically slow inputs (deep recursion, hash-collision
+   storms) are what cause GPU kernel timeouts; blocking them from the
+   corpus prevents them from becoming havoc parents that generate even
+   slower children. Fixed (not EMA) baseline so the threshold doesn't
+   drift up as slow inputs appear. */
 static void process_input_via_cpu_fsrv(afl_state_t *afl,
                                         u8 *input, u32 len) {
   u32 new_size = write_to_testcase(afl, (void **)&input, len, 0);
   if (new_size == 0) return;
 
-  u8 cpu_fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+  u64 t0 = get_cur_time_us();
+  u8  cpu_fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+  u64 verify_us = get_cur_time_us() - t0;
+
+  coqui_ctx_t *ctx = afl->coqui;
+  if (ctx->verify_baseline_n < 10) {
+    ctx->verify_baseline_sum += verify_us;
+    ctx->verify_baseline_n++;
+    if (ctx->verify_baseline_n == 10) {
+      ctx->verify_baseline_us = ctx->verify_baseline_sum / 10;
+      OKF("coqui speed gate: baseline verify_us=%llu (10×: %llu)",
+          (unsigned long long)ctx->verify_baseline_us,
+          (unsigned long long)(ctx->verify_baseline_us * 10));
+    }
+  } else if (ctx->verify_baseline_us > 0 &&
+             verify_us > ctx->verify_baseline_us * 10) {
+    ctx->slow_skipped++;
+    return;   /* don't admit to corpus */
+  }
+
   afl->queued_discovered += save_if_interesting(afl, input, len, cpu_fault);
 }
 
@@ -345,10 +377,11 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
       if (elapsed_us > 0) {
         fprintf(stderr,
                 "[coqui-rate] %.1f batches/s, %llu submits/s "
-                "(avg %.0f inputs/batch)\n",
+                "(avg %.0f inputs/batch, %llu slow-skipped)\n",
                 (double)dl * 1e6 / (double)elapsed_us,
                 (unsigned long long)(ds * 1000000ULL / elapsed_us),
-                dl > 0 ? (double)ds / (double)dl : 0.0);
+                dl > 0 ? (double)ds / (double)dl : 0.0,
+                (unsigned long long)ctx->slow_skipped);
         fflush(stderr);
       }
       ctx->rate_log_last_launches = ctx->launch_count;
