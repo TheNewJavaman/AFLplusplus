@@ -2337,7 +2337,10 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
 
   if (!WIFSTOPPED(fsrv->child_status)) { fsrv->child_pid = -1; }
 
-  fsrv->total_execs++;
+  /* In coqui_mode, CPU forkserver runs are internal verification passes for
+   * GPU-flagged inputs — not distinct "execs" from the user's perspective.
+   * Each input is counted once in coqui_submit_input on the way to the GPU. */
+  if (likely(!fsrv->coqui_mode)) { fsrv->total_execs++; }
 
   /* Any subsequent operations on fsrv->trace_bits must not be moved by the
      compiler below this point. Past this location, fsrv->trace_bits[]

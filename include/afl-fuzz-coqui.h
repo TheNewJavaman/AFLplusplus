@@ -76,8 +76,7 @@ typedef struct coqui_ctx {
   u64 launch_count;    /* batches launched so far */
   u64 total_submits;   /* diagnostic: total coqui_submit_input calls */
 
-  /* Per-second throughput logger state (opt-in via AFL_COQUI_RATE_LOG=1). */
-  u8             rate_log_enabled;
+  /* Per-second throughput logger state (always on). */
   u8             rate_log_init;
   struct timeval rate_log_t0;
   u64            rate_log_last_launches;

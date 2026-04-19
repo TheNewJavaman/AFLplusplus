@@ -3531,7 +3531,10 @@ havoc_stage:
 
   }
 
-  if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
+  /* Cross-fuzz_one accumulation: removed per-stage and end-of-fuzz_one flush
+   * so batches fill to batch_size (8192) before launching. Previous behavior
+   * launched partial batches at every stage boundary, capping throughput at
+   * ~150 execs/batch. Auto-flush still fires when the buffer fills. */
 
   new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
@@ -3672,7 +3675,10 @@ retry_splicing:
 
 #endif
 
-  if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
+  /* Cross-fuzz_one accumulation: removed per-stage and end-of-fuzz_one flush
+   * so batches fill to batch_size (8192) before launching. Previous behavior
+   * launched partial batches at every stage boundary, capping throughput at
+   * ~150 execs/batch. Auto-flush still fires when the buffer fills. */
 
 /* we are through with this queue entry - for this iteration */
 abandon_entry:
@@ -6036,7 +6042,10 @@ pacemaker_fuzzing:
 
            ++afl->stage_cur) { */
 
-      if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
+      /* Cross-fuzz_one accumulation: removed per-stage and end-of-fuzz_one flush
+   * so batches fill to batch_size (8192) before launching. Previous behavior
+   * launched partial batches at every stage boundary, capping throughput at
+   * ~150 execs/batch. Auto-flush still fires when the buffer fills. */
 
       new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
@@ -6142,7 +6151,10 @@ pacemaker_fuzzing:
 
       ret_val = 0;
 
-      if (unlikely(afl->gpu_mode)) { coqui_flush_batch(afl); }
+      /* Cross-fuzz_one accumulation: removed per-stage and end-of-fuzz_one flush
+   * so batches fill to batch_size (8192) before launching. Previous behavior
+   * launched partial batches at every stage boundary, capping throughput at
+   * ~150 execs/batch. Auto-flush still fires when the buffer fills. */
 
     abandon_entry:
     abandon_entry_puppet:

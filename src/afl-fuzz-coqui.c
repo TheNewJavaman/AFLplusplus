@@ -244,7 +244,6 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->launch_count     = 0;
   ctx->oversized_count  = 0;
   ctx->total_submits    = 0;
-  ctx->rate_log_enabled = (u8)getenv_u32("AFL_COQUI_RATE_LOG", 0);
   ctx->rate_log_init    = 0;
   ctx->rate_log_last_launches = 0;
   ctx->rate_log_last_submits  = 0;
@@ -322,32 +321,31 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
 
-  /* Opt-in per-second throughput diagnostic. AFL's execs_done only counts
-   * CPU-forkserver verifications of novelty-flagged inputs; the real GPU
-   * submission rate is hidden. Enable with AFL_COQUI_RATE_LOG=1. */
-  if (ctx->rate_log_enabled) {
-    struct timeval rate_tv;
-    gettimeofday(&rate_tv, NULL);
-    if (!ctx->rate_log_init) {
-      ctx->rate_log_t0 = rate_tv;
-      ctx->rate_log_init = 1;
-    }
-    u64 elapsed_us =
-      ((u64)(rate_tv.tv_sec - ctx->rate_log_t0.tv_sec) * 1000000ULL) +
-      (rate_tv.tv_usec - ctx->rate_log_t0.tv_usec);
-    if (elapsed_us >= 1000000ULL) {
-      u64 dl = ctx->launch_count - ctx->rate_log_last_launches;
-      u64 ds = ctx->total_submits - ctx->rate_log_last_submits;
-      fprintf(stderr,
-              "[coqui-rate] %llu batches/s, %llu submits/s "
-              "(avg %.0f inputs/batch)\n",
-              (unsigned long long)(dl * 1000000ULL / elapsed_us),
-              (unsigned long long)(ds * 1000000ULL / elapsed_us),
-              dl > 0 ? (double)ds / (double)dl : 0.0);
-      ctx->rate_log_last_launches = ctx->launch_count;
-      ctx->rate_log_last_submits  = ctx->total_submits;
-      ctx->rate_log_t0 = rate_tv;
-    }
+  /* Per-second throughput diagnostic. Counterpart to AFL's execs_per_sec,
+   * exposes how many batches are launching and the average inputs/batch —
+   * the latter is the useful signal that end-of-stage flushes are capping
+   * batch fill well below batch_size. */
+  struct timeval rate_tv;
+  gettimeofday(&rate_tv, NULL);
+  if (!ctx->rate_log_init) {
+    ctx->rate_log_t0 = rate_tv;
+    ctx->rate_log_init = 1;
+  }
+  u64 elapsed_us =
+    ((u64)(rate_tv.tv_sec - ctx->rate_log_t0.tv_sec) * 1000000ULL) +
+    (rate_tv.tv_usec - ctx->rate_log_t0.tv_usec);
+  if (elapsed_us >= 1000000ULL) {
+    u64 dl = ctx->launch_count - ctx->rate_log_last_launches;
+    u64 ds = ctx->total_submits - ctx->rate_log_last_submits;
+    fprintf(stderr,
+            "[coqui-rate] %llu batches/s, %llu submits/s "
+            "(avg %.0f inputs/batch)\n",
+            (unsigned long long)(dl * 1000000ULL / elapsed_us),
+            (unsigned long long)(ds * 1000000ULL / elapsed_us),
+            dl > 0 ? (double)ds / (double)dl : 0.0);
+    ctx->rate_log_last_launches = ctx->launch_count;
+    ctx->rate_log_last_submits  = ctx->total_submits;
+    ctx->rate_log_t0 = rate_tv;
   }
 }
 
@@ -455,6 +453,10 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
   coqui_batch_t *b = ctx->pending;
 
   ctx->total_submits++;
+  /* Count each submission as one exec — the corresponding increment in
+   * afl_fsrv_run_target is suppressed in coqui_mode to avoid double-counting
+   * GPU-flagged inputs that also run through CPU verification. */
+  afl->fsrv.total_execs++;
 
   if (len > ctx->byte_budget) {
     ctx->oversized_count++;
