@@ -321,31 +321,40 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
 
-  /* Per-second throughput diagnostic. Counterpart to AFL's execs_per_sec,
-   * exposes how many batches are launching and the average inputs/batch —
-   * the latter is the useful signal that end-of-stage flushes are capping
-   * batch fill well below batch_size. */
+  /* Throughput diagnostic: one line per batch launch. Supplements AFL's own
+   * execs_per_sec (accurate now that coqui_submit_input bumps total_execs)
+   * with per-batch visibility — inputs/batch is the key signal that batches
+   * are full (cross-fuzz_one accumulation working) vs partial. */
   struct timeval rate_tv;
   gettimeofday(&rate_tv, NULL);
   if (!ctx->rate_log_init) {
     ctx->rate_log_t0 = rate_tv;
     ctx->rate_log_init = 1;
-  }
-  u64 elapsed_us =
-    ((u64)(rate_tv.tv_sec - ctx->rate_log_t0.tv_sec) * 1000000ULL) +
-    (rate_tv.tv_usec - ctx->rate_log_t0.tv_usec);
-  if (elapsed_us >= 1000000ULL) {
-    u64 dl = ctx->launch_count - ctx->rate_log_last_launches;
-    u64 ds = ctx->total_submits - ctx->rate_log_last_submits;
-    fprintf(stderr,
-            "[coqui-rate] %llu batches/s, %llu submits/s "
-            "(avg %.0f inputs/batch)\n",
-            (unsigned long long)(dl * 1000000ULL / elapsed_us),
-            (unsigned long long)(ds * 1000000ULL / elapsed_us),
-            dl > 0 ? (double)ds / (double)dl : 0.0);
     ctx->rate_log_last_launches = ctx->launch_count;
     ctx->rate_log_last_submits  = ctx->total_submits;
-    ctx->rate_log_t0 = rate_tv;
+  } else {
+    u64 elapsed_us =
+      ((u64)(rate_tv.tv_sec - ctx->rate_log_t0.tv_sec) * 1000000ULL) +
+      (rate_tv.tv_usec - ctx->rate_log_t0.tv_usec);
+    u64 dl = ctx->launch_count - ctx->rate_log_last_launches;
+    u64 ds = ctx->total_submits - ctx->rate_log_last_submits;
+    /* Throttle: only print if either ≥ 1s elapsed or ≥ 4 batches accumulated,
+     * whichever comes first, so we see signal both when batches flow fast and
+     * when they're slow due to pathological inputs. */
+    if (elapsed_us >= 1000000ULL || dl >= 4) {
+      if (elapsed_us > 0) {
+        fprintf(stderr,
+                "[coqui-rate] %.1f batches/s, %llu submits/s "
+                "(avg %.0f inputs/batch)\n",
+                (double)dl * 1e6 / (double)elapsed_us,
+                (unsigned long long)(ds * 1000000ULL / elapsed_us),
+                dl > 0 ? (double)ds / (double)dl : 0.0);
+        fflush(stderr);
+      }
+      ctx->rate_log_last_launches = ctx->launch_count;
+      ctx->rate_log_last_submits  = ctx->total_submits;
+      ctx->rate_log_t0 = rate_tv;
+    }
   }
 }
 
