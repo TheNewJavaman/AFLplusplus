@@ -124,17 +124,37 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->d_virgin_map = (unsigned long long)d_virgin;
   CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
 
-  /* 4. Compute stack budget per spec §4.3 */
+  /* 4. Probe the device for its maximum allowed per-thread stack size.
+   *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
+   *    .local memory budget (per_thread × max-resident-threads × #SMs must
+   *    fit in device memory). There's no direct query API; binary-search
+   *    downward from the sm_75+ hardware ceiling (512 KB) to find the
+   *    largest accepted value. */
+  unsigned int total_budget = 524288;   /* sm_75+ hardware ceiling */
+  while (total_budget >= 32768) {
+    if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget) == CUDA_SUCCESS) break;
+    total_budget /= 2;
+  }
+  if (total_budget < 32768) {
+    FATAL("device rejected all per-thread stack sizes >= 32 KB");
+  }
+  size_t actual_set = 0;
+  cuCtxGetLimit(&actual_set, CU_LIMIT_STACK_SIZE);
+  OKF("coqui per-thread stack budget: %u KB (driver returned %zu)",
+      total_budget / 1024, actual_set);
+
+  /* Derive heap and stack regions from the budget.
+   *    Layout (per spec §4.2):
+   *      [coverage 64 KB][heap H][shadow H/8][real stack S]
+   *      where H = (total - 64K - S) * 8/9 and shadow = H/8 */
   unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 16384);
   unsigned int cov = 65536;
-  unsigned int total_cap = 524288;
-  if (stack_size + cov >= total_cap) {
-    FATAL("--stack-size %u + 64KB coverage >= 512KB budget", stack_size);
+  if (stack_size + cov >= total_budget) {
+    FATAL("--stack-size %u + 64KB coverage >= total_budget %u",
+          stack_size, total_budget);
   }
-  unsigned int remaining = total_cap - cov - stack_size;
+  unsigned int remaining = total_budget - cov - stack_size;
   unsigned int heap = (remaining * 8) / 9;
-  unsigned int total_budget = cov + heap + (heap / 8) + stack_size;
-  CUCHECK(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget));
   ctx->real_stack_size = stack_size;
 
   /* 5. Check static stack usage doesn't exceed budget */

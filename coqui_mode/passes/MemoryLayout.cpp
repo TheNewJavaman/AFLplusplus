@@ -33,9 +33,13 @@ using namespace llvm;
 
 namespace coqui {
 
+/* Total per-thread budget. sm_75 hardware ceiling is 512KB but real devices
+ * typically allow 256KB (driver caps based on max-resident-threads × #SMs vs
+ * device .local memory). Conservative 256KB fits commonly seen Turing/Ampere
+ * driver budgets. coqui-cc may grow this into a CLI flag (--total-cap) later. */
 static constexpr unsigned kCovMapSize      = 65536;
 static constexpr unsigned kDefaultStackSize = 16384;
-static constexpr unsigned kTotalBudget     = 524288;
+static constexpr unsigned kTotalBudget     = 262144;
 
 /* Per-thread slot pool constants — must match host launcher batch size. */
 static constexpr unsigned SLOT_STRIDE = 32;
