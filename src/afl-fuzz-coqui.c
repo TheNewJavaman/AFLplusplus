@@ -73,6 +73,7 @@ static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
 
   b->n_inputs   = 0;
   b->bytes_used = 0;
+  b->launch_start_us = 0;  /* adaptive batch-timeout (B1): no launch yet */
 
 }
 
@@ -241,6 +242,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   }
 
   ctx->batch_timeout_us = getenv_u64("AFL_COQUI_TIMEOUT_US", 3000000);
+  ctx->timeout_env_override = getenv("AFL_COQUI_TIMEOUT_US") ? 1 : 0;
   ctx->launch_count     = 0;
   ctx->oversized_count  = 0;
   ctx->total_submits    = 0;
@@ -251,6 +253,12 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->verify_baseline_sum = 0;
   ctx->verify_baseline_n   = 0;
   ctx->slow_skipped        = 0;
+  /* Adaptive batch-timeout (B1) ring buffer — zero-init. */
+  memset(ctx->batch_latency_ring, 0, sizeof(ctx->batch_latency_ring));
+  ctx->batch_latency_count  = 0;
+  ctx->batch_latency_head   = 0;
+  ctx->ping.launch_start_us = 0;
+  ctx->pong.launch_start_us = 0;
 
   afl->coqui = ctx;
 
@@ -314,6 +322,56 @@ static void process_input_via_cpu_fsrv(afl_state_t *afl,
 static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
 static void coqui_force_reset(afl_state_t *afl, const char *cubin_path);
 
+/* Adaptive batch-timeout (B1) helpers.
+ *
+ * Push one healthy-batch latency into the ring buffer, then — if we have
+ * enough samples AND the user did not pin the timeout via AFL_COQUI_TIMEOUT_US
+ * — recompute batch_timeout_us = clamp(MULT * P95, FLOOR, CEIL).
+ *
+ * Only healthy batches (CUDA_SUCCESS before cull deadline) feed this ring.
+ * Culled and force-reset batches are excluded so the estimate tracks the
+ * true steady-state latency, not the pathological tail. */
+static int coqui_u64_cmp(const void *a, const void *b) {
+  unsigned long long av = *(const unsigned long long *)a;
+  unsigned long long bv = *(const unsigned long long *)b;
+  return (av > bv) - (av < bv);
+}
+
+static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
+                                        unsigned long long latency_us) {
+  /* Defensive: huge outliers (e.g., first-batch init cost) could skew P95
+   * upward and defeat the whole point. Cap at 10s so a one-off slow start
+   * doesn't pin us to the 3s ceiling forever. */
+  if (latency_us > 10000000ULL) latency_us = 10000000ULL;
+
+  ctx->batch_latency_ring[ctx->batch_latency_head] = latency_us;
+  ctx->batch_latency_head =
+      (ctx->batch_latency_head + 1) % COQUI_LAT_RING_SIZE;
+  if (ctx->batch_latency_count < COQUI_LAT_RING_SIZE) {
+    ctx->batch_latency_count++;
+  }
+
+  if (ctx->timeout_env_override) return;  /* user pin wins */
+  if (ctx->batch_latency_count < COQUI_LAT_MIN_SAMPLES) return;
+
+  unsigned long long tmp[COQUI_LAT_RING_SIZE];
+  u32 n = ctx->batch_latency_count;
+  memcpy(tmp, ctx->batch_latency_ring, n * sizeof(unsigned long long));
+  qsort(tmp, n, sizeof(unsigned long long), coqui_u64_cmp);
+
+  /* P95: index = floor((n-1) * 0.95). For n=32 -> index 29.
+   * Standard nearest-rank on a ring means small-n estimates skew slightly
+   * low, but that is safer than skewing high (high = slower cull). */
+  u32 idx = (u32)(((unsigned long long)(n - 1) * COQUI_LAT_P95_PCT) / 100ULL);
+  unsigned long long p95 = tmp[idx];
+
+  unsigned long long target = p95 * COQUI_LAT_MULT;
+  if (target < COQUI_LAT_FLOOR_US) target = COQUI_LAT_FLOOR_US;
+  if (target > COQUI_LAT_CEIL_US)  target = COQUI_LAT_CEIL_US;
+
+  ctx->batch_timeout_us = target;
+}
+
 static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
@@ -361,12 +419,20 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
 
+  /* Adaptive batch-timeout (B1): stamp launch time ON THE BATCH so
+   * coqui_await_and_process can compute healthy-batch latency. Per-batch
+   * (not per-context) because ping-pong means launch(X) → flip → wait(Y),
+   * where a context-level field would get clobbered between Y's launch
+   * and Y's wait. */
+  struct timeval rate_tv;
+  gettimeofday(&rate_tv, NULL);
+  b->launch_start_us =
+      ((unsigned long long)rate_tv.tv_sec * 1000000ULL) + rate_tv.tv_usec;
+
   /* Throughput diagnostic: one line per batch launch. Supplements AFL's own
    * execs_per_sec (accurate now that coqui_submit_input bumps total_execs)
    * with per-batch visibility — inputs/batch is the key signal that batches
    * are full (cross-fuzz_one accumulation working) vs partial. */
-  struct timeval rate_tv;
-  gettimeofday(&rate_tv, NULL);
   if (!ctx->rate_log_init) {
     ctx->rate_log_t0 = rate_tv;
     ctx->rate_log_init = 1;
@@ -469,6 +535,23 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     usleep(1000);   /* 1ms poll — matches coqui driver */
   }
   (void)ctx;  /* silence unused-after-reset-path warnings */
+
+  /* Adaptive batch-timeout (B1): record latency of this batch ONLY if it
+   * completed healthily (CUDA_SUCCESS before the cull deadline fired).
+   * Culled and force-reset batches are the pathology we are trying to
+   * escape faster — including them in the stat would drive the timeout
+   * estimate UP, which is the opposite of the goal. The `culled` flag
+   * is the single source of truth here: we break out of the wait loop
+   * on CUDA_SUCCESS, and this code runs only after that break. */
+  if (!culled && b->launch_start_us > 0) {
+    struct timeval done_tv;
+    gettimeofday(&done_tv, NULL);
+    unsigned long long done_us =
+      ((unsigned long long)done_tv.tv_sec * 1000000ULL) + done_tv.tv_usec;
+    if (done_us > b->launch_start_us) {
+      coqui_push_healthy_latency(ctx, done_us - b->launch_start_us);
+    }
+  }
 
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {

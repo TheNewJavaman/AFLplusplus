@@ -58,6 +58,13 @@ typedef struct coqui_batch {
   /* Fill state. */
   u32 n_inputs;    /* slots used so far */
   u32 bytes_used;  /* bytes consumed in h_input_bytes (unaligned cursor) */
+
+  /* Adaptive batch-timeout (B1): wall-clock timestamp at cuEventRecord. Used
+   * by coqui_await_and_process to compute healthy-batch latency. Per-batch
+   * (not per-context) because ping-pong means launch(X) → flip → wait(Y)
+   * where Y was launched in the previous flip and X's launch would otherwise
+   * clobber a context-level field. 0 = no launch yet. */
+  unsigned long long launch_start_us;
 } coqui_batch_t;
 
 /* Per-afl-state coqui context. */
@@ -105,7 +112,34 @@ typedef struct coqui_ctx {
   /* Config from .conf sidecar */
   unsigned int real_stack_size;
   unsigned long long batch_timeout_us;
+
+  /* Adaptive batch-timeout (sub-proposal B1).
+   *
+   * Healthy batch wall-clock latency ring buffer. A "healthy" batch is one
+   * that completed via cuStreamQuery == CUDA_SUCCESS before the cull
+   * deadline fired (NOT culled, NOT force-reset). Once we have
+   * >= COQUI_LAT_MIN_SAMPLES samples, we set batch_timeout_us to
+   * clamp(COQUI_LAT_MULT * P95, COQUI_LAT_FLOOR_US, COQUI_LAT_CEIL_US)
+   * so pathological inputs get culled sooner (saving ~8s of the ~9s per
+   * bad batch: 3s static timeout + 5s hard-deadline + ~1s force-reset).
+   *
+   * Env-var override `AFL_COQUI_TIMEOUT_US` remains authoritative:
+   * `timeout_env_override` is captured at init and, if non-zero, the
+   * adaptive path never touches batch_timeout_us.
+   */
+  unsigned long long batch_latency_ring[128];  /* us */
+  u32                batch_latency_count;      /* total samples pushed */
+  u32                batch_latency_head;       /* next write index */
+  u8                 timeout_env_override;     /* 1 if AFL_COQUI_TIMEOUT_US set */
 } coqui_ctx_t;
+
+/* Adaptive batch-timeout tunables (B1). */
+#define COQUI_LAT_RING_SIZE     128
+#define COQUI_LAT_MIN_SAMPLES   32
+#define COQUI_LAT_P95_PCT       95
+#define COQUI_LAT_MULT          3ULL
+#define COQUI_LAT_FLOOR_US      500000ULL    /* 500 ms */
+#define COQUI_LAT_CEIL_US       3000000ULL   /* 3 s */
 
 /* ------------------------------------------------------------------------
  * API surface (called from core afl-fuzz)
