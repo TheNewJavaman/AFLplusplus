@@ -44,8 +44,8 @@ def main():
     ap.add_argument("-o", "--output", required=True, help="output base name")
     ap.add_argument("-arch", default=None, help="target GPU arch (e.g., sm_75)")
     ap.add_argument("--device", type=int, default=0, help="device for arch detection")
-    ap.add_argument("--stack-size", type=int, default=16384,
-                    help="real stack bytes per thread (default 16384)")
+    ap.add_argument("--stack-size", type=int, default=32768,
+                    help="real stack bytes per thread (default 32768)")
     ap.add_argument("--slab-pool-size", type=int, default=0,
                     help="optional shared slab pool size (0 = disabled)")
     ap.add_argument("-I", dest="includes", action="append", default=[])
@@ -105,10 +105,13 @@ def main():
     run(["llvm-link", str(pruned_bc), RUNTIME_BC, "-o", str(with_runtime_bc)])
 
     # 3c. opt with coqui-link pipeline
+    # Forward --stack-size to the pass via -coqui-stack-size so the IR
+    # layout's heap/shadow sizes track the runtime cuCtxSetLimit value.
     transformed_bc = workdir / "transformed.bc"
     run([
         "opt", "-load-pass-plugin", PASS_PLUGIN,
         "-passes=coqui-link",
+        f"-coqui-stack-size={args.stack_size}",
         str(with_runtime_bc), "-o", str(transformed_bc),
     ])
 

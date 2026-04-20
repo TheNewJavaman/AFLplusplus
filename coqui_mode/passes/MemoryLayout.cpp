@@ -17,9 +17,10 @@
  *
  * Total footprint: 32 bytes/thread × 8192 threads = 256 KB in .global section.
  *
- * Configuration: uses compile-time constants for sizes. Real user-facing
- * --stack-size is stored in a .conf sidecar and read by the host launcher
- * to cuCtxSetLimit; the pass here uses the derived values that match.
+ * Configuration: the real-stack budget is controlled via the
+ * -coqui-stack-size=N opt flag (default 32768 B). coqui-cc forwards its
+ * --stack-size value to opt so the pass-derived heap/shadow sizes match the
+ * host's cuCtxSetLimit value. Without the flag, the default constant applies.
  */
 
 #include "Transforms.h"
@@ -27,6 +28,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
@@ -38,8 +40,16 @@ namespace coqui {
  * device .local memory). Conservative 256KB fits commonly seen Turing/Ampere
  * driver budgets. coqui-cc may grow this into a CLI flag (--total-cap) later. */
 static constexpr unsigned kCovMapSize      = 65536;
-static constexpr unsigned kDefaultStackSize = 16384;
+static constexpr unsigned kDefaultStackSize = 32768;
 static constexpr unsigned kTotalBudget     = 262144;
+
+/* --coqui-stack-size=N : real-stack budget in bytes. coqui-cc forwards its
+ * --stack-size value via this opt flag so the pass-produced heap/shadow
+ * sizes are consistent with the runtime cuCtxSetLimit value. */
+static cl::opt<unsigned> RealStackSizeOpt(
+    "coqui-stack-size",
+    cl::desc("Per-thread real-stack budget in bytes (heap/shadow derived from remainder)"),
+    cl::init(kDefaultStackSize));
 
 /* Per-thread slot pool constants — must match host launcher batch size. */
 static constexpr unsigned SLOT_STRIDE = 32;
@@ -66,7 +76,13 @@ static GlobalVariable *getOrMakeSlotPool(Module &M) {
 bool runMemoryLayout(Module &M) {
   LLVMContext &C = M.getContext();
 
-  const unsigned realStack  = kDefaultStackSize;
+  /* Resolve real stack size: prefer --coqui-stack-size CLI if set, otherwise
+   * default constant. Guard against a value that would leave nothing for heap. */
+  unsigned realStack = RealStackSizeOpt;
+  if (realStack + kCovMapSize >= kTotalBudget) {
+    report_fatal_error(
+        "[coqui-cc] MemoryLayout: --coqui-stack-size + 64KB cov exceeds 256KB budget");
+  }
   const unsigned remaining  = kTotalBudget - kCovMapSize - realStack;
   const unsigned heapSize   = (remaining * 8) / 9;
   const unsigned shadowSize = heapSize / 8;
