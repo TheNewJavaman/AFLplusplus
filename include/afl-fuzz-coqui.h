@@ -119,7 +119,6 @@ typedef struct coqui_ctx {
 
   /* Device-persistent buffers (CUdeviceptr = u64) */
   unsigned long long d_virgin_map;
-  unsigned long long d_virgin_map_const;  /* .const snapshot, refreshed per batch */
   unsigned long long d_global_statics_pool;
   unsigned long long d_slab_pool;
 
