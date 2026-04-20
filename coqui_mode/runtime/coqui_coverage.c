@@ -89,6 +89,66 @@ u32 __coqui_classify_counts_and_sig(u8 *map) {
     return h;
 }
 
+/* Sparse variant of __coqui_classify_counts_and_sig driven by the
+ * per-thread touched-region bitmap that Coverage.cpp maintains alongside
+ * cov_map increments. `touch` is 32 bytes = 4 u64 words = 256 bits, one
+ * bit per 32-u64 = 256-byte region of the 64 KB cov_map.
+ *
+ * Output is byte-identical to __coqui_classify_counts_and_sig for the
+ * same input AS LONG AS every cov_map increment had a corresponding bit
+ * set in `touch`. Coverage.cpp emits the bit-set in the same basic block
+ * as the cov_map increment, so the only path on which a region could
+ * have a touched word without its touch-bit set is when an ASan check
+ * aborted the thread mid-BB; asan_report takes a different (full-scan)
+ * path via __coqui_trace_sig, so the sparse variant is never called on
+ * crashed threads.
+ *
+ * Iteration order matches the full walk (regions 0..31 in the summary,
+ * set bits within each summary word in ascending order, u64 offsets in
+ * ascending order inside each 32-word region) so FNV-1a hash ordering
+ * is preserved and sigs are byte-identical. */
+u32 __coqui_classify_counts_and_sig_sparse(u8 *map, u8 *touch) {
+    u64 *m64 = (u64 *)map;
+    u64 *t64 = (u64 *)touch;
+    u32 h = COQUI_FNV32_OFFSET;
+
+    /* 64 KB cov_map / 256 B per region = 256 regions = 4 u64 summary words.
+     * Coverage emits region = (cov_idx >> 8) with cov_idx in [0, 65535] so
+     * touched region indices are in [0, 255]; only summary words 0..3 can
+     * ever be non-zero. Iterate those four only — upper words in the
+     * 256-byte allocation exist as padding, not as valid region bits. */
+    for (u32 sw = 0; sw < 4; sw++) {
+        u64 tw = t64[sw];
+        while (tw) {
+            u32 bit = (u32)__builtin_ctzll(tw);
+            tw &= tw - 1;
+            u32 region = (sw << 6) | bit;      /* 0..255 */
+            u32 base   = region << 5;          /* starting u64 in cov_map, 0..8160 */
+            for (u32 k = 0; k < 32; k++) {
+                u32 i = base + k;
+                u64 word = m64[i];
+                if (word == 0) continue;
+
+                u8 *bytes = (u8 *)&word;
+                bytes[0] = __coqui_count_class_lookup[bytes[0]];
+                bytes[1] = __coqui_count_class_lookup[bytes[1]];
+                bytes[2] = __coqui_count_class_lookup[bytes[2]];
+                bytes[3] = __coqui_count_class_lookup[bytes[3]];
+                bytes[4] = __coqui_count_class_lookup[bytes[4]];
+                bytes[5] = __coqui_count_class_lookup[bytes[5]];
+                bytes[6] = __coqui_count_class_lookup[bytes[6]];
+                bytes[7] = __coqui_count_class_lookup[bytes[7]];
+                m64[i] = word;
+
+                h = (h ^ i)                 * COQUI_FNV32_PRIME;
+                h = (h ^ (u32)(word))       * COQUI_FNV32_PRIME;
+                h = (h ^ (u32)(word >> 32)) * COQUI_FNV32_PRIME;
+            }
+        }
+    }
+    return h;
+}
+
 /* Same FNV-1a fold, read-only (no classify). Used by crash paths that
  * fire mid-execution (asan_report) where the cov_map is partially
  * written; the signature groups crashes at the same site. */

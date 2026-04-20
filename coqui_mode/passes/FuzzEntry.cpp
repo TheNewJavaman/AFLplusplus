@@ -67,12 +67,15 @@ bool runFuzzEntry(Module &M) {
     FunctionType::get(voidT, {i32, i8}, false));
   FunctionCallee MemoryInit = M.getOrInsertFunction("__coqui_memory_init", VoidNoArg);
   FunctionCallee CovBase = M.getOrInsertFunction("__coqui_cov_base", PtrNoArg);
-  /* Folded classify-and-sig: single pass over the 64 KB cov_map that
-   * classifies every byte AND returns a 32-bit FNV-1a hash so the host
-   * can dedup crash-verifies by signature. */
-  FunctionCallee ClassifyAndSig = M.getOrInsertFunction(
-    "__coqui_classify_counts_and_sig",
-    FunctionType::get(i32, {i8p}, false));
+  FunctionCallee TouchBase = M.getOrInsertFunction("__coqui_touch_base", PtrNoArg);
+  /* Sparse classify-and-sig: walks only the touched 256-byte regions per
+   * the per-thread summary bitmap that Coverage.cpp maintains alongside
+   * cov_map increments. Byte- and sig-identical to the full-walk variant
+   * on the non-crash path; the crash path (asan_report) continues to use
+   * __coqui_trace_sig (full walk) and does not depend on the summary. */
+  FunctionCallee ClassifySparse = M.getOrInsertFunction(
+    "__coqui_classify_counts_and_sig_sparse",
+    FunctionType::get(i32, {i8p, i8p}, false));
   FunctionCallee VirginCmp = M.getOrInsertFunction(
     "__coqui_virgin_compare_and_flag",
     FunctionType::get(voidT, {i8p, i8p, i8p}, false));
@@ -143,8 +146,10 @@ bool runFuzzEntry(Module &M) {
 
   /* cov = __coqui_cov_base() */
   Value *cov = Builder.CreateCall(CovBase, {}, "cov");
-  /* sig = __coqui_classify_counts_and_sig(cov) */
-  Value *sig = Builder.CreateCall(ClassifyAndSig, {cov}, "sig");
+  /* touch = __coqui_touch_base() */
+  Value *touch = Builder.CreateCall(TouchBase, {}, "touch");
+  /* sig = __coqui_classify_counts_and_sig_sparse(cov, touch) */
+  Value *sig = Builder.CreateCall(ClassifySparse, {cov, touch}, "sig");
 
   /* PHASE_VIRGIN_CMP = 5 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 5)});

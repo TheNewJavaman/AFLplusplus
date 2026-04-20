@@ -13,7 +13,7 @@
  *   offset  0 ..  7  : cov_base   ptr (i8*, 8 bytes)
  *   offset  8 .. 15  : heap_base  ptr (i8*, 8 bytes)
  *   offset 16 .. 23  : shadow_base ptr (i8*, 8 bytes)
- *   offset 24 .. 31  : reserved
+ *   offset 24 .. 31  : touch_base ptr (i8*, 8 bytes) — 256 B region-touched summary bitmap
  *
  * Total footprint: 32 bytes/thread × 8192 threads = 256 KB in .global section.
  *
@@ -38,6 +38,10 @@ namespace coqui {
  * device .local memory). Conservative 256KB fits commonly seen Turing/Ampere
  * driver budgets. coqui-cc may grow this into a CLI flag (--total-cap) later. */
 static constexpr unsigned kCovMapSize      = 65536;
+/* 64 KB cov_map / 256 B region-per-bit = 256 bits summary = 4 u64 words
+ * = 32 bytes. Kept compact so it fits in a single cache line and costs
+ * one 32-byte store to zero at kernel entry. */
+static constexpr unsigned kTouchMapSize    = 32;
 static constexpr unsigned kDefaultStackSize = 16384;
 static constexpr unsigned kTotalBudget     = 262144;
 
@@ -49,6 +53,7 @@ static constexpr unsigned BATCH_SIZE  = 8192;
 static constexpr unsigned OFF_COV_BASE    = 0;
 static constexpr unsigned OFF_HEAP_BASE   = 8;
 static constexpr unsigned OFF_SHADOW_BASE = 16;
+static constexpr unsigned OFF_TOUCH_BASE  = 24;
 
 static GlobalVariable *getOrMakeSlotPool(Module &M) {
   if (auto *GV = M.getGlobalVariable("__coqui_thread_slots"))
@@ -67,7 +72,7 @@ bool runMemoryLayout(Module &M) {
   LLVMContext &C = M.getContext();
 
   const unsigned realStack  = kDefaultStackSize;
-  const unsigned remaining  = kTotalBudget - kCovMapSize - realStack;
+  const unsigned remaining  = kTotalBudget - kCovMapSize - kTouchMapSize - realStack;
   const unsigned heapSize   = (remaining * 8) / 9;
   const unsigned shadowSize = heapSize / 8;
   const unsigned usableHeap = heapSize; /* heap + shadow are separate allocas */
@@ -105,10 +110,23 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
+  /* Per-thread 256-byte touched-region summary bitmap. Each bit covers a
+   * 256-byte region of cov_map (= 32 u64 words); 2048 bits total. Read by
+   * __coqui_classify_counts_and_sig_sparse to skip untouched regions. */
+  AllocaInst *TouchAlloca = Builder.CreateAlloca(
+      ArrayType::get(i8, kTouchMapSize), nullptr, "cov_touch");
+  TouchAlloca->setAlignment(Align(8));
+
   /* Zero the coverage map at kernel entry; each thread accumulates fresh. */
   Builder.CreateMemSet(CovAlloca,
                        ConstantInt::get(i8, 0),
                        static_cast<uint64_t>(kCovMapSize),
+                       MaybeAlign(Align(8)));
+
+  /* Zero the touch summary — classify-sparse reads this. */
+  Builder.CreateMemSet(TouchAlloca,
+                       ConstantInt::get(i8, 0),
+                       static_cast<uint64_t>(kTouchMapSize),
                        MaybeAlign(Align(8)));
 
   /* Compute tid and base byte offset into the pool for this thread. */
@@ -138,6 +156,13 @@ bool runMemoryLayout(Module &M) {
   Value *shadowSlot = Builder.CreateGEP(i8, Pool, shadowOffI32, "shadow_slot");
   Builder.CreateStore(ShadowAlloca, shadowSlot);
 
+  /* Store touch_alloca pointer at offset OFF_TOUCH_BASE */
+  Value *touchOffI32 = Builder.CreateAdd(base32,
+                                         ConstantInt::get(i32, OFF_TOUCH_BASE),
+                                         "touch_off");
+  Value *touchSlot = Builder.CreateGEP(i8, Pool, touchOffI32, "touch_slot");
+  Builder.CreateStore(TouchAlloca, touchSlot);
+
   /* 4. Emit accessor getter functions.
    *
    * Each getter computes: load ptr from Pool[tid * SLOT_STRIDE + Offset].
@@ -165,6 +190,7 @@ bool runMemoryLayout(Module &M) {
   emitGetter("__coqui_cov_base",    OFF_COV_BASE);
   emitGetter("__coqui_heap_base",   OFF_HEAP_BASE);
   emitGetter("__coqui_shadow_base", OFF_SHADOW_BASE);
+  emitGetter("__coqui_touch_base",  OFF_TOUCH_BASE);
 
   /* __coqui_heap_size() — returns compile-time constant as i32 */
   {
