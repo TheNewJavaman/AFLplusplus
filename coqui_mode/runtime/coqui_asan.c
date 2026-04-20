@@ -154,7 +154,8 @@ static void asan_report(int error_type) {
      * can dedup verify calls by signature. Mid-execution crashes leave the
      * cov_map partially written; threads that hit the same parser site
      * converge to the same partial map ⇒ same signature. */
-    __coqui_status_array[tid].crash_sig = __coqui_trace_sig(__coqui_cov_base());
+    __coqui_status_array[tid].crash_sig =
+        __coqui_trace_sig(__coqui_cov_base(), __coqui_cov_map_size());
 
     __coqui_exit();
 }

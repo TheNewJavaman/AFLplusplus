@@ -26,6 +26,10 @@ struct CoquiLinkPass : public PassInfoMixin<CoquiLinkPass> {
     coqui::runHeap(M);
     coqui::runLibc(M);              /* NEW: minimum libc string/math replacements */
     coqui::runStaticGlobals(M);
+    coqui::runSancovCount(M);   /* Assigns sequential IDs to __sancov_gen_*
+                                 * arrays and emits @__coqui_num_edges.
+                                 * Must run before MemoryLayout, which reads
+                                 * the edge count to size the cov pool. */
     coqui::runMemoryLayout(M);
     coqui::runCoverage(M);
     coqui::runAsan(M);

@@ -21,6 +21,7 @@ set(COQUI_PASS_SOURCES
     StaticGlobals.cpp
     MemoryLayout.cpp
     Coverage.cpp
+    SancovCount.cpp
     Asan.cpp
     ExternalSymbolGatekeeper.cpp
 )

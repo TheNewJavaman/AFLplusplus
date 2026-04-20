@@ -116,14 +116,71 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   CUCHECK(cuModuleGetFunction(&kernel, mod, "__coqui_fuzz_kernel"));
   ctx->cu_kernel = (void *)kernel;
 
-  CUdeviceptr d_virgin;
-  size_t virgin_sz;
-  CUCHECK(cuModuleGetGlobal(&d_virgin, &virgin_sz, mod, "__coqui_virgin_map"));
-  if (virgin_sz != 65536) {
-    FATAL("__coqui_virgin_map symbol size %zu != 64KB", virgin_sz);
+  /* 3a. Read the SanCov edge count (emitted by SancovCount pass as an
+   *     i64 constant global). This tells us how large the cov_map_pool
+   *     and virgin_map need to be. Round up to 4 because
+   *     coverage_evaluate walks in 4-byte chunks. Falls back to 1024 if
+   *     the cubin was built without -fsanitize-coverage (num_edges == 0). */
+  CUdeviceptr d_num_edges_sym;
+  size_t d_num_edges_sz;
+  unsigned long long num_edges = 0;
+  if (cuModuleGetGlobal(&d_num_edges_sym, &d_num_edges_sz, mod,
+                         "__coqui_num_edges") == CUDA_SUCCESS &&
+      d_num_edges_sz == sizeof(unsigned long long)) {
+    CUCHECK(cuMemcpyDtoH(&num_edges, d_num_edges_sym, sizeof(unsigned long long)));
+  } else {
+    WARNF("__coqui_num_edges not found in cubin — assuming legacy 64 KB map. "
+          "Rebuild with a current coqui-cc for SanCov.");
   }
+  unsigned long long cov_map_size = (num_edges + 3ULL) & ~3ULL;
+  if (cov_map_size == 0) cov_map_size = 1024;
+  ctx->num_edges   = num_edges;
+  ctx->cov_map_size = cov_map_size;
+
+  /* 3b. Allocate per-thread cov pool: batch_size * cov_map_size.
+   *     Zero once (subsequent zeroing is done in-kernel by
+   *     coverage_evaluate). Then bind the device-global pool pointer
+   *     @__coqui_cov_map_pool_ptr so the kernel can compute per-thread
+   *     offsets. */
+  CUdeviceptr d_cov_pool = 0;
+  unsigned long long cov_pool_bytes =
+      (unsigned long long)8192 * cov_map_size;    /* batch_size fixed = 8192 */
+  CUCHECK(cuMemAlloc(&d_cov_pool, cov_pool_bytes));
+  CUCHECK(cuMemsetD8(d_cov_pool, 0, cov_pool_bytes));
+  ctx->d_cov_map_pool = (unsigned long long)d_cov_pool;
+
+  CUdeviceptr d_cov_pool_ptr_sym;
+  size_t d_cov_pool_ptr_sz;
+  CUCHECK(cuModuleGetGlobal(&d_cov_pool_ptr_sym, &d_cov_pool_ptr_sz, mod,
+                             "__coqui_cov_map_pool_ptr"));
+  if (d_cov_pool_ptr_sz != sizeof(CUdeviceptr)) {
+    FATAL("__coqui_cov_map_pool_ptr symbol size %zu != %zu",
+          d_cov_pool_ptr_sz, sizeof(CUdeviceptr));
+  }
+  CUCHECK(cuMemcpyHtoD(d_cov_pool_ptr_sym, &d_cov_pool, sizeof(CUdeviceptr)));
+
+  /* 3c. Allocate global virgin bitmap: one instance of cov_map_size bytes
+   *     (classified counter map, persistent across batches). Bind via
+   *     @__coqui_virgin_map_ptr. */
+  CUdeviceptr d_virgin = 0;
+  CUCHECK(cuMemAlloc(&d_virgin, cov_map_size));
+  CUCHECK(cuMemsetD8(d_virgin, 0, cov_map_size));
   ctx->d_virgin_map = (unsigned long long)d_virgin;
-  CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
+
+  CUdeviceptr d_virgin_ptr_sym;
+  size_t d_virgin_ptr_sz;
+  CUCHECK(cuModuleGetGlobal(&d_virgin_ptr_sym, &d_virgin_ptr_sz, mod,
+                             "__coqui_virgin_map_ptr"));
+  if (d_virgin_ptr_sz != sizeof(CUdeviceptr)) {
+    FATAL("__coqui_virgin_map_ptr symbol size %zu != %zu",
+          d_virgin_ptr_sz, sizeof(CUdeviceptr));
+  }
+  CUCHECK(cuMemcpyHtoD(d_virgin_ptr_sym, &d_virgin, sizeof(CUdeviceptr)));
+
+  OKF("coqui SanCov: %llu edges, cov_map %llu B/thread, "
+      "pool %.1f MB (was 64 KB/thread / 512 MB)",
+      num_edges, cov_map_size,
+      (double)cov_pool_bytes / (1024.0 * 1024.0));
 
   /* 4. Probe the device for its maximum allowed per-thread stack size.
    *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
@@ -145,13 +202,16 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
       total_budget / 1024, actual_set);
 
   /* Derive heap and stack regions from the budget.
-   *    Layout (per spec §4.2):
-   *      [coverage 64 KB][heap H][shadow H/8][real stack S]
-   *      where H = (total - 64K - S) * 8/9 and shadow = H/8 */
+   *    SanCov layout (iter 10): cov_map is now a device-global pool, not a
+   *    per-thread alloca. But the MemoryLayout pass still reserves the
+   *    legacy 64 KB "cov slot" in its heap-sizing formula (kLegacyCov) so
+   *    the heap/shadow numbers stay identical across the transition. Keep
+   *    the host side in lockstep: (heap + shadow) = (total - 64K - S) * 8/9.
+   */
   unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 32768);
   unsigned int cov = 65536;
   if (stack_size + cov >= total_budget) {
-    FATAL("--stack-size %u + 64KB coverage >= total_budget %u",
+    FATAL("--stack-size %u + 64KB coverage reserve >= total_budget %u",
           stack_size, total_budget);
   }
   unsigned int remaining = total_budget - cov - stack_size;
@@ -176,7 +236,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   if (budget64 < floor64) budget64 = floor64;
   if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;  /* MAX_ALLOC cap */
   ctx->byte_budget = (unsigned int)budget64;
-  ctx->map_size = 65536;
+  ctx->map_size = (unsigned int)cov_map_size;
 
   /* 7. Create streams */
   CUstream sa, sb;
@@ -798,6 +858,10 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_global_statics_pool);
   if (ctx->d_slab_pool)
     cuMemFree((CUdeviceptr)ctx->d_slab_pool);
+  if (ctx->d_cov_map_pool)
+    cuMemFree((CUdeviceptr)ctx->d_cov_map_pool);
+  if (ctx->d_virgin_map)
+    cuMemFree((CUdeviceptr)ctx->d_virgin_map);
 
   /* Destroy streams, unload module, destroy context */
   if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);
