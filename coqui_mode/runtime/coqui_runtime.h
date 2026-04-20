@@ -74,6 +74,7 @@ void __coqui_status_set_phase(u32 tid, u8 phase);
 u8  *__coqui_cov_base(void);       /* per-thread coverage map (64 KB) */
 u8  *__coqui_heap_base(void);      /* per-thread heap */
 u8  *__coqui_shadow_base(void);    /* per-thread ASan shadow */
+u8  *__coqui_touch_base(void);     /* per-thread touched-region summary bitmap (256 B) */
 u32  __coqui_heap_size(void);      /* runtime-configured heap size */
 
 /* Coverage runtime */
@@ -86,6 +87,15 @@ void __coqui_classify_counts(u8 *map);
  * separate __coqui_classify_counts is retained for any future caller that
  * does not need the hash; kernel entry uses the combined form. */
 u32  __coqui_classify_counts_and_sig(u8 *map);
+
+/* Sparse variant: classify + sig driven by a per-thread 2048-bit summary
+ * bitmap (256 bytes) that Coverage.cpp maintains alongside cov_map
+ * increments. Each summary bit covers 256 B (32 u64s) of cov_map. Output
+ * is byte-identical to the full-walk variant when the summary is strictly
+ * >= the set of touched regions; Coverage emits bit-sets inline with cov
+ * increments so a partial trace (ASan mid-BB abort) takes the full-walk
+ * crash path via __coqui_trace_sig instead. */
+u32  __coqui_classify_counts_and_sig_sparse(u8 *map, u8 *touch);
 
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap);
 
