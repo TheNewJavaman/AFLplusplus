@@ -16,6 +16,35 @@
 #include "coqui_runtime.h"
 #include <stdatomic.h>
 
+/* Read-only snapshot of __coqui_virgin_map, refreshed DtoD at end of every
+ * batch by the host (cuMemcpyDtoDAsync on the batch's stream → cmem[3]).
+ *
+ * Purpose: skip the hot atom.or.b64 into writable virgin when the warp's
+ * OR-reduced classified word is already fully covered by the constant
+ * snapshot. The const copy lags the writable copy (updated only at batch
+ * end), so: const_virgin ⊆ writable_virgin is an invariant. If a word's
+ * classified bits are all present in const_virgin, they're present in
+ * writable too, and the atomic-or would be a no-op — skip it.
+ *
+ * On NVPTX clang lowers address_space(4) to .const; ptxas places it in
+ * cmem[3] (64 KB bank, broadcast-cached single-cycle for all 32 lanes of
+ * a warp reading the same address). Bank is separate from cmem[0]/cmem[4]
+ * (kernel params / compiler internal) so the 64 KB footprint doesn't
+ * evict existing small-constant LUTs.
+ */
+/* NOTE: no C-level `const` on the declaration even though the array is
+ * actually read-only from device code. Clang's middle-end constant-folds
+ * reads from a `const` zero-initialized global to literal 0 (killing the
+ * skip-atomic logic). Keeping it non-const preserves the load-from-memory,
+ * and the NVPTX back-end lowers any address_space(4) global to `.const`
+ * (cmem[3]) regardless of the C-level const qualifier — verified via
+ * ptxas: `ld.const.u64` is still emitted, matching the constant-cache
+ * fast path. The host is the only writer (DtoD at batch end), so there's
+ * no device-side mutation and the ptxas "const is read-only" invariant
+ * holds — no store-to-const instructions are emitted. */
+__attribute__((address_space(4)))
+u8 __coqui_virgin_map_const[COQUI_COV_MAP_SIZE] = {0};
+
 /* Bucket lookup — matches AFL's count_class_lookup16. */
 __attribute__((section(".const"), used))
 u8 __coqui_count_class_lookup[256] = {
@@ -217,6 +246,8 @@ static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
+    __attribute__((address_space(4))) u64 *c64 =
+        (__attribute__((address_space(4))) u64 *)__coqui_virgin_map_const;
     const u32 n = COQUI_COV_MAP_SIZE / 8;
     const u32 mask = __coqui_active_mask();
     int novel = 0;
@@ -230,17 +261,32 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
             u64 warp_mine = __coqui_warp_or_u64(mask, mine);
             if (warp_mine == 0) continue;
 
-            /* Lane 0 does the atomic; broadcast `was` (pre-OR virgin) so
-             * every lane can compute its own novelty contribution
-             * mine & ~was. Over-reports novelty within a warp when >1
-             * lane independently set the same bit — benign, CPU verify
-             * rejects false positives. */
-            u64 was0 = 0;
-            if (laneid == 0) {
-                was0 = atomic_fetch_or_explicit(&v64[i], warp_mine,
-                                                memory_order_relaxed);
+            /* Fast-path: const_virgin is a LOWER BOUND on writable virgin
+             * (refreshed at each batch end; never ahead of writable). If
+             * warp_mine has no bits outside const_virgin[i], all those
+             * bits are already in writable virgin → the atomic-or would
+             * be a no-op. Skip it. All 32 lanes load the same address,
+             * serviced by the constant-cache broadcast (single cycle).
+             *
+             * Correctness: const ⊆ writable, so
+             *   (warp_mine & ~const_v) == 0 ⇒ warp_mine ⊆ const_v ⊆ writable
+             * ⇒ (warp_mine & ~writable) == 0 ⇒ no novelty. Using const_v as
+             * `was` produces the same mine & ~was calc each lane would see
+             * after a real atomic, so no lane incorrectly flags novelty. */
+            u64 const_v = c64[i];
+            u64 was;
+            if ((warp_mine & ~const_v) == 0) {
+                was = const_v;
+            } else {
+                /* Possible novelty — must atomic to update writable and
+                 * get the real pre-OR state. */
+                u64 was0 = 0;
+                if (laneid == 0) {
+                    was0 = atomic_fetch_or_explicit(&v64[i], warp_mine,
+                                                    memory_order_relaxed);
+                }
+                was = __coqui_warp_bcast_u64(mask, was0, 0);
             }
-            u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
             if (mine & ~was) { novel = 1; }
         }
     } else {

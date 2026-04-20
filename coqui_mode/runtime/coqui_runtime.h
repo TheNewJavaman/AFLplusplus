@@ -131,4 +131,15 @@ int __coqui_fuzz_execute(const unsigned char *data, unsigned long size);
 /* Device-global virgin map (allocated at module load, accessed via cuModuleGetGlobal) */
 extern u8 __coqui_virgin_map[COQUI_COV_MAP_SIZE];
 
+/* Read-only-from-device .const (cmem[3]) snapshot of virgin_map,
+ * refreshed by host cuMemcpyDtoDAsync at end of each batch. Used by
+ * the virgin-compare fast-path to skip L2 atomics when the warp's
+ * classified word is already fully reflected in this snapshot.
+ *
+ * Not marked C-`const` on purpose — see comment in coqui_coverage.c —
+ * but the device code only reads from it (ptxas guarantees .const
+ * read-only at the hardware level). */
+extern __attribute__((address_space(4))) u8
+    __coqui_virgin_map_const[COQUI_COV_MAP_SIZE];
+
 #endif /* _COQUI_RUNTIME_H */

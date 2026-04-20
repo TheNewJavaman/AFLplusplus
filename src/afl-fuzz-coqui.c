@@ -125,6 +125,21 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->d_virgin_map = (unsigned long long)d_virgin;
   CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
 
+  /* Resolve the .const (cmem[3]) snapshot symbol so we can DtoD-refresh it
+   * from writable virgin at each batch end. Present in the runtime, so if
+   * absent something drifted in the pass/runtime link. */
+  CUdeviceptr d_virgin_const;
+  size_t virgin_const_sz;
+  CUCHECK(cuModuleGetGlobal(&d_virgin_const, &virgin_const_sz, mod,
+                            "__coqui_virgin_map_const"));
+  if (virgin_const_sz != 65536) {
+    FATAL("__coqui_virgin_map_const symbol size %zu != 64KB",
+          virgin_const_sz);
+  }
+  ctx->d_virgin_map_const = (unsigned long long)d_virgin_const;
+  /* Zero it so the first batch sees const ⊆ writable trivially. */
+  CUCHECK(cuMemsetD8(d_virgin_const, 0, 65536));
+
   /* 4. Probe the device for its maximum allowed per-thread stack size.
    *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must
@@ -651,6 +666,29 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     process_input_via_cpu_fsrv(afl, input, len);
   }
   #undef COQUI_CRASH_DEDUP_SLOTS
+
+  /* Refresh the .const snapshot of virgin_map so the next batch's
+   * atomic-skip fast path can see any new bits this batch flipped.
+   * Async on the batch's stream: the subsequent coqui_submit_input /
+   * launch sequence ends up on the other stream (ping-pong), so this
+   * DtoD overlaps with the next batch's HtoD seeding.
+   *
+   * Driver caveat: `.const` (cmem[3]) symbols can be updated via
+   * cuMemcpy{Htod,Dtod}Async when you address them by their resolved
+   * CUdeviceptr (from cuModuleGetGlobal). This is the documented path
+   * — see CUDA C Programming Guide §3.2.1 (constant memory updates).
+   *
+   * Cost: ~5–15 µs per batch end at PCIe-x16 device-to-device. At
+   * ~14 healthy batches/s that's <0.25 ms/s of overhead.
+   *
+   * Correctness invariant preserved: const is only ever updated AT the
+   * end of a batch, after this kernel has already finished writing to
+   * writable virgin (stream dependency through cuStreamQuery). Bits
+   * added by future batches are applied to writable via atomic-or first
+   * and only later refreshed into const, so const never leads writable. */
+  CUCHECK(cuMemcpyDtoDAsync((CUdeviceptr)ctx->d_virgin_map_const,
+                            (CUdeviceptr)ctx->d_virgin_map,
+                            65536, s));
 
   return 0;
 }
