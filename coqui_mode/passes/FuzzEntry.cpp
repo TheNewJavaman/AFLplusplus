@@ -4,20 +4,10 @@
  * Per coqui internals design §7.1: emits __coqui_fuzz_kernel with the
  * 5-argument signature (input_bytes, offsets, input_lens, novelty, status).
  *
- * Kernel body calls __coqui_fuzz_execute per-thread, then runs a single-pass
- * __coqui_coverage_evaluate(cov, global_cov, cov_map_size) which classifies,
- * zeros in place, and atom.or's into the global cov map — returning 1 if the
- * thread contributed novelty.
+ * Kernel body calls __coqui_fuzz_execute per-thread, then runs
+ * post-execution bucketing + virgin compare via runtime helpers.
  *
  * Adds nvvm.annotations to mark __coqui_fuzz_kernel as .entry.
- *
- * Iteration 10: migrated from AFL hash-edge coverage to SanitizerCoverage
- * (trace-pc-guard). The virgin/novelty bitmap is now sized to num_edges
- * (read at host init via cuModuleGetGlobal @__coqui_num_edges) and lives in
- * a device-global pool pointed to by @__coqui_virgin_map_ptr. Both the
- * cov_map and virgin_map are dynamically sized per-module; only the host
- * knows the sizes, so the kernel reads the base pointers from module-scope
- * globals rather than hard-coded [65536 x i8] arrays.
  */
 
 #include "Transforms.h"
@@ -70,40 +60,30 @@ bool runFuzzEntry(Module &M) {
   FunctionType *VoidNoArg = FunctionType::get(voidT, false);
   FunctionType *TidRet    = FunctionType::get(i32, false);
   FunctionType *PtrNoArg  = FunctionType::get(i8p, false);
-  FunctionType *I64NoArg  = FunctionType::get(i64, false);
 
   FunctionCallee GetTid = M.getOrInsertFunction("__coqui_fuzz_tid", TidRet);
   FunctionCallee SetPhase = M.getOrInsertFunction(
     "__coqui_status_set_phase",
     FunctionType::get(voidT, {i32, i8}, false));
   FunctionCallee MemoryInit = M.getOrInsertFunction("__coqui_memory_init", VoidNoArg);
-  FunctionCallee CovBase    = M.getOrInsertFunction("__coqui_cov_base", PtrNoArg);
-  FunctionCallee CovSize    = M.getOrInsertFunction("__coqui_cov_map_size", I64NoArg);
+  FunctionCallee CovBase = M.getOrInsertFunction("__coqui_cov_base", PtrNoArg);
+  /* Folded classify-and-sig: single pass over the 64 KB cov_map that
+   * classifies every byte AND returns a 32-bit FNV-1a hash so the host
+   * can dedup crash-verifies by signature. */
+  FunctionCallee ClassifyAndSig = M.getOrInsertFunction(
+    "__coqui_classify_counts_and_sig",
+    FunctionType::get(i32, {i8p}, false));
+  FunctionCallee VirginCmp = M.getOrInsertFunction(
+    "__coqui_virgin_compare_and_flag",
+    FunctionType::get(voidT, {i8p, i8p, i8p}, false));
 
-  /* Single-pass coverage_evaluate: classify counters, zero in place, OR-reduce
-   * across the warp, and atom.or the warp result into the global bitmap. Returns
-   * 1 if this thread contributed a new bit, 0 otherwise. Replaces both the
-   * old classify_counts_and_sig and virgin_compare_and_flag paths. */
-  FunctionCallee CoverageEval = M.getOrInsertFunction(
-    "__coqui_coverage_evaluate",
-    FunctionType::get(i32, {i8p, i8p, i64}, false));
-
-  /* FNV-1a hash of the partial coverage map after classification — used for
-   * crash dedup. Read-only; does not mutate the map (classify+zero already
-   * happened in coverage_evaluate). */
-  FunctionCallee TraceSig = M.getOrInsertFunction(
-    "__coqui_trace_sig",
-    FunctionType::get(i32, {i8p, i64}, false));
-
-  /* 4. Virgin map is now dynamically sized at host init. The kernel reads the
-   * base pointer from @__coqui_virgin_map_ptr (ptr, addrspace 0). Host binds
-   * this via cuModuleGetGlobal + cuMemcpyHtoD after cuMemAllocing the map. */
-  GlobalVariable *VirginMapPtr = M.getGlobalVariable("__coqui_virgin_map_ptr", true);
-  if (!VirginMapPtr) {
-    VirginMapPtr = new GlobalVariable(
-      M, i8p, /*isConstant*/false, GlobalValue::ExternalLinkage,
-      Constant::getNullValue(i8p), "__coqui_virgin_map_ptr");
-    VirginMapPtr->setAlignment(Align(8));
+  /* 4. Declare the virgin_map as an extern global [65536 x i8] */
+  ArrayType *VirginArrTy = ArrayType::get(i8, 65536);
+  GlobalVariable *VirginMap = M.getGlobalVariable("__coqui_virgin_map", true);
+  if (!VirginMap) {
+    VirginMap = new GlobalVariable(
+      M, VirginArrTy, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_virgin_map");
   }
 
   /* 5. __coqui_status_array pointer global (runtime will read this) */
@@ -158,68 +138,20 @@ bool runFuzzEntry(Module &M) {
   FunctionType *ExecType = FunctionType::get(i32, {i8p, i64}, false);
   Builder.CreateCall(ExecType, User, {inputPtr, len64});
 
-  /* PHASE_BUCKETING = 4 (classify + OR into virgin fused into
-   * coverage_evaluate; single phase marker covers both). */
+  /* PHASE_BUCKETING = 4 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 4)});
 
-  /* cov = __coqui_cov_base(); cov_size = __coqui_cov_map_size(); */
-  Value *cov     = Builder.CreateCall(CovBase, {}, "cov");
-  Value *covSize = Builder.CreateCall(CovSize, {}, "cov_size");
+  /* cov = __coqui_cov_base() */
+  Value *cov = Builder.CreateCall(CovBase, {}, "cov");
+  /* sig = __coqui_classify_counts_and_sig(cov) */
+  Value *sig = Builder.CreateCall(ClassifyAndSig, {cov}, "sig");
 
-  /* virgin_map = load @__coqui_virgin_map_ptr */
-  Value *virgin  = Builder.CreateLoad(i8p, VirginMapPtr, "virgin_map");
-
-  /* found_new = __coqui_coverage_evaluate(cov, virgin, cov_size) */
-  Value *foundNew = Builder.CreateCall(CoverageEval, {cov, virgin, covSize}, "found_new");
-
-  /* PHASE_VIRGIN_CMP = 5 (stays as a phase marker for any monitors that
-   * watched for it, even though the work is now fused above). */
+  /* PHASE_VIRGIN_CMP = 5 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 5)});
 
-  /* Store novelty bit: novelty[tid >> 5] |= (found_new ? 1 : 0) << (tid & 31).
-   * Equivalent to atomic_or when a warp contributes multiple novel threads,
-   * but these are all within one 32-bit word of the bitmap; we use a plain
-   * atomic add via inline asm, or the simpler approach of an atomic or on
-   * the 32-bit slot.
-   *
-   * For simplicity we do a per-thread atomicOr on the 32-bit slot here —
-   * same semantics as the old virgin_compare path (which also did
-   * atomic_fetch_or_explicit on a 32-bit word of the novelty bitmap).
-   * NVPTX lowers atomicrmw or on addrspace(0) (generic) to atom.or.b32. */
-  Value *tid32      = tid; /* already i32 */
-  Value *word_i     = Builder.CreateLShr(tid32, ConstantInt::get(i32, 5), "word_i");
-  Value *bit_i      = Builder.CreateAnd(tid32, ConstantInt::get(i32, 31), "bit_i");
-  Value *bitMask32  = Builder.CreateShl(
-      ConstantInt::get(i32, 1), bit_i, "bit_mask");
-  /* noveltyArg is u8* but bitmap is in 32-bit words — compute byte offset as
-   * word_i * 4. */
-  Value *wordByteOff = Builder.CreateMul(word_i, ConstantInt::get(i32, 4),
-                                          "novelty_byte_off");
-  Value *novSlot     = Builder.CreateGEP(i8, noveltyArg, wordByteOff, "novelty_word");
-
-  /* If found_new (i32 0 or 1) is true, atomicOr the word with (1 << bit_i).
-   * Do the branchless form: atomic or with (found_new ? mask : 0). */
-  Value *foundNz = Builder.CreateICmpNE(foundNew, ConstantInt::get(i32, 0), "found_nz");
-  Value *orVal = Builder.CreateSelect(foundNz, bitMask32,
-                                      ConstantInt::get(i32, 0), "or_val");
-  Builder.CreateAtomicRMW(AtomicRMWInst::Or, novSlot, orVal,
-                          MaybeAlign(Align(4)),
-                          AtomicOrdering::Monotonic);
-
-  /* Compute crash_sig = FNV-1a over the (now-classified + zeroed) cov map.
-   * NOTE: coverage_evaluate zeros the cov map as it walks it — so by the time
-   * this runs, the cov_map is all zero and trace_sig would be the FNV offset
-   * basis for every thread.
-   *
-   * This is intentional: at this point in the kernel the per-thread map has
-   * already been classified + OR'd into the global map + zeroed. For clean
-   * (non-crashing) executions the sig is only used for crash dedup, and
-   * non-crashing threads never go through the crash dedup path (coqui
-   * checks status.asan_error != 0 before consulting crash_sig). The
-   * interesting sig values are the ones stamped by asan_report() in
-   * coqui_asan.c, which runs BEFORE the map is cleared because the ASan
-   * trap path is mid-execution. */
-  Value *sig = Builder.CreateCall(TraceSig, {cov, covSize}, "sig");
+  /* With opaque pointers, VirginMap (ptr to [65536 x i8]) is already
+     an i8* — no bitcast needed; pass directly as i8p. */
+  Builder.CreateCall(VirginCmp, {cov, VirginMap, noveltyArg});
 
   /* Store sig into status[tid].crash_sig.
    *

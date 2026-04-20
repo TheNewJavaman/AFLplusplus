@@ -18,12 +18,20 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
-/* -- Constants --
- *
- * Coverage map is per-edge (SanitizerCoverage trace-pc-guard): size is
- * determined at link time by the SancovCount pass and exposed to the host
- * via @__coqui_num_edges. The runtime reads the size via
- * __coqui_cov_map_size() (pass-materialized constant). No 64 KB AFL default. */
+/* -- Constants -- */
+
+#define COQUI_COV_MAP_SIZE 65536u        /* 64 KB — AFL default, hardcoded */
+
+/* Bucket class bits (same as AFL count_class_lookup16) */
+#define COQUI_BUCKET_0   0x00
+#define COQUI_BUCKET_1   0x01
+#define COQUI_BUCKET_2   0x02
+#define COQUI_BUCKET_3   0x04
+#define COQUI_BUCKET_4_7 0x08
+#define COQUI_BUCKET_8_15   0x10
+#define COQUI_BUCKET_16_31  0x20
+#define COQUI_BUCKET_32_127 0x40
+#define COQUI_BUCKET_128_UP 0x80
 
 /* Phase markers (written to coqui_status_t.phase by kernel logic) */
 #define COQUI_PHASE_EMPTY       0
@@ -63,35 +71,31 @@ void __coqui_exit(void);   /* PTX `exit;` — this thread exits, kernel continue
 void __coqui_status_set_phase(u32 tid, u8 phase);
 
 /* Region accessors (set up by MemoryLayout transform at kernel entry) */
-u8  *__coqui_cov_base(void);       /* per-thread coverage map slot (size given by __coqui_cov_map_size) */
+u8  *__coqui_cov_base(void);       /* per-thread coverage map (64 KB) */
 u8  *__coqui_heap_base(void);      /* per-thread heap */
 u8  *__coqui_shadow_base(void);    /* per-thread ASan shadow */
 u32  __coqui_heap_size(void);      /* runtime-configured heap size */
-u64  __coqui_cov_map_size(void);   /* per-thread cov_map size in bytes (=num_edges rounded to 4) */
 
-/* -- Coverage runtime --
- *
- * __coqui_coverage_evaluate: classify the per-thread counter map, zero it in
- * place, atom.or-merge the warp's classified result into the global bitmap.
- * Returns 1 if this thread contributed novelty, 0 otherwise.
- *
- * cov_map_size MUST be a multiple of 4 (rounded up from num_edges).
- */
-int __coqui_coverage_evaluate(u8 *thread_cov, u8 *global_cov, u64 cov_map_size);
+/* Coverage runtime */
+extern __attribute__((visibility("default")))
+u8 __coqui_count_class_lookup[256];
+void __coqui_classify_counts(u8 *map);
 
-/* Dedup hash of the (current contents of the) cov_map at crash time. Used by
- * asan_report() to stamp crash_sig so the host can group crashes at the same
- * parser site to the same signature. Reads the raw (pre-classify) counters
- * because ASan fires mid-execution, before coverage_evaluate clears the map. */
-u32  __coqui_trace_sig(u8 *map, u64 cov_map_size);
+/* One-pass variant: classify every byte *and* fold a 32-bit FNV-1a hash
+ * over the classified map so the host can dedup crash-verify on it. The
+ * separate __coqui_classify_counts is retained for any future caller that
+ * does not need the hash; kernel entry uses the combined form. */
+u32  __coqui_classify_counts_and_sig(u8 *map);
 
-/* -- SanitizerCoverage callbacks (coqui_sancov.c). Invoked by clang-emitted
- *    instrumentation when the target is compiled with
- *    -fsanitize-coverage=trace-pc-guard. --
- */
-void __sanitizer_cov_trace_pc_guard(unsigned int *guard);
-void __sanitizer_cov_trace_pc_guard_init(unsigned int *start,
-                                          unsigned int *stop);
+void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap);
+
+/* Dedup hash of partial coverage at crash time (called from asan_report).
+ * Uses the same FNV-1a algorithm as the classify_and_sig variant so
+ * signatures are comparable across crashed and clean threads. */
+u32  __coqui_trace_sig(u8 *map);
+
+/* prev_loc (per-thread, for AFL hash instrumentation) */
+u32 *__coqui_prev_loc_ptr(void);
 
 /* Heap allocator (coqui_memory.c) */
 void *__coqui_malloc(unsigned long size);
@@ -124,17 +128,7 @@ double __coqui_strtod(const char *nptr, char **endptr);
 /* Renamed user entry (was LLVMFuzzerTestOneInput). Called by kernel per-thread. */
 int __coqui_fuzz_execute(const unsigned char *data, unsigned long size);
 
-/* Device-global virgin map base pointer — host cuMemAllocs the bitmap and
- * binds it via cuModuleGetGlobal("__coqui_virgin_map_ptr"). The size is
- * determined at module load from @__coqui_num_edges (rounded up to 4). */
-extern u8 *__coqui_virgin_map_ptr;
-
-/* Device-global cov pool base pointer — host cuMemAllocs a batch-size *
- * cov_map_size counter pool and binds it via cuModuleGetGlobal(). The
- * MemoryLayout pass computes each thread's cov_base as base + tid * size. */
-extern u8 *__coqui_cov_map_pool_ptr;
-
-/* SanCov edge count (emitted as i64 constant by SancovCount pass). */
-extern unsigned long __coqui_num_edges;
+/* Device-global virgin map (allocated at module load, accessed via cuModuleGetGlobal) */
+extern u8 __coqui_virgin_map[COQUI_COV_MAP_SIZE];
 
 #endif /* _COQUI_RUNTIME_H */

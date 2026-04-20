@@ -72,20 +72,6 @@ def main():
             "-O2", "-emit-llvm", "-c",
             "-g0", "-fno-stack-protector", "-fno-pic",
             "-D__COQUI_DEVICE__=1",
-            # SanitizerCoverage: emit per-edge guard variables + callbacks.
-            # The SancovCount pass renumbers the guards to 1-based sequential
-            # IDs, and coqui_sancov.c implements the trace_pc_guard callback.
-            #
-            # NOTE: `-fsanitize-coverage=trace-pc-guard` is silently dropped
-            # by the Clang driver when targeting NVPTX (see clang-21 -### output:
-            # the flag does NOT make it into the cc1 invocation). We bypass via
-            # -Xclang with the two internal cc1 flags, which successfully
-            # apply the SanitizerCoverage pass to NVPTX modules.
-            #
-            # -fsanitize-coverage-type=3 corresponds to CoverageEdge in LLVM
-            # (see clang/include/clang/Basic/CodeGenOptions.def).
-            "-Xclang", "-fsanitize-coverage-type=3",
-            "-Xclang", "-fsanitize-coverage-trace-pc-guard",
         ]
         for inc in args.includes:
             cmd += ["-I", inc]

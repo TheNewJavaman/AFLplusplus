@@ -118,14 +118,9 @@ typedef struct coqui_ctx {
   void *stream_b;     /* CUstream */
 
   /* Device-persistent buffers (CUdeviceptr = u64) */
-  unsigned long long d_virgin_map;        /* classified global cov bitmap (size = cov_map_size) */
+  unsigned long long d_virgin_map;
   unsigned long long d_global_statics_pool;
   unsigned long long d_slab_pool;
-  unsigned long long d_cov_map_pool;      /* per-thread counter pool (batch * cov_map_size) */
-
-  /* SanCov sizing (populated by coqui_init from the cubin) */
-  unsigned long long num_edges;      /* raw edge count from @__coqui_num_edges */
-  unsigned long long cov_map_size;   /* num_edges rounded up to 4 */
 
   /* Config from .conf sidecar */
   unsigned int real_stack_size;

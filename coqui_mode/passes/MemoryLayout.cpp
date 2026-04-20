@@ -1,26 +1,26 @@
 /*
- * MemoryLayout.cpp --- set up per-thread heap / shadow regions + cov pool binding.
+ * MemoryLayout.cpp --- set up per-thread stack regions.
  *
- * Iteration 10 rewrite: coverage map is no longer a per-thread 64 KB alloca.
- * Instead, the host cuMemAllocs a device-global pool of size
- * (batch_size * cov_map_size_rounded_up_to_4) where cov_map_size is derived
- * from @__coqui_num_edges emitted by the SancovCount pass. The host writes
- * the pool base pointer into the device global @__coqui_cov_map_pool_ptr.
+ * Inserts three allocas at kernel entry:
+ *   - cov_map  : 64 KB (aligned 8)
+ *   - heap     : H bytes (runtime-configured)
+ *   - shadow   : H/8 bytes (aligned 8)
  *
- * This pass:
- *   - Emits @__coqui_cov_map_pool_ptr (ptr, module-scope, addrspace 0),
- *     declared ExternalLinkage so the host can bind it via cuModuleGetGlobal.
- *   - Inserts heap + shadow allocas at kernel entry (unchanged from before).
- *   - Computes cov_base = cov_map_pool + tid * cov_map_size at kernel entry
- *     (reads the pool ptr from @__coqui_cov_map_pool_ptr and the size from
- *     @__coqui_num_edges rounded up to 4).
- *   - Stores (cov_base, heap_base, shadow_base) into the tid-indexed
- *     __coqui_thread_slots pool.
- *   - Emits __coqui_cov_base / __coqui_heap_base / __coqui_shadow_base getter
- *     functions.
+ * Stores their pointers into a tid-indexed addrspace(0) (.global) slot pool,
+ * then emits helper accessor functions that load from the per-thread slot.
  *
- * The removal of the 64 KB per-thread cov alloca cuts per-thread static stack
- * usage by 64 KB — for sm_75 + 8192 threads this frees ~512 MB of .local.
+ * Layout of __coqui_thread_slots[tid * SLOT_STRIDE + offset]:
+ *   offset  0 ..  7  : cov_base   ptr (i8*, 8 bytes)
+ *   offset  8 .. 15  : heap_base  ptr (i8*, 8 bytes)
+ *   offset 16 .. 23  : shadow_base ptr (i8*, 8 bytes)
+ *   offset 24 .. 31  : reserved
+ *
+ * Total footprint: 32 bytes/thread × 8192 threads = 256 KB in .global section.
+ *
+ * Configuration: the real-stack budget is controlled via the
+ * -coqui-stack-size=N opt flag (default 32768 B). coqui-cc forwards its
+ * --stack-size value to opt so the pass-derived heap/shadow sizes match the
+ * host's cuCtxSetLimit value. Without the flag, the default constant applies.
  */
 
 #include "Transforms.h"
@@ -35,15 +35,17 @@ using namespace llvm;
 
 namespace coqui {
 
-/* Per-thread total budget (heap + shadow + real stack). Matches the
- * CUDA driver-reported real-stack ceiling on sm_75 (512 KB but
- * typically 256 KB after the driver's max-resident-threads check). */
+/* Total per-thread budget. sm_75 hardware ceiling is 512KB but real devices
+ * typically allow 256KB (driver caps based on max-resident-threads × #SMs vs
+ * device .local memory). Conservative 256KB fits commonly seen Turing/Ampere
+ * driver budgets. coqui-cc may grow this into a CLI flag (--total-cap) later. */
+static constexpr unsigned kCovMapSize      = 65536;
 static constexpr unsigned kDefaultStackSize = 32768;
-static constexpr unsigned kTotalBudget      = 262144;
+static constexpr unsigned kTotalBudget     = 262144;
 
-/* --coqui-stack-size=N : real-stack budget in bytes (forwarded by
- * coqui-cc --stack-size). The heap + shadow sizes are derived from the
- * remainder. */
+/* --coqui-stack-size=N : real-stack budget in bytes. coqui-cc forwards its
+ * --stack-size value via this opt flag so the pass-produced heap/shadow
+ * sizes are consistent with the runtime cuCtxSetLimit value. */
 static cl::opt<unsigned> RealStackSizeOpt(
     "coqui-stack-size",
     cl::desc("Per-thread real-stack budget in bytes (heap/shadow derived from remainder)"),
@@ -71,70 +73,20 @@ static GlobalVariable *getOrMakeSlotPool(Module &M) {
       "__coqui_thread_slots"); /* default addrspace 0 = .global */
 }
 
-/* Module-scope device global holding the base pointer of the cov_map pool.
- * The host writes this via cuMemcpyHtoD after cuMemAllocing the pool,
- * looking up the symbol via cuModuleGetGlobal("__coqui_cov_map_pool_ptr").
- * Declared ExternalLinkage + default-initialized to nullptr; the initializer
- * is a placeholder — the host overrides it at init. */
-static GlobalVariable *getOrMakeCovPoolPtr(Module &M) {
-  if (auto *GV = M.getGlobalVariable("__coqui_cov_map_pool_ptr"))
-    return GV;
-  LLVMContext &C = M.getContext();
-  Type *PtrTy = PointerType::get(C, 0);
-  auto *GV = new GlobalVariable(
-      M, PtrTy, /*isConstant=*/false,
-      GlobalValue::ExternalLinkage,
-      Constant::getNullValue(PtrTy),
-      "__coqui_cov_map_pool_ptr");
-  GV->setAlignment(Align(8));
-  return GV;
-}
-
-/* @__coqui_num_edges is emitted as an i64 constant by the SancovCount pass
- * that runs before us. If SancovCount found at least one __sancov_gen_*
- * array, the value is the total edge count. Otherwise, it is 0 (legacy /
- * no-sancov build). We fall back to 65536 in the zero case so old callers
- * still work.
- *
- * cov_map_size (the per-thread footprint) is num_edges rounded up to 4 —
- * coverage_evaluate processes the map in 4-byte chunks. */
-static uint64_t readNumEdges(Module &M) {
-  GlobalVariable *GV = M.getGlobalVariable("__coqui_num_edges", true);
-  if (!GV) return 0;
-  if (!GV->hasInitializer()) return 0;
-  auto *C = dyn_cast<ConstantInt>(GV->getInitializer());
-  if (!C) return 0;
-  return C->getZExtValue();
-}
-
 bool runMemoryLayout(Module &M) {
   LLVMContext &C = M.getContext();
 
   /* Resolve real stack size: prefer --coqui-stack-size CLI if set, otherwise
-   * default constant. */
+   * default constant. Guard against a value that would leave nothing for heap. */
   unsigned realStack = RealStackSizeOpt;
-  if (realStack >= kTotalBudget) {
+  if (realStack + kCovMapSize >= kTotalBudget) {
     report_fatal_error(
-        "[coqui-cc] MemoryLayout: --coqui-stack-size exceeds 256KB budget");
+        "[coqui-cc] MemoryLayout: --coqui-stack-size + 64KB cov exceeds 256KB budget");
   }
-  /* The old layout always reserved 64 KB for cov before sizing heap/shadow.
-   * We no longer do per-thread cov allocas — it lives in a device-global pool
-   * — but we keep the same heap/shadow sizing formula so the numbers match
-   * what the kernel has historically run with. */
-  static constexpr unsigned kLegacyCov = 65536;
-  const unsigned remaining  = kTotalBudget - kLegacyCov - realStack;
+  const unsigned remaining  = kTotalBudget - kCovMapSize - realStack;
   const unsigned heapSize   = (remaining * 8) / 9;
   const unsigned shadowSize = heapSize / 8;
   const unsigned usableHeap = heapSize; /* heap + shadow are separate allocas */
-
-  /* Resolve per-thread coverage map size (bytes). Rounded up to 4 because
-   * coverage_evaluate walks in 4-byte chunks. Zero means the target was
-   * compiled without -fsanitize-coverage=trace-pc-guard; we still need a
-   * non-zero footprint so the host pool allocation succeeds — fall back to
-   * 1024 so the module still runs (but novelty will be permanently 0). */
-  uint64_t numEdges = readNumEdges(M);
-  uint64_t covMapSize = (numEdges + 3ULL) & ~3ULL;
-  if (covMapSize == 0) covMapSize = 1024; /* conservative fallback */
 
   /* 1. Find kernel entry */
   Function *Kernel = M.getFunction("__coqui_fuzz_kernel");
@@ -145,21 +97,21 @@ bool runMemoryLayout(Module &M) {
 
   Type *i8  = Type::getInt8Ty(C);
   Type *i32 = Type::getInt32Ty(C);
-  Type *i64 = Type::getInt64Ty(C);
   Type *i8p = PointerType::get(C, 0); /* addrspace(0) opaque pointer */
 
-  /* 2. Declare the addrspace(0) slot pool + cov pool ptr + tid helper. */
-  GlobalVariable *Pool       = getOrMakeSlotPool(M);
-  GlobalVariable *CovPoolPtr = getOrMakeCovPoolPtr(M);
+  /* 2. Declare the addrspace(0) slot pool and the tid helper. */
+  GlobalVariable *Pool = getOrMakeSlotPool(M);
 
   FunctionType *TidT = FunctionType::get(i32, /*isVarArg=*/false);
   FunctionCallee Tid = M.getOrInsertFunction("__coqui_fuzz_tid", TidT);
 
-  /* 3. Insert allocas at kernel entry (heap + shadow only), then store base
-   *    pointers into pool slots. Coverage lives in a device-global pool
-   *    indexed by tid * cov_map_size — no alloca needed. */
+  /* 3. Insert allocas at kernel entry, then store base pointers into pool slots */
   BasicBlock &EntryBB = Kernel->getEntryBlock();
   IRBuilder<> Builder(&EntryBB, EntryBB.begin());
+
+  AllocaInst *CovAlloca = Builder.CreateAlloca(
+      ArrayType::get(i8, kCovMapSize), nullptr, "cov_map");
+  CovAlloca->setAlignment(Align(8));
 
   AllocaInst *HeapAlloca = Builder.CreateAlloca(
       ArrayType::get(i8, heapSize), nullptr, "heap");
@@ -169,31 +121,24 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
-  /* Compute tid and base byte offset into the slot pool for this thread. */
+  /* Zero the coverage map at kernel entry; each thread accumulates fresh. */
+  Builder.CreateMemSet(CovAlloca,
+                       ConstantInt::get(i8, 0),
+                       static_cast<uint64_t>(kCovMapSize),
+                       MaybeAlign(Align(8)));
+
+  /* Compute tid and base byte offset into the pool for this thread. */
   Value *tid     = Builder.CreateCall(Tid, {}, "tid");
   Value *base32  = Builder.CreateMul(tid,
                                      ConstantInt::get(i32, SLOT_STRIDE),
                                      "tid_off");
 
-  /* Compute per-thread cov_base = cov_map_pool + tid * cov_map_size.
-   * Loaded at kernel entry once; stored into the slot so subsequent callers
-   * (ASan report path, post-kernel classify/virgin) can access it.
-   *
-   * Using i64 for the byte-stride to accommodate large batch × large
-   * per-thread map (e.g. 8192 × 16384 = 128 MB — well within u32 but we
-   * standardise on i64 for safety on future larger modules). */
-  Value *covPoolBase = Builder.CreateLoad(i8p, CovPoolPtr, "cov_pool_base");
-  Value *tid64       = Builder.CreateZExt(tid, i64, "tid64");
-  Value *covOffset   = Builder.CreateMul(
-      tid64, ConstantInt::get(i64, covMapSize), "cov_thread_off");
-  Value *covBase     = Builder.CreateGEP(i8, covPoolBase, covOffset, "cov_base_val");
-
-  /* Store cov_base pointer at offset OFF_COV_BASE */
+  /* Store cov_alloca pointer at offset OFF_COV_BASE */
   Value *covOffI32 = Builder.CreateAdd(base32,
                                        ConstantInt::get(i32, OFF_COV_BASE),
                                        "cov_off");
   Value *covSlot = Builder.CreateGEP(i8, Pool, covOffI32, "cov_slot");
-  Builder.CreateStore(covBase, covSlot);
+  Builder.CreateStore(CovAlloca, covSlot);
 
   /* Store heap_alloca pointer at offset OFF_HEAP_BASE */
   Value *heapOffI32 = Builder.CreateAdd(base32,
@@ -248,23 +193,6 @@ bool runMemoryLayout(Module &M) {
       BasicBlock *BB = BasicBlock::Create(C, "entry", F);
       IRBuilder<> B(BB);
       B.CreateRet(ConstantInt::get(i32, usableHeap));
-    }
-  }
-
-  /* __coqui_cov_map_size() — returns the per-thread cov map size in bytes
-   * (i64). The runtime uses this to size its coverage_evaluate walk. Falls
-   * back to 1024 if @__coqui_num_edges is zero (module built without
-   * -fsanitize-coverage=trace-pc-guard). */
-  {
-    FunctionType *FT = FunctionType::get(i64, /*isVarArg=*/false);
-    Function *F = cast<Function>(
-        M.getOrInsertFunction("__coqui_cov_map_size", FT).getCallee());
-    if (F->isDeclaration()) {
-      F->setLinkage(GlobalValue::InternalLinkage);
-      F->addFnAttr(Attribute::AlwaysInline);
-      BasicBlock *BB = BasicBlock::Create(C, "entry", F);
-      IRBuilder<> B(BB);
-      B.CreateRet(ConstantInt::get(i64, covMapSize));
     }
   }
 
