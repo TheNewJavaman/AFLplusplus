@@ -107,10 +107,16 @@ def main():
     # 3c. opt with coqui-link pipeline
     # Forward --stack-size to the pass via -coqui-stack-size so the IR
     # layout's heap/shadow sizes track the runtime cuCtxSetLimit value.
+    #
+    # Chain always-inline AFTER coqui-link: the ASan pass INSERTS calls to
+    # runtime fast-path wrappers (__coqui_asan_check_load/store_N) during
+    # this phase, so the inliner must run afterward to see those new call
+    # sites. Runtime fast-path wrappers carry always_inline; their outlined
+    # slow-path counterparts carry noinline and remain as calls.
     transformed_bc = workdir / "transformed.bc"
     run([
         "opt", "-load-pass-plugin", PASS_PLUGIN,
-        "-passes=coqui-link",
+        "-passes=coqui-link,always-inline",
         f"-coqui-stack-size={args.stack_size}",
         str(with_runtime_bc), "-o", str(transformed_bc),
     ])
@@ -130,9 +136,16 @@ def main():
         sys.exit(0)
 
     # 5. ptxas -> .cubin
+    #
+    # --maxrregcount=120 clamps registers/thread to 120 so we stay in the 128-
+    # register occupancy tier on sm_75. Outlined-ASan (step 3c) inflated the
+    # fast path's live ranges enough that ptxas would otherwise pick 136 regs
+    # (measured in iter 8), knocking occupancy down. 120 was the pre-iter-8
+    # natural value, and ptxas spills the overflow into the existing .local
+    # frame without growing the real stack (observed in iter 4).
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
     run([
-        "ptxas", f"-arch={arch}", "-O1",
+        "ptxas", f"-arch={arch}", "-O1", "--maxrregcount=120",
         str(ptx_path), "-o", str(cubin),
     ])
 
