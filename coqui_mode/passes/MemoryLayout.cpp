@@ -105,11 +105,51 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
-  /* Zero the coverage map at kernel entry; each thread accumulates fresh. */
-  Builder.CreateMemSet(CovAlloca,
-                       ConstantInt::get(i8, 0),
-                       static_cast<uint64_t>(kCovMapSize),
-                       MaybeAlign(Align(8)));
+  /* Zero the coverage map at kernel entry; each thread accumulates fresh.
+   *
+   * A naive CreateMemSet(CovAlloca, 0, 65536, Align(8)) lowers on NVPTX to
+   * 65536 ST.E.U8 per-byte stores (SASS confirms). To avoid that, emit an
+   * explicit i64 store loop: 8192 iterations × one ST.E.U64 each. NVPTX
+   * reliably vectorizes this into wider stores (ST.E.64 / ST.E.128). */
+  Type *i64 = Type::getInt64Ty(C);
+  {
+    const uint64_t kWords = kCovMapSize / 8; /* 8192 × i64 = 65536 bytes */
+    /* Split the current entry block so we can splice in: entry -> loop -> cont.
+     * Everything we've emitted so far (the three allocas) stays in the entry
+     * block; "cont" receives all later code naturally as we keep using
+     * Builder.  SplitBasicBlock puts an unconditional br entry -> cont; we
+     * replace that with entry -> loopBB, loopBB -> cont. */
+    BasicBlock *ContBB = EntryBB.splitBasicBlock(Builder.GetInsertPoint(),
+                                                 "cov_zero_cont");
+    /* splitBasicBlock leaves Builder's insert point at ContBB-beginning.
+     * EntryBB now ends with an unconditional branch to ContBB; we'll
+     * replace that with a branch to a new loop block. */
+    BasicBlock *LoopBB = BasicBlock::Create(C, "cov_zero_loop", Kernel,
+                                            ContBB);
+    /* Rewire entry's terminator to go to LoopBB instead of ContBB. */
+    Instruction *OldTerm = EntryBB.getTerminator();
+    IRBuilder<> ETB(OldTerm);
+    ETB.CreateBr(LoopBB);
+    OldTerm->eraseFromParent();
+
+    /* Emit the loop body: phi i ∈ [0, kWords), store 0 at CovAlloca + i*8. */
+    IRBuilder<> LB(LoopBB);
+    PHINode *IV = LB.CreatePHI(i64, 2, "iv");
+    IV->addIncoming(ConstantInt::get(i64, 0), &EntryBB);
+    /* GEP as i64* — CovAlloca already has align 8 which matches. */
+    Value *Slot = LB.CreateGEP(i64, CovAlloca, {IV}, "cov_word");
+    StoreInst *S = LB.CreateStore(ConstantInt::get(i64, 0), Slot);
+    S->setAlignment(Align(8));
+    Value *Next = LB.CreateAdd(IV, ConstantInt::get(i64, 1), "iv_next");
+    Value *Done = LB.CreateICmpEQ(Next, ConstantInt::get(i64, kWords),
+                                  "cov_zero_done");
+    LB.CreateCondBr(Done, ContBB, LoopBB);
+    IV->addIncoming(Next, LoopBB);
+
+    /* Reposition Builder at the start of ContBB so the rest of this pass
+     * keeps appending there (pool-slot stores, tid mul, etc.). */
+    Builder.SetInsertPoint(ContBB, ContBB->begin());
+  }
 
   /* Compute tid and base byte offset into the pool for this thread. */
   Value *tid     = Builder.CreateCall(Tid, {}, "tid");
