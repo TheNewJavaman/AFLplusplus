@@ -105,10 +105,17 @@ def main():
     run(["llvm-link", str(pruned_bc), RUNTIME_BC, "-o", str(with_runtime_bc)])
 
     # 3c. opt with coqui-link pipeline
+    # Run always-inline AFTER coqui-link: the ASan pass INSERTS calls to
+    # runtime check helpers (__coqui_asan_check_load_N, etc.) during this
+    # phase, so the inliner must run afterward to see those new call sites.
+    # Runtime helpers marked with __attribute__((always_inline)) — ASan checks,
+    # libc shims, small memory helpers — get inlined at every call site.
+    # Avoid general -O2 inliner — it triggers IPA passes (internalize/globaldce
+    # elsewhere) that the rest of the pipeline doesn't expect.
     transformed_bc = workdir / "transformed.bc"
     run([
         "opt", "-load-pass-plugin", PASS_PLUGIN,
-        "-passes=coqui-link",
+        "-passes=coqui-link,always-inline",
         str(with_runtime_bc), "-o", str(transformed_bc),
     ])
 

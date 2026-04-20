@@ -62,7 +62,8 @@ void __coqui_asan_register_slab(void *(*m)(unsigned long), void (*f)(void *)) {
  * Uses 8-byte stores where possible (8x fewer stores on NVPTX global mem).
  * heap_off and n are byte offsets/sizes in the usable heap.
  */
-static void asan_poison_range(unsigned long heap_off, unsigned long n,
+__attribute__((always_inline))
+static inline void asan_poison_range(unsigned long heap_off, unsigned long n,
                                u8 value) {
     u8 *shadow = __coqui_shadow_base();
     unsigned long start = heap_off >> 3;
@@ -102,7 +103,8 @@ static void asan_poison_range(unsigned long heap_off, unsigned long n,
  * Handles partial tail granule: if n is not a multiple of 8, the last
  * shadow byte gets the partial-accessible encoding (= n & 7).
  */
-static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
+__attribute__((always_inline))
+static inline void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
     u8 *shadow = __coqui_shadow_base();
 
     unsigned long aligned    = n & ~7UL;
@@ -146,6 +148,9 @@ static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
  */
 extern coqui_status_t *__coqui_status_array;
 
+/* Not always_inline: asan_report is the cold error path. Inlining it into every
+ * check site pulls in __coqui_fuzz_tid + __coqui_exit and blows register pressure
+ * past the 128/thread budget. Keep as a call — error paths are rare. */
 static void asan_report(int error_type) {
     u32 tid = __coqui_fuzz_tid();
     __coqui_status_array[tid].asan_error = (u8)error_type;
@@ -164,7 +169,8 @@ static void asan_report(int error_type) {
  * Iterates over every shadow granule touched by the access, matching the
  * reference implementation's multi-granule loop.
  */
-static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
+__attribute__((always_inline))
+static inline int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
     u8  *heap     = __coqui_heap_base();
     u32  heap_sz  = __coqui_heap_size();
     u8  *shadow   = __coqui_shadow_base();
@@ -211,11 +217,13 @@ static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
  * ===-------------------------------------------------------------------=== */
 
 #define CHECK_IMPL(N)                                                   \
-    void __coqui_asan_check_load_##N(void *ptr) {                       \
+    __attribute__((always_inline))                                       \
+    void __coqui_asan_check_load_##N(void *ptr) {                        \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
     }                                                                    \
-    void __coqui_asan_check_store_##N(void *ptr) {                      \
+    __attribute__((always_inline))                                       \
+    void __coqui_asan_check_store_##N(void *ptr) {                       \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
     }

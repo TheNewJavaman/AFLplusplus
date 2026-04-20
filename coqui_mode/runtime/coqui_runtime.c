@@ -18,6 +18,7 @@ __attribute__((used))
 coqui_status_t *__coqui_status_array;
 
 /* Thread identity via clang NVPTX intrinsic builtins (lower to mov.u32 %r, %tid.x etc). */
+__attribute__((always_inline))
 u32 __coqui_fuzz_tid(void) {
     return (u32)__nvvm_read_ptx_sreg_ctaid_x()
          * (u32)__nvvm_read_ptx_sreg_ntid_x()
@@ -25,11 +26,13 @@ u32 __coqui_fuzz_tid(void) {
 }
 
 /* Unrecoverable abort — PTX trap; exit; */
+__attribute__((always_inline))
 void __coqui_trap(void) {
     __builtin_trap();
 }
 
 /* Clean per-thread exit — PTX exit;. No clang builtin; inline asm. */
+__attribute__((always_inline))
 void __coqui_exit(void) {
     __asm__ volatile("exit;");
 }

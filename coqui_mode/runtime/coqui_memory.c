@@ -27,10 +27,12 @@ typedef struct heap_hdr {
 #define BLOCK_HDR_SIZE 8u                   /* [size:u32][pad:u32] */
 
 /* Align up to 8 bytes. */
-static u32 align8(u32 x) { return (x + 7u) & ~7u; }
+__attribute__((always_inline))
+static inline u32 align8(u32 x) { return (x + 7u) & ~7u; }
 
 /* Get this thread's heap control header. */
-static heap_hdr_t *heap_hdr(void) {
+__attribute__((always_inline))
+static inline heap_hdr_t *heap_hdr(void) {
     return (heap_hdr_t *)__coqui_heap_base();
 }
 
@@ -123,13 +125,15 @@ void __coqui_free(void *ptr) {
 
 /* Internal byte-wise memset / memcpy for runtime use. User-facing memcpy/memset
    go through clang's intrinsic lowering, not these. */
-static void *memset_u8(void *dst, int c, unsigned long n) {
+__attribute__((always_inline))
+static inline void *memset_u8(void *dst, int c, unsigned long n) {
     u8 *d = (u8 *)dst;
     for (unsigned long i = 0; i < n; i++) d[i] = (u8)c;
     return dst;
 }
 
-static void *memcpy_u8(void *dst, const void *src, unsigned long n) {
+__attribute__((always_inline))
+static inline void *memcpy_u8(void *dst, const void *src, unsigned long n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
     for (unsigned long i = 0; i < n; i++) d[i] = s[i];
