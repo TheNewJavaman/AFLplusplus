@@ -127,14 +127,9 @@ def main():
         sys.exit(0)
 
     # 5. ptxas -> .cubin
-    #    --maxrregcount clamps per-thread register use so more blocks can be
-    #    resident per SM (improves occupancy). Trade-off: spills to .local
-    #    (counted in STACK per cuobjdump --dump-resource-usage). On memory-
-    #    bound kernels the occupancy gain typically dominates.
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
     run([
         "ptxas", f"-arch={arch}", "-O1",
-        "--maxrregcount=80",
         str(ptx_path), "-o", str(cubin),
     ])
 
