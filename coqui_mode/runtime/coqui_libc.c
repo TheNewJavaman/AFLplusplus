@@ -16,27 +16,23 @@
 
 #include "coqui_runtime.h"
 
-__attribute__((always_inline))
 unsigned long __coqui_strlen(const char *s) {
     unsigned long n = 0;
     while (s[n]) n++;
     return n;
 }
 
-__attribute__((always_inline))
 int __coqui_strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-__attribute__((always_inline))
 int __coqui_strncmp(const char *a, const char *b, unsigned long n) {
     while (n-- && *a && *a == *b) { a++; b++; }
     if (n == (unsigned long)-1) return 0;
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-__attribute__((always_inline))
 int __coqui_memcmp(const void *a, const void *b, unsigned long n) {
     const unsigned char *p = (const unsigned char *)a;
     const unsigned char *q = (const unsigned char *)b;
@@ -47,7 +43,6 @@ int __coqui_memcmp(const void *a, const void *b, unsigned long n) {
     return 0;
 }
 
-__attribute__((always_inline))
 char *__coqui_strchr(const char *s, int c) {
     while (*s) {
         if (*s == (char)c) return (char *)s;
