@@ -30,24 +30,51 @@ u8 __coqui_count_class_lookup[256] = {
     [128 ... 255] = COQUI_BUCKET_128_UP,
 };
 
+/* Byte-LUT classify of one u64 (in/out via pointer). Marked static inline
+ * so the chunked outer loop can inline it and the compiler keeps `word` in
+ * a register. Byte-identical output to the previous per-word code. */
+static inline void __coqui_classify_word(u64 *w) {
+    u64 word = *w;
+    u8 *bytes = (u8 *)&word;
+    bytes[0] = __coqui_count_class_lookup[bytes[0]];
+    bytes[1] = __coqui_count_class_lookup[bytes[1]];
+    bytes[2] = __coqui_count_class_lookup[bytes[2]];
+    bytes[3] = __coqui_count_class_lookup[bytes[3]];
+    bytes[4] = __coqui_count_class_lookup[bytes[4]];
+    bytes[5] = __coqui_count_class_lookup[bytes[5]];
+    bytes[6] = __coqui_count_class_lookup[bytes[6]];
+    bytes[7] = __coqui_count_class_lookup[bytes[7]];
+    *w = word;
+}
+
+/* Cacheline-chunked classify: 8 u64s (64 bytes) per outer iteration. A
+ * single OR across the 8 loaded words lets us skip whole cachelines when
+ * they're all zero, which is the common case for sparse cov_maps. The
+ * compiler is free to coalesce the 8 adjacent 64-bit loads into wider
+ * LDG.E.128 instructions. Per-word classify semantics unchanged. */
 void __coqui_classify_counts(u8 *map) {
     u64 *m64 = (u64 *)map;
-    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
+    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
+    /* n_chunks is 8192 == multiple of 8 (1024 cachelines). */
 
-    for (u32 i = 0; i < n_chunks; i++) {
-        u64 word = m64[i];
-        if (word == 0) continue;
+    for (u32 i = 0; i < n_chunks; i += 8) {
+        u64 w0 = m64[i+0], w1 = m64[i+1], w2 = m64[i+2], w3 = m64[i+3];
+        u64 w4 = m64[i+4], w5 = m64[i+5], w6 = m64[i+6], w7 = m64[i+7];
 
-        u8 *bytes = (u8 *)&word;
-        bytes[0] = __coqui_count_class_lookup[bytes[0]];
-        bytes[1] = __coqui_count_class_lookup[bytes[1]];
-        bytes[2] = __coqui_count_class_lookup[bytes[2]];
-        bytes[3] = __coqui_count_class_lookup[bytes[3]];
-        bytes[4] = __coqui_count_class_lookup[bytes[4]];
-        bytes[5] = __coqui_count_class_lookup[bytes[5]];
-        bytes[6] = __coqui_count_class_lookup[bytes[6]];
-        bytes[7] = __coqui_count_class_lookup[bytes[7]];
-        m64[i] = word;
+        if (i + 8 < n_chunks) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"((const void *)&m64[i+8]));
+        }
+
+        if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) continue;
+
+        if (w0) { __coqui_classify_word(&w0); m64[i+0] = w0; }
+        if (w1) { __coqui_classify_word(&w1); m64[i+1] = w1; }
+        if (w2) { __coqui_classify_word(&w2); m64[i+2] = w2; }
+        if (w3) { __coqui_classify_word(&w3); m64[i+3] = w3; }
+        if (w4) { __coqui_classify_word(&w4); m64[i+4] = w4; }
+        if (w5) { __coqui_classify_word(&w5); m64[i+5] = w5; }
+        if (w6) { __coqui_classify_word(&w6); m64[i+6] = w6; }
+        if (w7) { __coqui_classify_word(&w7); m64[i+7] = w7; }
     }
 }
 
@@ -63,28 +90,78 @@ void __coqui_classify_counts(u8 *map) {
  * two maps that differ only in which zeros are skipped can't collide. */
 u32 __coqui_classify_counts_and_sig(u8 *map) {
     u64 *m64 = (u64 *)map;
-    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
+    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
     u32 h = COQUI_FNV32_OFFSET;
+    /* Chunked 8-u64 (64-byte cacheline) walk. FNV semantics preserved:
+     * each nonzero word still folds (i, lo, hi) in ascending-index order,
+     * so the returned hash is byte-identical to the per-word variant. */
 
-    for (u32 i = 0; i < n_chunks; i++) {
-        u64 word = m64[i];
-        if (word == 0) continue;
+    for (u32 i = 0; i < n_chunks; i += 8) {
+        u64 w0 = m64[i+0], w1 = m64[i+1], w2 = m64[i+2], w3 = m64[i+3];
+        u64 w4 = m64[i+4], w5 = m64[i+5], w6 = m64[i+6], w7 = m64[i+7];
 
-        u8 *bytes = (u8 *)&word;
-        bytes[0] = __coqui_count_class_lookup[bytes[0]];
-        bytes[1] = __coqui_count_class_lookup[bytes[1]];
-        bytes[2] = __coqui_count_class_lookup[bytes[2]];
-        bytes[3] = __coqui_count_class_lookup[bytes[3]];
-        bytes[4] = __coqui_count_class_lookup[bytes[4]];
-        bytes[5] = __coqui_count_class_lookup[bytes[5]];
-        bytes[6] = __coqui_count_class_lookup[bytes[6]];
-        bytes[7] = __coqui_count_class_lookup[bytes[7]];
-        m64[i] = word;
+        if (i + 8 < n_chunks) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"((const void *)&m64[i+8]));
+        }
 
-        /* Fold the index then the low and high halves. */
-        h = (h ^ i)                 * COQUI_FNV32_PRIME;
-        h = (h ^ (u32)(word))       * COQUI_FNV32_PRIME;
-        h = (h ^ (u32)(word >> 32)) * COQUI_FNV32_PRIME;
+        if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) continue;
+
+        if (w0) {
+            __coqui_classify_word(&w0);
+            m64[i+0] = w0;
+            h = (h ^ (i+0))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w0))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w0 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w1) {
+            __coqui_classify_word(&w1);
+            m64[i+1] = w1;
+            h = (h ^ (i+1))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w1))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w1 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w2) {
+            __coqui_classify_word(&w2);
+            m64[i+2] = w2;
+            h = (h ^ (i+2))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w2))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w2 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w3) {
+            __coqui_classify_word(&w3);
+            m64[i+3] = w3;
+            h = (h ^ (i+3))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w3))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w3 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w4) {
+            __coqui_classify_word(&w4);
+            m64[i+4] = w4;
+            h = (h ^ (i+4))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w4))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w4 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w5) {
+            __coqui_classify_word(&w5);
+            m64[i+5] = w5;
+            h = (h ^ (i+5))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w5))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w5 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w6) {
+            __coqui_classify_word(&w6);
+            m64[i+6] = w6;
+            h = (h ^ (i+6))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w6))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w6 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w7) {
+            __coqui_classify_word(&w7);
+            m64[i+7] = w7;
+            h = (h ^ (i+7))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w7))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w7 >> 32))   * COQUI_FNV32_PRIME;
+        }
     }
     return h;
 }
