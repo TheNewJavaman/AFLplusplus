@@ -16,7 +16,9 @@
 #include "coqui_runtime.h"
 #include <stdatomic.h>
 
-/* Bucket lookup — matches AFL's count_class_lookup16. */
+/* Bucket lookup — matches AFL's count_class_lookup16.
+ * Retained for any off-hot-path caller and for the `#if 0` self-check
+ * below; the hot classify loops use SWAR via vset4.u32.u32.ge instead. */
 __attribute__((section(".const"), used))
 u8 __coqui_count_class_lookup[256] = {
     [0]   = COQUI_BUCKET_0,
@@ -30,6 +32,80 @@ u8 __coqui_count_class_lookup[256] = {
     [128 ... 255] = COQUI_BUCKET_128_UP,
 };
 
+/* Byte-parallel ≥ compare via PTX vset4. Returns {0x00 | 0x01} per byte
+ * (bit 0 set iff byte of `a` ≥ `T`). Single PTX instruction on all
+ * capabilities from sm_52 upward. */
+__attribute__((always_inline))
+static inline u32 __coqui_vset4_ge(u32 a, u32 T) {
+    u32 r;
+    asm("vset4.u32.u32.ge %0, %1, %2, %3;"
+        : "=r"(r) : "r"(a), "r"(T), "r"(0));
+    return r;
+}
+
+/* SWAR classify of one u32 (4 packed bytes). Output byte is one-hot
+ * encoding of which bucket the input byte falls in:
+ *   0     → 0x00
+ *   1     → 0x01
+ *   2     → 0x02
+ *   3     → 0x04
+ *   4..7  → 0x08
+ *   8..15 → 0x10
+ *   16..31  → 0x20
+ *   32..127 → 0x40
+ *   128..255 → 0x80
+ *
+ * Strategy: compute `g_T = vset4.ge(a, T)` (bit 0 per byte) for the
+ * bucket thresholds T ∈ {1,2,3,4,8,16,32,128}. Because thresholds are
+ * sorted and g is monotone (g_Tlo ⊇ g_Thi), XOR of adjacent masks gives
+ * the exclusive range indicator; shift each into the right bit slot
+ * within the byte and OR. Note: 3 is its own bucket (0x04) — the XOR
+ * (g3 ^ g4) handles the exception naturally. */
+__attribute__((always_inline))
+static inline u32 __coqui_classify_u32_swar(u32 w) {
+    u32 g1   = __coqui_vset4_ge(w, 1);
+    u32 g2   = __coqui_vset4_ge(w, 2);
+    u32 g3   = __coqui_vset4_ge(w, 3);
+    u32 g4   = __coqui_vset4_ge(w, 4);
+    u32 g8   = __coqui_vset4_ge(w, 8);
+    u32 g16  = __coqui_vset4_ge(w, 16);
+    u32 g32  = __coqui_vset4_ge(w, 32);
+    u32 g128 = __coqui_vset4_ge(w, 128);
+    return  (g1  ^ g2)
+         | ((g2  ^ g3)   << 1)
+         | ((g3  ^ g4)   << 2)
+         | ((g4  ^ g8)   << 3)
+         | ((g8  ^ g16)  << 4)
+         | ((g16 ^ g32)  << 5)
+         | ((g32 ^ g128) << 6)
+         | ( g128        << 7);
+}
+
+__attribute__((always_inline))
+static inline u64 __coqui_classify_u64_swar(u64 word) {
+    u32 lo = (u32)word;
+    u32 hi = (u32)(word >> 32);
+    u32 clo = __coqui_classify_u32_swar(lo);
+    u32 chi = __coqui_classify_u32_swar(hi);
+    return ((u64)chi << 32) | (u64)clo;
+}
+
+/* Self-check (disabled). Re-enable by flipping to #if 1 to assert the
+ * SWAR formulation matches the LUT for every input byte 0..255. */
+#if 0
+static void __coqui_classify_self_check(void) {
+    for (u32 b = 0; b < 256; b++) {
+        u64 w = (u64)b * 0x0101010101010101ULL;
+        u64 swar = __coqui_classify_u64_swar(w);
+        u64 lut = 0;
+        for (int k = 0; k < 8; k++) {
+            lut |= ((u64)__coqui_count_class_lookup[b]) << (k * 8);
+        }
+        if (swar != lut) __coqui_trap();
+    }
+}
+#endif
+
 void __coqui_classify_counts(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
@@ -37,17 +113,7 @@ void __coqui_classify_counts(u8 *map) {
     for (u32 i = 0; i < n_chunks; i++) {
         u64 word = m64[i];
         if (word == 0) continue;
-
-        u8 *bytes = (u8 *)&word;
-        bytes[0] = __coqui_count_class_lookup[bytes[0]];
-        bytes[1] = __coqui_count_class_lookup[bytes[1]];
-        bytes[2] = __coqui_count_class_lookup[bytes[2]];
-        bytes[3] = __coqui_count_class_lookup[bytes[3]];
-        bytes[4] = __coqui_count_class_lookup[bytes[4]];
-        bytes[5] = __coqui_count_class_lookup[bytes[5]];
-        bytes[6] = __coqui_count_class_lookup[bytes[6]];
-        bytes[7] = __coqui_count_class_lookup[bytes[7]];
-        m64[i] = word;
+        m64[i] = __coqui_classify_u64_swar(word);
     }
 }
 
@@ -70,15 +136,7 @@ u32 __coqui_classify_counts_and_sig(u8 *map) {
         u64 word = m64[i];
         if (word == 0) continue;
 
-        u8 *bytes = (u8 *)&word;
-        bytes[0] = __coqui_count_class_lookup[bytes[0]];
-        bytes[1] = __coqui_count_class_lookup[bytes[1]];
-        bytes[2] = __coqui_count_class_lookup[bytes[2]];
-        bytes[3] = __coqui_count_class_lookup[bytes[3]];
-        bytes[4] = __coqui_count_class_lookup[bytes[4]];
-        bytes[5] = __coqui_count_class_lookup[bytes[5]];
-        bytes[6] = __coqui_count_class_lookup[bytes[6]];
-        bytes[7] = __coqui_count_class_lookup[bytes[7]];
+        word = __coqui_classify_u64_swar(word);
         m64[i] = word;
 
         /* Fold the index then the low and high halves. */
