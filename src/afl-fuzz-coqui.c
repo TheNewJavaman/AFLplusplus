@@ -318,9 +318,17 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
 
-  /* H->D */
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_bytes,
-                             b->h_input_bytes, ctx->byte_budget, s));
+  /* H->D — only copy the live prefix of input_bytes. Kernel reads only
+   * input_bytes[offsets[tid]..+lens[tid]] and empty-slot threads
+   * (lens[tid]==0) short-circuit at FuzzEntry.cpp L112-113 before any
+   * read. Stale tail from previous batches is inert. Round up to
+   * 8-byte alignment to match the slot cursor maintained by
+   * coqui_submit_input (off = (bytes_used + 7) & ~7u). */
+  size_t input_bytes_len = (b->bytes_used + 7u) & ~(size_t)7u;
+  if (input_bytes_len > 0) {
+    CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_bytes,
+                               b->h_input_bytes, input_bytes_len, s));
+  }
   CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_offsets,
                              b->h_offsets, ctx->batch_size * 4, s));
   CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_lens,
