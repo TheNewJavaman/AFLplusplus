@@ -215,81 +215,16 @@ static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
 
 /* ===-------------------------------------------------------------------===
  * Size-specialized check functions (called by instrumented code)
- *
- * Split into a FAST PATH (inlined at every call site) and a SLOW PATH
- * (outlined, shared by all call sites of the same size). Pattern follows
- * coqui upstream commits 26c9110 / 61bd5e4 / b5baaad: the common case
- * (access outside heap, or shadow byte == ASAN_CLEAN) is ~5-10 SASS insns
- * inline; the rare case (poisoned / partial granule) falls through to a
- * single outlined slow-path function that runs the full asan_check_access
- * multi-granule walk.
- *
- * Fast path:
- *   1. pointer not in heap → clean (not our concern)
- *   2. first granule shadow byte == 0 AND, if access crosses granule,
- *      second granule shadow byte == 0 → clean
- *   otherwise → fall through to slow path
- *
- * This is CONSERVATIVE: a partial granule (s in 1..7) with a clean in-bounds
- * access triggers a slow-path call even though the full checker would return
- * clean too. That is safe (correctness preserved) and the slow path decides
- * correctly.
  * ===-------------------------------------------------------------------=== */
 
-static inline __attribute__((always_inline))
-int asan_fastpath_ok(void *ptr, u8 access_size) {
-    u8  *heap        = __coqui_heap_base();
-    u32  heap_sz     = __coqui_heap_size();
-    unsigned long a          = (unsigned long)ptr;
-    unsigned long heap_start = (unsigned long)heap;
-
-    /* Pointer outside the usable heap — not our concern, treat as clean. */
-    if (a < heap_start || a + access_size > heap_start + heap_sz)
-        return 1;
-
-    unsigned long off    = a - heap_start;
-    u8 *shadow           = __coqui_shadow_base();
-    u8 s                 = shadow[off >> 3];
-
-    /* First granule must be fully clean. */
-    if (s != ASAN_CLEAN) return 0;
-
-    /* If the access crosses into a second granule, check that one too. */
-    unsigned long end_off = off + (unsigned long)access_size - 1u;
-    if ((end_off >> 3) != (off >> 3)) {
-        s = shadow[end_off >> 3];
-        if (s != ASAN_CLEAN) return 0;
-    }
-    return 1;
-}
-
-#define SLOWPATH_IMPL(N)                                                \
-    __attribute__((noinline))                                            \
-    void __coqui_asan_slowpath_load_##N(void *ptr) {                     \
-        int err = 0;                                                     \
-        if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
-    }                                                                    \
-    __attribute__((noinline))                                            \
-    void __coqui_asan_slowpath_store_##N(void *ptr) {                    \
-        int err = 0;                                                     \
-        if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
-    }
-
-SLOWPATH_IMPL(1)
-SLOWPATH_IMPL(2)
-SLOWPATH_IMPL(4)
-SLOWPATH_IMPL(8)
-
 #define CHECK_IMPL(N)                                                   \
-    __attribute__((always_inline))                                       \
     void __coqui_asan_check_load_##N(void *ptr) {                       \
-        if (asan_fastpath_ok(ptr, (u8)(N))) return;                     \
-        __coqui_asan_slowpath_load_##N(ptr);                             \
+        int err = 0;                                                     \
+        if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
     }                                                                    \
-    __attribute__((always_inline))                                       \
     void __coqui_asan_check_store_##N(void *ptr) {                      \
-        if (asan_fastpath_ok(ptr, (u8)(N))) return;                     \
-        __coqui_asan_slowpath_store_##N(ptr);                            \
+        int err = 0;                                                     \
+        if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
     }
 
 CHECK_IMPL(1)
