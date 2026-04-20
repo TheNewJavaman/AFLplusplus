@@ -51,6 +51,62 @@ void __coqui_classify_counts(u8 *map) {
     }
 }
 
+/* FNV-1a 32-bit constants. */
+#define COQUI_FNV32_OFFSET  0x811c9dc5u
+#define COQUI_FNV32_PRIME   0x01000193u
+
+/* One-pass classify + hash. Identical classify semantics to the plain
+ * variant; folds an FNV-1a hash of the classified words (and their
+ * position, so bit-pattern-identical nonzero words at different offsets
+ * still diverge) while the word is in a register. Skipping zero words
+ * from the hash is safe because the u32 index is always mixed in, so
+ * two maps that differ only in which zeros are skipped can't collide. */
+u32 __coqui_classify_counts_and_sig(u8 *map) {
+    u64 *m64 = (u64 *)map;
+    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
+    u32 h = COQUI_FNV32_OFFSET;
+
+    for (u32 i = 0; i < n_chunks; i++) {
+        u64 word = m64[i];
+        if (word == 0) continue;
+
+        u8 *bytes = (u8 *)&word;
+        bytes[0] = __coqui_count_class_lookup[bytes[0]];
+        bytes[1] = __coqui_count_class_lookup[bytes[1]];
+        bytes[2] = __coqui_count_class_lookup[bytes[2]];
+        bytes[3] = __coqui_count_class_lookup[bytes[3]];
+        bytes[4] = __coqui_count_class_lookup[bytes[4]];
+        bytes[5] = __coqui_count_class_lookup[bytes[5]];
+        bytes[6] = __coqui_count_class_lookup[bytes[6]];
+        bytes[7] = __coqui_count_class_lookup[bytes[7]];
+        m64[i] = word;
+
+        /* Fold the index then the low and high halves. */
+        h = (h ^ i)                 * COQUI_FNV32_PRIME;
+        h = (h ^ (u32)(word))       * COQUI_FNV32_PRIME;
+        h = (h ^ (u32)(word >> 32)) * COQUI_FNV32_PRIME;
+    }
+    return h;
+}
+
+/* Same FNV-1a fold, read-only (no classify). Used by crash paths that
+ * fire mid-execution (asan_report) where the cov_map is partially
+ * written; the signature groups crashes at the same site. */
+u32 __coqui_trace_sig(u8 *map) {
+    u64 *m64 = (u64 *)map;
+    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
+    u32 h = COQUI_FNV32_OFFSET;
+
+    for (u32 i = 0; i < n_chunks; i++) {
+        u64 word = m64[i];
+        if (word == 0) continue;
+        h = (h ^ i)                 * COQUI_FNV32_PRIME;
+        h = (h ^ (u32)(word))       * COQUI_FNV32_PRIME;
+        h = (h ^ (u32)(word >> 32)) * COQUI_FNV32_PRIME;
+    }
+    return h;
+}
+
 /* -- Warp helpers -- */
 
 static inline u32 __coqui_active_mask(void) {

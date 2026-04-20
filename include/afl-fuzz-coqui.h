@@ -26,14 +26,25 @@ struct afl_state;  /* forward */
  * Data types
  * ------------------------------------------------------------------------*/
 
-/* Per-input status returned by the GPU kernel (or stub). */
+/* Per-input status returned by the GPU kernel.
+ *
+ * IMPORTANT: field order + layout MUST match the device-side definition in
+ * coqui_mode/runtime/coqui_runtime.h byte-for-byte. The kernel uses its own
+ * 16-byte stride; cuMemAlloc on the host uses sizeof of THIS struct; if
+ * the two disagree, writes alias across slots and the host reads garbage.
+ *
+ * Prior versions of this struct were 8 bytes with a reordered field list —
+ * a latent bug that caused every non-novel input to appear "crashed" on the
+ * host (phase=COMPLETE read as asan_error=6). Fixed in iter5 P1 as part of
+ * adding crash_sig for crash-verify deduplication. */
 typedef struct coqui_status {
-  u8  asan_error;     /* non-zero if ASan tripped */
+  u8  phase;          /* kernel-side phase marker (PHASE_COMPLETE on success) */
+  u8  signal;         /* POSIX signal number or 0 */
+  u8  asan_error;     /* non-zero if ASan check tripped */
   u8  ubsan_fatal;    /* non-zero if non-recoverable UBSan fired */
-  u8  signal;         /* non-zero = signal number that killed this thread */
-  u8  timeout_flag;   /* non-zero if this input exceeded per-thread budget */
-  u32 _reserved;      /* padding / future use */
-} coqui_status_t;
+  u32 crash_sig;      /* FNV-1a signature of classified cov_map (for dedup) */
+  u64 _reserved1;
+} coqui_status_t;     /* 16 bytes — DO NOT CHANGE without updating runtime header */
 
 /* One ping-pong half: packed input bytes + metadata + device mirrors. */
 typedef struct coqui_batch {
@@ -82,6 +93,8 @@ typedef struct coqui_ctx {
   u64 oversized_count; /* inputs skipped because they alone exceed byte_budget */
   u64 launch_count;    /* batches launched so far */
   u64 total_submits;   /* diagnostic: total coqui_submit_input calls */
+  u64 crash_dedup_hits;/* crash-verify calls skipped because signature already seen in batch */
+  u64 crash_verify_calls; /* crash-verify calls actually issued (for ratio sanity) */
 
   /* CPU-side speed gate (ported from coqui driver 9d85772). Blocks corpus
    * admission of inputs that verify >10× slower than baseline, preventing

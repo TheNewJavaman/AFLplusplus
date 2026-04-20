@@ -67,9 +67,12 @@ bool runFuzzEntry(Module &M) {
     FunctionType::get(voidT, {i32, i8}, false));
   FunctionCallee MemoryInit = M.getOrInsertFunction("__coqui_memory_init", VoidNoArg);
   FunctionCallee CovBase = M.getOrInsertFunction("__coqui_cov_base", PtrNoArg);
-  FunctionCallee Classify = M.getOrInsertFunction(
-    "__coqui_classify_counts",
-    FunctionType::get(voidT, {i8p}, false));
+  /* Folded classify-and-sig: single pass over the 64 KB cov_map that
+   * classifies every byte AND returns a 32-bit FNV-1a hash so the host
+   * can dedup crash-verifies by signature. */
+  FunctionCallee ClassifyAndSig = M.getOrInsertFunction(
+    "__coqui_classify_counts_and_sig",
+    FunctionType::get(i32, {i8p}, false));
   FunctionCallee VirginCmp = M.getOrInsertFunction(
     "__coqui_virgin_compare_and_flag",
     FunctionType::get(voidT, {i8p, i8p, i8p}, false));
@@ -140,8 +143,8 @@ bool runFuzzEntry(Module &M) {
 
   /* cov = __coqui_cov_base() */
   Value *cov = Builder.CreateCall(CovBase, {}, "cov");
-  /* __coqui_classify_counts(cov) */
-  Builder.CreateCall(Classify, {cov});
+  /* sig = __coqui_classify_counts_and_sig(cov) */
+  Value *sig = Builder.CreateCall(ClassifyAndSig, {cov}, "sig");
 
   /* PHASE_VIRGIN_CMP = 5 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 5)});
@@ -149,6 +152,21 @@ bool runFuzzEntry(Module &M) {
   /* With opaque pointers, VirginMap (ptr to [65536 x i8]) is already
      an i8* — no bitcast needed; pass directly as i8p. */
   Builder.CreateCall(VirginCmp, {cov, VirginMap, noveltyArg});
+
+  /* Store sig into status[tid].crash_sig.
+   *
+   * Struct layout (must match coqui_runtime.h and afl-fuzz-coqui.h):
+   *   u8 phase; u8 signal; u8 asan_error; u8 ubsan_fatal; u32 crash_sig; u64 _reserved1;
+   * crash_sig lives at byte offset 4 of the 16-byte slot.
+   */
+  Value *statusTid64 = Builder.CreateZExt(tid, i64, "tid64");
+  Value *slotBase    = Builder.CreateGEP(
+      i8, statusArg,
+      {Builder.CreateMul(statusTid64, ConstantInt::get(i64, 16))},
+      "status_slot");
+  Value *sigSlot     = Builder.CreateGEP(
+      i8, slotBase, {ConstantInt::get(i64, 4)}, "sig_slot");
+  Builder.CreateStore(sig, sigSlot);
 
   /* PHASE_COMPLETE = 6 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 6)});

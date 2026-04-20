@@ -246,6 +246,8 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->launch_count     = 0;
   ctx->oversized_count  = 0;
   ctx->total_submits    = 0;
+  ctx->crash_dedup_hits = 0;
+  ctx->crash_verify_calls = 0;
   ctx->rate_log_init    = 0;
   ctx->rate_log_last_launches = 0;
   ctx->rate_log_last_submits  = 0;
@@ -267,12 +269,15 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
 
 }
 
-/* Translate GPU status fields to an AFL fault code. */
+/* Translate GPU status fields to an AFL fault code.
+ *
+ * Note: the device does not currently set a per-thread timeout_flag — if/when
+ * it does, add a field to coqui_status_t in both runtime.h and afl-fuzz-coqui.h
+ * at matching byte offsets, then check it here. */
 static u8 translate_gpu_status(coqui_status_t *s) {
   if (s->asan_error) return FSRV_RUN_CRASH;
   if (s->ubsan_fatal) return FSRV_RUN_CRASH;
   if (s->signal) return FSRV_RUN_CRASH;
-  if (s->timeout_flag) return FSRV_RUN_TMOUT;
   return FSRV_RUN_OK;
 }
 
@@ -449,13 +454,25 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
      * when they're slow due to pathological inputs. */
     if (elapsed_us >= 1000000ULL || dl >= 4) {
       if (elapsed_us > 0) {
+        double avg_dedup_per_batch = dl > 0
+            ? (double)ctx->crash_dedup_hits / (double)ctx->launch_count
+            : 0.0;
+        double avg_verify_per_batch = dl > 0
+            ? (double)ctx->crash_verify_calls / (double)ctx->launch_count
+            : 0.0;
         fprintf(stderr,
                 "[coqui-rate] %.1f batches/s, %llu submits/s "
-                "(avg %.0f inputs/batch, %llu slow-skipped)\n",
+                "(avg %.0f inputs/batch, %llu slow-skipped, "
+                "crash_dedup_hits=%llu avg=%.1f/batch, "
+                "crash_verify_calls=%llu avg=%.1f/batch)\n",
                 (double)dl * 1e6 / (double)elapsed_us,
                 (unsigned long long)(ds * 1000000ULL / elapsed_us),
                 dl > 0 ? (double)ds / (double)dl : 0.0,
-                (unsigned long long)ctx->slow_skipped);
+                (unsigned long long)ctx->slow_skipped,
+                (unsigned long long)ctx->crash_dedup_hits,
+                avg_dedup_per_batch,
+                (unsigned long long)ctx->crash_verify_calls,
+                avg_verify_per_batch);
         fflush(stderr);
       }
       ctx->rate_log_last_launches = ctx->launch_count;
@@ -569,19 +586,71 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   }
 
   /* Also process crashes not flagged as novel.
-     A GPU crash may not set new coverage bits but still needs to be saved. */
+   * A GPU crash may not set new coverage bits but still needs to be saved.
+   *
+   * Crash-signature dedup (iter5 P1): each crashed thread stores an FNV-1a
+   * hash of its classified cov_map in status[i].crash_sig. Malformed inputs
+   * that fail at the same parser site converge to the same signature, so
+   * we only invoke the (expensive) CPU forkserver verify on the FIRST slot
+   * with each unique signature. Subsequent duplicates increment
+   * crash_dedup_hits and are skipped; the FIRST slot (lowest index) is
+   * deterministic and independent of iteration order.
+   *
+   * Hash-set: 256 slots of open-addressing (power of 2 → bitmask probe).
+   * Inserting 4085 keys into 256 slots has worst-case degraded probe
+   * length but distinct-signatures count is expected to be O(10-50), so
+   * in practice the set is sparsely populated. If the set fills (unlikely),
+   * we treat any new probe sequence as "seen" to avoid runaway probing and
+   * accept the false-positive (dropped verify). */
+  coqui_status_t *hs = b->h_status;
+
+  #define COQUI_CRASH_DEDUP_SLOTS 256u
+  u32 dedup_slots[COQUI_CRASH_DEDUP_SLOTS];
+  u8  dedup_used[COQUI_CRASH_DEDUP_SLOTS];
+  memset(dedup_slots, 0, sizeof(dedup_slots));
+  memset(dedup_used,  0, sizeof(dedup_used));
+
   for (u32 i = 0; i < ctx->batch_size; i++) {
     if (b->h_input_lens[i] == 0) continue;
     u8 nov = (b->h_novelty[i / 8] >> (i % 8)) & 1;
     if (nov) continue;   /* already processed above */
 
-    u8 gpu_fault = translate_gpu_status(&b->h_status[i]);
-    if (gpu_fault == FSRV_RUN_CRASH || gpu_fault == FSRV_RUN_TMOUT) {
-      u8 *input = b->h_input_bytes + b->h_offsets[i];
-      u32 len = b->h_input_lens[i];
-      process_input_via_cpu_fsrv(afl, input, len);
+    u8 gpu_fault = translate_gpu_status(&hs[i]);
+    if (gpu_fault != FSRV_RUN_CRASH && gpu_fault != FSRV_RUN_TMOUT) continue;
+
+    /* Dedup lookup — open-addressing linear probe. sig==0 is a valid key
+     * (treated the same as any other). A full table (no empty slot found
+     * after batch_size probes) falls through to "seen" to cap work. */
+    u32 sig = hs[i].crash_sig;
+    u32 idx = sig & (COQUI_CRASH_DEDUP_SLOTS - 1u);
+    int seen = 0;
+    int inserted = 0;
+    for (u32 probe = 0; probe < COQUI_CRASH_DEDUP_SLOTS; probe++) {
+      u32 slot = (idx + probe) & (COQUI_CRASH_DEDUP_SLOTS - 1u);
+      if (!dedup_used[slot]) {
+        dedup_slots[slot] = sig;
+        dedup_used[slot]  = 1;
+        inserted = 1;
+        break;
+      }
+      if (dedup_slots[slot] == sig) { seen = 1; break; }
     }
+    if (!inserted && !seen) {
+      /* Table full — treat as seen to stop runaway probing. */
+      seen = 1;
+    }
+
+    if (seen) {
+      ctx->crash_dedup_hits++;
+      continue;
+    }
+
+    ctx->crash_verify_calls++;
+    u8 *input = b->h_input_bytes + b->h_offsets[i];
+    u32 len = b->h_input_lens[i];
+    process_input_via_cpu_fsrv(afl, input, len);
   }
+  #undef COQUI_CRASH_DEDUP_SLOTS
 
   return 0;
 }

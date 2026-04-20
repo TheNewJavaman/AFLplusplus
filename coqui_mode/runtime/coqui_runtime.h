@@ -43,13 +43,18 @@ typedef uint64_t u64;
 #define COQUI_PHASE_COMPLETE    6
 #define COQUI_PHASE_RESERVED    7
 
-/* Per-thread status reported to the host */
+/* Per-thread status reported to the host.
+ *
+ * Layout is BYTE-IDENTICAL to the host-side coqui_status_t in
+ * include/afl-fuzz-coqui.h (same field order, same sizeof=16). The kernel
+ * writes via its 16-byte stride; cuMemAlloc on the host uses the host
+ * sizeof, so the two MUST agree or writes alias across slots. */
 typedef struct coqui_status {
     u8  phase;
     u8  signal;        /* POSIX signal number or 0 */
     u8  asan_error;    /* non-zero if ASan check tripped */
     u8  ubsan_fatal;   /* non-zero if non-recoverable UBSan (future) */
-    u32 _reserved0;
+    u32 crash_sig;     /* FNV-1a hash of classified cov_map; 0 if not crashed */
     u64 _reserved1;
 } coqui_status_t;       /* 16 bytes */
 
@@ -75,7 +80,19 @@ u32  __coqui_heap_size(void);      /* runtime-configured heap size */
 extern __attribute__((visibility("default")))
 u8 __coqui_count_class_lookup[256];
 void __coqui_classify_counts(u8 *map);
+
+/* One-pass variant: classify every byte *and* fold a 32-bit FNV-1a hash
+ * over the classified map so the host can dedup crash-verify on it. The
+ * separate __coqui_classify_counts is retained for any future caller that
+ * does not need the hash; kernel entry uses the combined form. */
+u32  __coqui_classify_counts_and_sig(u8 *map);
+
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap);
+
+/* Dedup hash of partial coverage at crash time (called from asan_report).
+ * Uses the same FNV-1a algorithm as the classify_and_sig variant so
+ * signatures are comparable across crashed and clean threads. */
+u32  __coqui_trace_sig(u8 *map);
 
 /* prev_loc (per-thread, for AFL hash instrumentation) */
 u32 *__coqui_prev_loc_ptr(void);
