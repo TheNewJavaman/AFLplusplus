@@ -67,13 +67,6 @@ fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
 
 #endif
 
-  /* iter25: in GPU mode the coqui consumer thread also drives the CPU
-   * forkserver. The coqui_state_mutex is recursive so the consumer's
-   * process_input_via_cpu_fsrv — which holds it externally — can re-enter
-   * via this path without deadlocking. */
-  u8 gpu_lock_needed = (afl->gpu_mode && fsrv == &afl->fsrv);
-  if (unlikely(gpu_lock_needed)) coqui_state_lock(afl);
-
   fsrv_run_result_t res = afl_fsrv_run_target(fsrv, timeout, &afl->stop_soon);
 
 #ifdef __AFL_CODE_COVERAGE
@@ -134,7 +127,6 @@ fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
   time_spent_start = (spec.tv_sec * 1000000000) + spec.tv_nsec;
 #endif
 
-  if (unlikely(gpu_lock_needed)) coqui_state_unlock(afl);
   return res;
 
 }
@@ -147,12 +139,6 @@ u32 __attribute__((hot)) write_to_testcase(afl_state_t *afl, void **mem,
                                            u32 len, u32 fix) {
 
   u8 sent = 0;
-
-  /* iter25: serialize shared-memory fuzz buffer writes in GPU mode.
-   * Both the producer thread (calibrate/trim) and the consumer thread
-   * (verify) call this — without a lock the buffer's payload races. */
-  u8 gpu_lock_needed = afl->gpu_mode ? 1 : 0;
-  if (unlikely(gpu_lock_needed)) coqui_state_lock(afl);
 
   if (unlikely(afl->custom_mutators_count)) {
 
@@ -193,7 +179,6 @@ u32 __attribute__((hot)) write_to_testcase(afl_state_t *afl, void **mem,
 
       } else {
 
-        if (unlikely(gpu_lock_needed)) coqui_state_unlock(afl);
         return 0;
 
       }
@@ -321,7 +306,6 @@ u32 __attribute__((hot)) write_to_testcase(afl_state_t *afl, void **mem,
 
 #endif
 
-  if (unlikely(gpu_lock_needed)) coqui_state_unlock(afl);
   return len;
 
 }
