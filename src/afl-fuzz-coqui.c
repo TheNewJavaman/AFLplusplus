@@ -12,6 +12,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 
 #include <cuda.h>
 
@@ -603,7 +604,14 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       return 1;
     }
 
-    usleep(1000);   /* 1ms poll — matches coqui driver */
+    /* Was usleep(1000). The 1 ms kernel sleep overshoots GPU completion by
+     * ~0.5 ms on average (median await=1.5 ms vs ~1 ms actual GPU+DtoH) and
+     * burns a full kernel-tick on every poll miss. sched_yield() hands the
+     * CPU back cooperatively without a sleep syscall — we wake on the next
+     * tick if nothing else runs, reducing poll-overshoot to ~10 µs. Main
+     * thread has no useful work during await in the single-threaded design,
+     * so tight-polling isn't stealing cycles from productive work. */
+    sched_yield();
   }
   (void)ctx;  /* silence unused-after-reset-path warnings */
 
