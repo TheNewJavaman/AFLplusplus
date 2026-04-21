@@ -743,16 +743,6 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (!afl->coqui) return;
   coqui_ctx_t *ctx = afl->coqui;
 
-  /* Snapshot adaptive-timeout state so it survives the ctx rebuild —
-   * otherwise every force_reset re-learns P95 from the static 3s default,
-   * adding ~2.5s to the FIRST cull after each reset. */
-  unsigned long long saved_ring[COQUI_LAT_RING_SIZE];
-  memcpy(saved_ring, ctx->batch_latency_ring, sizeof(saved_ring));
-  u32                saved_count    = ctx->batch_latency_count;
-  u32                saved_head     = ctx->batch_latency_head;
-  unsigned long long saved_timeout  = ctx->batch_timeout_us;
-  u8                 saved_override = ctx->timeout_env_override;
-
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
 
   /* Host pinned buffers are independent of context lifecycle. */
@@ -771,18 +761,6 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   afl->coqui = NULL;
 
   coqui_init(afl, cubin_path);
-
-  /* Restore the ring + adapted timeout into the freshly-built ctx so the
-   * NEXT cull uses the previously-converged P95-based timeout instead of
-   * the static default. Skip restoration if the env-var override was in
-   * effect — that path never adapted anyway, and we want it preserved. */
-  coqui_ctx_t *new_ctx = afl->coqui;
-  if (new_ctx && !saved_override) {
-    memcpy(new_ctx->batch_latency_ring, saved_ring, sizeof(saved_ring));
-    new_ctx->batch_latency_count = saved_count;
-    new_ctx->batch_latency_head  = saved_head;
-    new_ctx->batch_timeout_us    = saved_timeout;
-  }
 }
 
 static void free_batch_half_cuda(coqui_batch_t *b) {
