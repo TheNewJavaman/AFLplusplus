@@ -45,6 +45,9 @@
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -1064,6 +1067,17 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
        specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
 
     setsid();
+
+    /* When afl-fuzz dies (incl. SIGKILL or stuck-in-cuCtxDestroy SIGKILL),
+     * have the kernel deliver SIGKILL to the forkserver immediately so it
+     * can't survive as an orphan. Without this, killing afl-fuzz mid-
+     * shutdown leaves the forkserver process holding GPU context resources
+     * that degrade subsequent processes' per-thread stack budget — a real
+     * bug surfaced during the 2026-04-20 cuAFL bench harness work. Linux-
+     * specific; PR_SET_PDEATHSIG persists across execv. */
+#if defined(__linux__)
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
 
     if (!(debug_child_output)) {
 
