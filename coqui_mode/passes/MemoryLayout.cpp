@@ -1,18 +1,8 @@
 /*
  * MemoryLayout.cpp --- set up per-thread stack regions.
  *
- * cov_map now lives in a device-global pool (single cuMemAlloc'd buffer of
- * size BATCH_SIZE * 64KB). Each thread's slot is (cov_pool_base + tid * 64KB),
- * addressed via the __coqui_cov_base() helper which reads pool_base from the
- * module-scope `__coqui_cov_pool_ptr` global (host binds this via
- * cuModuleGetGlobal at init). The old per-thread alloca is gone; this keeps
- * the cov_map alive across a split of kernel A (user code) and kernel B
- * (classify+virgin) since `.local` allocas would be reclaimed at kernel exit.
- *
- * Heap + shadow remain per-thread allocas (ASan semantics require the shadow
- * to be contiguous with heap bytes; easier to keep both on the .local stack).
- *
- * Inserts two allocas at kernel entry:
+ * Inserts three allocas at kernel entry:
+ *   - cov_map  : 64 KB (aligned 8)
  *   - heap     : H bytes (runtime-configured)
  *   - shadow   : H/8 bytes (aligned 8)
  *
@@ -20,7 +10,7 @@
  * then emits helper accessor functions that load from the per-thread slot.
  *
  * Layout of __coqui_thread_slots[tid * SLOT_STRIDE + offset]:
- *   offset  0 ..  7  : reserved (cov moved to global pool)
+ *   offset  0 ..  7  : cov_base   ptr (i8*, 8 bytes)
  *   offset  8 .. 15  : heap_base  ptr (i8*, 8 bytes)
  *   offset 16 .. 23  : shadow_base ptr (i8*, 8 bytes)
  *   offset 24 .. 31  : reserved
@@ -83,30 +73,11 @@ static GlobalVariable *getOrMakeSlotPool(Module &M) {
       "__coqui_thread_slots"); /* default addrspace 0 = .global */
 }
 
-/* Get-or-create the pool base pointer global: an i8* (8 bytes) the host
- * will bind to the cuMemAlloc'd cov pool at init via cuModuleGetGlobal. */
-static GlobalVariable *getOrMakeCovPoolPtr(Module &M) {
-  if (auto *GV = M.getGlobalVariable("__coqui_cov_pool_ptr"))
-    return GV;
-  LLVMContext &C = M.getContext();
-  Type *i8p = PointerType::get(C, 0);
-  return new GlobalVariable(
-      M, i8p, /*isConstant=*/false,
-      GlobalValue::ExternalLinkage,
-      Constant::getNullValue(i8p),
-      "__coqui_cov_pool_ptr"); /* addrspace 0 = .global */
-}
-
 bool runMemoryLayout(Module &M) {
   LLVMContext &C = M.getContext();
 
   /* Resolve real stack size: prefer --coqui-stack-size CLI if set, otherwise
-   * default constant. Guard against a value that would leave nothing for heap.
-   *
-   * Note: since cov_map moved OUT of .local (it's now in a global pool), the
-   * per-thread .local budget frees up 64 KB. We still keep the same "logical"
-   * total budget for heap+stack sizing for stability — the freed space becomes
-   * headroom for register spill + stage-B kernel locals. */
+   * default constant. Guard against a value that would leave nothing for heap. */
   unsigned realStack = RealStackSizeOpt;
   if (realStack + kCovMapSize >= kTotalBudget) {
     report_fatal_error(
@@ -126,21 +97,21 @@ bool runMemoryLayout(Module &M) {
 
   Type *i8  = Type::getInt8Ty(C);
   Type *i32 = Type::getInt32Ty(C);
-  Type *i64 = Type::getInt64Ty(C);
   Type *i8p = PointerType::get(C, 0); /* addrspace(0) opaque pointer */
 
-  /* 2. Declare the addrspace(0) slot pool, the cov-pool pointer global,
-   *    and the tid helper. */
-  GlobalVariable *Pool       = getOrMakeSlotPool(M);
-  GlobalVariable *CovPoolPtr = getOrMakeCovPoolPtr(M);
+  /* 2. Declare the addrspace(0) slot pool and the tid helper. */
+  GlobalVariable *Pool = getOrMakeSlotPool(M);
 
   FunctionType *TidT = FunctionType::get(i32, /*isVarArg=*/false);
   FunctionCallee Tid = M.getOrInsertFunction("__coqui_fuzz_tid", TidT);
 
-  /* 3. Insert allocas at kernel entry, then store base pointers into pool slots.
-   *    cov_map is NO LONGER a .local alloca — it comes from the global pool. */
+  /* 3. Insert allocas at kernel entry, then store base pointers into pool slots */
   BasicBlock &EntryBB = Kernel->getEntryBlock();
   IRBuilder<> Builder(&EntryBB, EntryBB.begin());
+
+  AllocaInst *CovAlloca = Builder.CreateAlloca(
+      ArrayType::get(i8, kCovMapSize), nullptr, "cov_map");
+  CovAlloca->setAlignment(Align(8));
 
   AllocaInst *HeapAlloca = Builder.CreateAlloca(
       ArrayType::get(i8, heapSize), nullptr, "heap");
@@ -150,15 +121,24 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
-  /* No per-thread cov_map zeroing at entry: the zero-on-read pattern in
-   * __coqui_virgin_compare_and_flag leaves the pool at zeros after each
-   * batch, so stage A always sees a clean slot. */
+  /* Zero the coverage map at kernel entry; each thread accumulates fresh. */
+  Builder.CreateMemSet(CovAlloca,
+                       ConstantInt::get(i8, 0),
+                       static_cast<uint64_t>(kCovMapSize),
+                       MaybeAlign(Align(8)));
 
   /* Compute tid and base byte offset into the pool for this thread. */
   Value *tid     = Builder.CreateCall(Tid, {}, "tid");
   Value *base32  = Builder.CreateMul(tid,
                                      ConstantInt::get(i32, SLOT_STRIDE),
                                      "tid_off");
+
+  /* Store cov_alloca pointer at offset OFF_COV_BASE */
+  Value *covOffI32 = Builder.CreateAdd(base32,
+                                       ConstantInt::get(i32, OFF_COV_BASE),
+                                       "cov_off");
+  Value *covSlot = Builder.CreateGEP(i8, Pool, covOffI32, "cov_slot");
+  Builder.CreateStore(CovAlloca, covSlot);
 
   /* Store heap_alloca pointer at offset OFF_HEAP_BASE */
   Value *heapOffI32 = Builder.CreateAdd(base32,
@@ -176,34 +156,9 @@ bool runMemoryLayout(Module &M) {
 
   /* 4. Emit accessor getter functions.
    *
-   * __coqui_cov_base() — computes cov_pool_base + tid * 64KB (from global
-   * pool pointer __coqui_cov_pool_ptr bound by the host at module load).
-   * __coqui_heap_base / __coqui_shadow_base — loads from Pool slot as before.
+   * Each getter computes: load ptr from Pool[tid * SLOT_STRIDE + Offset].
    */
-
-  /* Emit __coqui_cov_base — no slot indirection; compute directly. */
-  {
-    FunctionType *FT = FunctionType::get(i8p, /*isVarArg=*/false);
-    Function *F = cast<Function>(
-        M.getOrInsertFunction("__coqui_cov_base", FT).getCallee());
-    if (F->isDeclaration()) {
-      F->setLinkage(GlobalValue::InternalLinkage);
-      F->addFnAttr(Attribute::AlwaysInline);
-      BasicBlock *BB = BasicBlock::Create(C, "entry", F);
-      IRBuilder<> B(BB);
-      /* base = *__coqui_cov_pool_ptr  (i8*) */
-      Value *base = B.CreateLoad(i8p, CovPoolPtr, "cov_pool_base");
-      /* tid in i32 -> zext to i64, multiply by 65536 */
-      Value *t     = B.CreateCall(Tid, {}, "tid");
-      Value *t64   = B.CreateZExt(t, i64, "tid64");
-      Value *off64 = B.CreateMul(t64, ConstantInt::get(i64, kCovMapSize),
-                                 "cov_off64");
-      Value *p     = B.CreateGEP(i8, base, off64, "cov_slot_ptr");
-      B.CreateRet(p);
-    }
-  }
-
-  auto emitSlotGetter = [&](StringRef Name, unsigned Offset) {
+  auto emitGetter = [&](StringRef Name, unsigned Offset) {
     FunctionType *FT = FunctionType::get(i8p, /*isVarArg=*/false);
     /* getOrInsertFunction returns an existing decl or creates a new one. */
     Function *F = cast<Function>(
@@ -223,8 +178,9 @@ bool runMemoryLayout(Module &M) {
     B.CreateRet(B.CreateLoad(i8p, slotPtr, Name));
   };
 
-  emitSlotGetter("__coqui_heap_base",   OFF_HEAP_BASE);
-  emitSlotGetter("__coqui_shadow_base", OFF_SHADOW_BASE);
+  emitGetter("__coqui_cov_base",    OFF_COV_BASE);
+  emitGetter("__coqui_heap_base",   OFF_HEAP_BASE);
+  emitGetter("__coqui_shadow_base", OFF_SHADOW_BASE);
 
   /* __coqui_heap_size() — returns compile-time constant as i32 */
   {
