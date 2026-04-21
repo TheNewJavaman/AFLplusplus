@@ -381,6 +381,15 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
 
+  /* Submit-phase timing: wrap the HtoD/memset/launch/DtoH/event-record API
+   * calls so the [coqui-rate] print can split driver-submission cost from
+   * actual GPU wait (measured separately in coqui_await_and_process). */
+  struct timeval _tv_submit_t0;
+  gettimeofday(&_tv_submit_t0, NULL);
+  unsigned long long _submit_t0_us =
+      ((unsigned long long)_tv_submit_t0.tv_sec * 1000000ULL) +
+      _tv_submit_t0.tv_usec;
+
   /* H->D — only copy the live prefix of input_bytes. Kernel reads only
    * input_bytes[offsets[tid]..+lens[tid]] and empty-slot threads
    * (lens[tid]==0) short-circuit at FuzzEntry.cpp L112-113 before any
@@ -424,6 +433,17 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
 
+  /* Close out submit-phase timer now that all driver calls for this batch
+   * have returned. */
+  {
+    struct timeval _tv_submit_t1;
+    gettimeofday(&_tv_submit_t1, NULL);
+    unsigned long long _submit_t1_us =
+        ((unsigned long long)_tv_submit_t1.tv_sec * 1000000ULL) +
+        _tv_submit_t1.tv_usec;
+    ctx->t_submit_us += (_submit_t1_us - _submit_t0_us);
+  }
+
   /* Adaptive batch-timeout (B1): stamp launch time ON THE BATCH so
    * coqui_await_and_process can compute healthy-batch latency. Per-batch
    * (not per-context) because ping-pong means launch(X) → flip → wait(Y),
@@ -460,11 +480,23 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
         double avg_verify_per_batch = dl > 0
             ? (double)ctx->crash_verify_calls / (double)ctx->launch_count
             : 0.0;
+        /* Per-batch phase averages over this window. submit is driver-API
+         * time (all async), await is the GPU wait in the poll loop, verify
+         * is CPU-side novelty+crash loops after kernel completion. Summing
+         * submit+await+verify approximates total host wall time per batch;
+         * the gap to 1/batch-rate is AFL's outer stage overhead. */
+        double avg_submit_us_batch = dl > 0
+            ? (double)ctx->t_submit_us / (double)dl : 0.0;
+        double avg_await_us_batch  = dl > 0
+            ? (double)ctx->t_await_us  / (double)dl : 0.0;
+        double avg_verify_us_batch = dl > 0
+            ? (double)ctx->t_verify_us / (double)dl : 0.0;
         fprintf(stderr,
                 "[coqui-rate] %.1f batches/s, %llu submits/s "
                 "(avg %.0f inputs/batch, %llu slow-skipped, "
                 "crash_dedup_hits=%llu avg=%.1f/batch, "
-                "crash_verify_calls=%llu avg=%.1f/batch)\n",
+                "crash_verify_calls=%llu avg=%.1f/batch, "
+                "submit=%.0fus await=%.0fus verify=%.0fus /batch)\n",
                 (double)dl * 1e6 / (double)elapsed_us,
                 (unsigned long long)(ds * 1000000ULL / elapsed_us),
                 dl > 0 ? (double)ds / (double)dl : 0.0,
@@ -472,12 +504,20 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                 (unsigned long long)ctx->crash_dedup_hits,
                 avg_dedup_per_batch,
                 (unsigned long long)ctx->crash_verify_calls,
-                avg_verify_per_batch);
+                avg_verify_per_batch,
+                avg_submit_us_batch,
+                avg_await_us_batch,
+                avg_verify_us_batch);
         fflush(stderr);
       }
       ctx->rate_log_last_launches = ctx->launch_count;
       ctx->rate_log_last_submits  = ctx->total_submits;
       ctx->rate_log_t0 = rate_tv;
+      /* Reset per-window timing accumulators; next print shows the next
+       * window's phase averages. */
+      ctx->t_submit_us = 0;
+      ctx->t_await_us  = 0;
+      ctx->t_verify_us = 0;
     }
   }
 }
@@ -509,9 +549,18 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   unsigned long long hard_deadline_us = cull_deadline_us + 1000000ULL;
 
   int culled = 0;
+  unsigned long long wait_end_us = 0;  /* set when cuStreamQuery reports success */
   while (1) {
     CUresult r = cuStreamQuery(s);
-    if (r == CUDA_SUCCESS) break;
+    if (r == CUDA_SUCCESS) {
+      struct timeval _tv_wait_end;
+      gettimeofday(&_tv_wait_end, NULL);
+      wait_end_us =
+          ((unsigned long long)_tv_wait_end.tv_sec * 1000000ULL) +
+          _tv_wait_end.tv_usec;
+      ctx->t_await_us += (wait_end_us - start_us);
+      break;
+    }
     if (r != CUDA_ERROR_NOT_READY) {
       CUCHECK(r);   /* genuine GPU fault */
     }
@@ -656,6 +705,20 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     process_input_via_cpu_fsrv(afl, input, len);
   }
   #undef COQUI_CRASH_DEDUP_SLOTS
+
+  /* Close out verify-phase timer: wait_end_us was captured at the CUDA_SUCCESS
+   * break out of the poll loop; everything between there and here is the
+   * post-kernel host work (novelty walk + crash-sig dedup + fsrv verifies). */
+  if (wait_end_us > 0) {
+    struct timeval _tv_verify_end;
+    gettimeofday(&_tv_verify_end, NULL);
+    unsigned long long _verify_end_us =
+        ((unsigned long long)_tv_verify_end.tv_sec * 1000000ULL) +
+        _tv_verify_end.tv_usec;
+    if (_verify_end_us > wait_end_us) {
+      ctx->t_verify_us += (_verify_end_us - wait_end_us);
+    }
+  }
 
   return 0;
 }

@@ -96,6 +96,22 @@ typedef struct coqui_ctx {
   u64 crash_dedup_hits;/* crash-verify calls skipped because signature already seen in batch */
   u64 crash_verify_calls; /* crash-verify calls actually issued (for ratio sanity) */
 
+  /* Host-side per-phase timing accumulators (reset at each [coqui-rate]
+   * print).  Each batch contributes one sample; dividing by dl
+   * (batches-in-window) gives avg us/batch for that phase.
+   *
+   * t_submit_us : time inside coqui_launch_batch (API submissions — HtoD,
+   *               cuLaunchKernel, DtoH, cuEventRecord; all async, so this
+   *               is dominated by driver latency not actual work).
+   * t_await_us  : time in the cuStreamQuery poll loop inside
+   *               coqui_await_and_process — the dominant wall-clock cost,
+   *               reflecting actual GPU execution + implicit DtoH.
+   * t_verify_us : CPU-side novelty + crash-verify forkserver calls, post-
+   *               kernel.  Separates CPU verify cost from GPU wait. */
+  u64 t_submit_us;
+  u64 t_await_us;
+  u64 t_verify_us;
+
   /* CPU-side speed gate (ported from coqui driver 9d85772). Blocks corpus
    * admission of inputs that verify >10× slower than baseline, preventing
    * pathologically slow inputs from becoming havoc parents. */
