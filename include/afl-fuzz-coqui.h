@@ -122,6 +122,12 @@ typedef struct coqui_ctx {
   unsigned long long d_global_statics_pool;
   unsigned long long d_slab_pool;
 
+  /* Iteration 20: warp-shared cov_map pool. One 64 KB map per warp
+   * (256 × 64 KB = 16 MB) replaces per-thread 64 KB (8192 × 64 KB =
+   * 512 MB .local). Bound to device-side @__coqui_cov_pool_ptr. */
+  unsigned long long d_cov_pool;
+  unsigned long long cov_pool_bytes;
+
   /* Config from .conf sidecar */
   unsigned int real_stack_size;
   unsigned long long batch_timeout_us;

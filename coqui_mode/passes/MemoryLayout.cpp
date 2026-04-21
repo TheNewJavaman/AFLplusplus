@@ -1,26 +1,32 @@
 /*
- * MemoryLayout.cpp --- set up per-thread stack regions.
+ * MemoryLayout.cpp --- set up per-thread heap/shadow + warp-shared cov pool binding.
  *
- * Inserts three allocas at kernel entry:
- *   - cov_map  : 64 KB (aligned 8)
- *   - heap     : H bytes (runtime-configured)
- *   - shadow   : H/8 bytes (aligned 8)
+ * Iteration 20 rewrite (warp-shared cov_map):
+ *   Coverage map is no longer a per-thread 64 KB alloca. Instead:
+ *     - One 64 KB cov map per WARP (32 threads share one map).
+ *     - Host cuMemAllocs a device-global pool of size
+ *       (num_warps × 65536) = 256 × 64 KB = 16 MB total on sm_75.
+ *     - Host writes the pool base into @__coqui_cov_pool_ptr via
+ *       cuModuleGetGlobal + cuMemcpyHtoD.
+ *   Per-thread cov_base = cov_pool_base + (tid >> 5) * 65536.
  *
- * Stores their pointers into a tid-indexed addrspace(0) (.global) slot pool,
- * then emits helper accessor functions that load from the per-thread slot.
+ * Footprint savings:
+ *   Before: 8192 × 64 KB = 512 MB per-thread .local
+ *   After : 256 × 64 KB  = 16 MB device-global (32× reduction)
  *
- * Layout of __coqui_thread_slots[tid * SLOT_STRIDE + offset]:
- *   offset  0 ..  7  : cov_base   ptr (i8*, 8 bytes)
- *   offset  8 .. 15  : heap_base  ptr (i8*, 8 bytes)
- *   offset 16 .. 23  : shadow_base ptr (i8*, 8 bytes)
- *   offset 24 .. 31  : reserved
+ * Heap + shadow remain per-thread allocas unchanged.
  *
- * Total footprint: 32 bytes/thread × 8192 threads = 256 KB in .global section.
+ * Getter functions emitted:
+ *   __coqui_cov_base()    — returns pool_base + (tid >> 5) * 65536
+ *   __coqui_heap_base()   — returns per-thread heap alloca
+ *   __coqui_shadow_base() — returns per-thread shadow alloca
+ *   __coqui_heap_size()   — returns compile-time constant
  *
  * Configuration: the real-stack budget is controlled via the
- * -coqui-stack-size=N opt flag (default 32768 B). coqui-cc forwards its
- * --stack-size value to opt so the pass-derived heap/shadow sizes match the
- * host's cuCtxSetLimit value. Without the flag, the default constant applies.
+ * -coqui-stack-size=N opt flag (default 32768 B). The heap/shadow
+ * sizes still subtract 64 KB "cov reserve" in the formula so the
+ * per-thread heap budget matches historical behaviour even though
+ * the cov map itself is no longer per-thread.
  */
 
 #include "Transforms.h"
@@ -35,10 +41,6 @@ using namespace llvm;
 
 namespace coqui {
 
-/* Total per-thread budget. sm_75 hardware ceiling is 512KB but real devices
- * typically allow 256KB (driver caps based on max-resident-threads × #SMs vs
- * device .local memory). Conservative 256KB fits commonly seen Turing/Ampere
- * driver budgets. coqui-cc may grow this into a CLI flag (--total-cap) later. */
 static constexpr unsigned kCovMapSize      = 65536;
 static constexpr unsigned kDefaultStackSize = 32768;
 static constexpr unsigned kTotalBudget     = 262144;
@@ -73,20 +75,41 @@ static GlobalVariable *getOrMakeSlotPool(Module &M) {
       "__coqui_thread_slots"); /* default addrspace 0 = .global */
 }
 
+/* Module-scope device global holding the base pointer of the warp-shared
+ * cov map pool. The host writes this via cuMemcpyHtoD after cuMemAllocing
+ * the pool, looking up the symbol via cuModuleGetGlobal("__coqui_cov_pool_ptr").
+ * ExternalLinkage + default-initialized to nullptr; the host overrides at init. */
+static GlobalVariable *getOrMakeCovPoolPtr(Module &M) {
+  if (auto *GV = M.getGlobalVariable("__coqui_cov_pool_ptr"))
+    return GV;
+  LLVMContext &C = M.getContext();
+  Type *PtrTy = PointerType::get(C, 0);
+  auto *NewGV = new GlobalVariable(
+      M, PtrTy, /*isConstant=*/false,
+      GlobalValue::ExternalLinkage,
+      Constant::getNullValue(PtrTy),
+      "__coqui_cov_pool_ptr");
+  NewGV->setAlignment(Align(8));
+  return NewGV;
+}
+
 bool runMemoryLayout(Module &M) {
   LLVMContext &C = M.getContext();
 
   /* Resolve real stack size: prefer --coqui-stack-size CLI if set, otherwise
-   * default constant. Guard against a value that would leave nothing for heap. */
+   * default constant. Guard against a value that would leave nothing for heap.
+   * Keep the "+64 KB cov reserve" in the sizing formula so heap/shadow match
+   * the historical footprint even though the cov map is now warp-shared and
+   * lives in a device-global pool, not a per-thread alloca. */
   unsigned realStack = RealStackSizeOpt;
   if (realStack + kCovMapSize >= kTotalBudget) {
     report_fatal_error(
-        "[coqui-cc] MemoryLayout: --coqui-stack-size + 64KB cov exceeds 256KB budget");
+        "[coqui-cc] MemoryLayout: --coqui-stack-size + 64KB cov reserve exceeds 256KB budget");
   }
   const unsigned remaining  = kTotalBudget - kCovMapSize - realStack;
   const unsigned heapSize   = (remaining * 8) / 9;
   const unsigned shadowSize = heapSize / 8;
-  const unsigned usableHeap = heapSize; /* heap + shadow are separate allocas */
+  const unsigned usableHeap = heapSize;
 
   /* 1. Find kernel entry */
   Function *Kernel = M.getFunction("__coqui_fuzz_kernel");
@@ -97,21 +120,20 @@ bool runMemoryLayout(Module &M) {
 
   Type *i8  = Type::getInt8Ty(C);
   Type *i32 = Type::getInt32Ty(C);
+  Type *i64 = Type::getInt64Ty(C);
   Type *i8p = PointerType::get(C, 0); /* addrspace(0) opaque pointer */
 
-  /* 2. Declare the addrspace(0) slot pool and the tid helper. */
-  GlobalVariable *Pool = getOrMakeSlotPool(M);
+  /* 2. Declare the addrspace(0) slot pool + cov pool ptr + tid helper. */
+  GlobalVariable *Pool       = getOrMakeSlotPool(M);
+  GlobalVariable *CovPoolPtr = getOrMakeCovPoolPtr(M);
 
   FunctionType *TidT = FunctionType::get(i32, /*isVarArg=*/false);
   FunctionCallee Tid = M.getOrInsertFunction("__coqui_fuzz_tid", TidT);
 
-  /* 3. Insert allocas at kernel entry, then store base pointers into pool slots */
+  /* 3. Insert heap + shadow allocas at kernel entry; compute warp-shared
+   * cov_base from the device-global pool pointer. No cov alloca. */
   BasicBlock &EntryBB = Kernel->getEntryBlock();
   IRBuilder<> Builder(&EntryBB, EntryBB.begin());
-
-  AllocaInst *CovAlloca = Builder.CreateAlloca(
-      ArrayType::get(i8, kCovMapSize), nullptr, "cov_map");
-  CovAlloca->setAlignment(Align(8));
 
   AllocaInst *HeapAlloca = Builder.CreateAlloca(
       ArrayType::get(i8, heapSize), nullptr, "heap");
@@ -121,24 +143,29 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
-  /* Zero the coverage map at kernel entry; each thread accumulates fresh. */
-  Builder.CreateMemSet(CovAlloca,
-                       ConstantInt::get(i8, 0),
-                       static_cast<uint64_t>(kCovMapSize),
-                       MaybeAlign(Align(8)));
-
   /* Compute tid and base byte offset into the pool for this thread. */
   Value *tid     = Builder.CreateCall(Tid, {}, "tid");
   Value *base32  = Builder.CreateMul(tid,
                                      ConstantInt::get(i32, SLOT_STRIDE),
                                      "tid_off");
 
-  /* Store cov_alloca pointer at offset OFF_COV_BASE */
+  /* Compute warp-shared cov_base = cov_pool_base + (tid >> 5) * 65536.
+   *   warp_id = tid >> 5
+   *   cov_base = cov_pool + warp_id * 65536
+   * All 32 threads in a warp get the SAME cov_base. */
+  Value *covPoolBase = Builder.CreateLoad(i8p, CovPoolPtr, "cov_pool_base");
+  Value *warpId      = Builder.CreateLShr(tid, ConstantInt::get(i32, 5), "warp_id");
+  Value *warpId64    = Builder.CreateZExt(warpId, i64, "warp_id64");
+  Value *covOffset   = Builder.CreateMul(
+      warpId64, ConstantInt::get(i64, kCovMapSize), "cov_warp_off");
+  Value *covBaseVal  = Builder.CreateGEP(i8, covPoolBase, covOffset, "cov_base_val");
+
+  /* Store cov_base pointer at offset OFF_COV_BASE */
   Value *covOffI32 = Builder.CreateAdd(base32,
                                        ConstantInt::get(i32, OFF_COV_BASE),
                                        "cov_off");
   Value *covSlot = Builder.CreateGEP(i8, Pool, covOffI32, "cov_slot");
-  Builder.CreateStore(CovAlloca, covSlot);
+  Builder.CreateStore(covBaseVal, covSlot);
 
   /* Store heap_alloca pointer at offset OFF_HEAP_BASE */
   Value *heapOffI32 = Builder.CreateAdd(base32,
@@ -160,13 +187,10 @@ bool runMemoryLayout(Module &M) {
    */
   auto emitGetter = [&](StringRef Name, unsigned Offset) {
     FunctionType *FT = FunctionType::get(i8p, /*isVarArg=*/false);
-    /* getOrInsertFunction returns an existing decl or creates a new one. */
     Function *F = cast<Function>(
         M.getOrInsertFunction(Name, FT).getCallee());
-    /* If the function already has a body (defined earlier), skip. */
     if (!F->isDeclaration())
       return;
-    /* It is a forward declaration (from runtime.h or FuzzEntry) — fill it in. */
     F->setLinkage(GlobalValue::InternalLinkage);
     F->addFnAttr(Attribute::AlwaysInline);
     BasicBlock *BB = BasicBlock::Create(C, "entry", F);

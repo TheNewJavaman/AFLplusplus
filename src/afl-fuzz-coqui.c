@@ -125,6 +125,32 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->d_virgin_map = (unsigned long long)d_virgin;
   CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
 
+  /* 3a. Iteration 20: warp-shared cov_map pool. Allocate one 64 KB map per
+   *     warp (batch_size / 32 = 256 warps × 64 KB = 16 MB total) and bind
+   *     the pool base into the cubin's @__coqui_cov_pool_ptr symbol.
+   *     Zeroed here once; launch-time zero is handled in coqui_launch_batch
+   *     via cuMemsetD8Async. */
+  const unsigned long long cov_pool_bytes =
+      (unsigned long long)(8192 / 32) * 65536ULL;  /* 256 warps × 64 KB = 16 MB */
+  CUdeviceptr d_cov_pool;
+  CUCHECK(cuMemAlloc(&d_cov_pool, cov_pool_bytes));
+  CUCHECK(cuMemsetD8(d_cov_pool, 0, cov_pool_bytes));
+  ctx->d_cov_pool = (unsigned long long)d_cov_pool;
+  ctx->cov_pool_bytes = cov_pool_bytes;
+
+  CUdeviceptr d_cov_pool_ptr_sym;
+  size_t d_cov_pool_ptr_sz;
+  CUCHECK(cuModuleGetGlobal(&d_cov_pool_ptr_sym, &d_cov_pool_ptr_sz, mod,
+                             "__coqui_cov_pool_ptr"));
+  if (d_cov_pool_ptr_sz != sizeof(CUdeviceptr)) {
+    FATAL("__coqui_cov_pool_ptr symbol size %zu != %zu",
+          d_cov_pool_ptr_sz, sizeof(CUdeviceptr));
+  }
+  CUCHECK(cuMemcpyHtoD(d_cov_pool_ptr_sym, &d_cov_pool, sizeof(CUdeviceptr)));
+  OKF("coqui warp-shared cov pool: %llu B (%.1f MB, 256 warps × 64 KB) "
+      "bound to __coqui_cov_pool_ptr",
+      cov_pool_bytes, (double)cov_pool_bytes / (1024.0 * 1024.0));
+
   /* 4. Probe the device for its maximum allowed per-thread stack size.
    *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must
@@ -400,6 +426,11 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                             ctx->batch_size / 32, s));
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
+  /* Iteration 20: zero the warp-shared cov pool each batch. 16 MB D2D memset
+   * is ~0.5 ms on an RTX TITAN (~35 GB/s throughput) — cheap next to the
+   * 512 MB-per-thread-scan it replaces. */
+  CUCHECK(cuMemsetD8Async((CUdeviceptr)ctx->d_cov_pool, 0,
+                           ctx->cov_pool_bytes, s));
 
   /* Launch */
   void *args[] = {
@@ -798,6 +829,8 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_global_statics_pool);
   if (ctx->d_slab_pool)
     cuMemFree((CUdeviceptr)ctx->d_slab_pool);
+  if (ctx->d_cov_pool)
+    cuMemFree((CUdeviceptr)ctx->d_cov_pool);
 
   /* Destroy streams, unload module, destroy context */
   if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);
