@@ -72,3 +72,24 @@ static inline u32 gpu_rand_below(u64 *prng, u32 n) {
   }
   return (u32)(m >> 32);
 }
+
+/* ------------------------------------------------------------------------
+ * Weighted splice partner selection.
+ *
+ * CPU precomputes prefix-sum weights into __coqui_seed_pool_cumw[].
+ * We binary-search for the slot with cumw[slot] first exceeding the draw.
+ * On lo == self_idx, return SELF_SAME; caller retries the op.
+ * ------------------------------------------------------------------------*/
+
+static inline u32 weighted_splice_pick(u64 *prng, u32 self_idx) {
+  u32 n = __coqui_seed_pool_count;
+  if (n == 0) return COQUI_SPLICE_SELF_SAME;
+  u32 r = gpu_rand_below(prng, __coqui_seed_pool_cumw_total);
+  u32 lo = 0, hi = n;
+  while (lo < hi) {
+    u32 m = (lo + hi) >> 1;
+    if (__coqui_seed_pool_cumw[m] <= r) lo = m + 1; else hi = m;
+  }
+  if (lo >= n) lo = n - 1;   /* defensive: should not happen with correct CDF */
+  return (lo == self_idx) ? COQUI_SPLICE_SELF_SAME : lo;
+}
