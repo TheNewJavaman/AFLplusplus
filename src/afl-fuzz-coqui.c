@@ -497,16 +497,11 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   unsigned long long start_us =
     ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
   unsigned long long cull_deadline_us = start_us + ctx->batch_timeout_us;
-  /* Hard ceiling: if the kernel hasn't finished 1s after culling, assume an
-   * infinite loop and force-reset (kills the kernel). Reset costs ~1s, which
-   * is cheaper than waiting longer for a pathological kernel to finish.
-   *
-   * iter17 tightening: was 5s. Profile evidence (P1 iter6) showed truly-
-   * pathological cjson kernels hang 5–22+ seconds, well beyond any plausible
-   * grace window; the 5s grace was almost never recovering legitimately-slow
-   * batches and was costing ~4s per pathology cycle. 1s grace gives near-done
-   * kernels a fair chance to complete while keeping recovery latency low. */
-  unsigned long long hard_deadline_us = cull_deadline_us + 1000000ULL;
+  /* Hard ceiling: if the kernel hasn't finished 5s after culling, assume an
+   * infinite loop and force-reset the context (kills the kernel). Reset
+   * costs ~1s (cuCtxDestroy + cuCtxCreate + cuModuleLoad + allocs), which
+   * is cheaper than waiting minutes for a pathological kernel to finish. */
+  unsigned long long hard_deadline_us = cull_deadline_us + 5000000ULL;
 
   int culled = 0;
   while (1) {
@@ -521,7 +516,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
 
     if (!culled && now >= cull_deadline_us) {
       WARNF("coqui batch timeout after %llu us — disabling queue entry "
-            "'%s' and extending wait by 1s",
+            "'%s' and extending wait by 5s",
             ctx->batch_timeout_us,
             afl->queue_cur ? (const char *)afl->queue_cur->fname : "(none)");
       if (afl->queue_cur) {
