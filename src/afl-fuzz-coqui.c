@@ -107,7 +107,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
     FATAL("coqui requires sm_75+; device is sm_%d%d", major, minor);
   }
 
-  /* 3. Load cubin, resolve kernel, resolve virgin_map global */
+  /* 3. Load cubin, resolve kernels (stage A + stage B), resolve globals */
   CUmodule mod;
   CUCHECK(cuModuleLoad(&mod, cubin_path));
   ctx->cu_module = (void *)mod;
@@ -115,6 +115,11 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   CUfunction kernel;
   CUCHECK(cuModuleGetFunction(&kernel, mod, "__coqui_fuzz_kernel"));
   ctx->cu_kernel = (void *)kernel;
+
+  /* Stage B coverage kernel: reads cov_pool, does classify + virgin compare. */
+  CUfunction kernel_cov;
+  CUCHECK(cuModuleGetFunction(&kernel_cov, mod, "__coqui_fuzz_kernel_cov"));
+  ctx->cu_kernel_cov = (void *)kernel_cov;
 
   CUdeviceptr d_virgin;
   size_t virgin_sz;
@@ -177,6 +182,33 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;  /* MAX_ALLOC cap */
   ctx->byte_budget = (unsigned int)budget64;
   ctx->map_size = 65536;
+
+  /* 6b. cov_pool (split-kernel model, iter 12): batch_size * 64KB device
+   *     buffer. Shared by stage A writes (AFL edge instrumentation via
+   *     __coqui_cov_base()) and stage B reads (classify + virgin compare).
+   *     Zero-initialized once here; stage B's zero-on-read pattern in
+   *     __coqui_virgin_compare_and_flag keeps it zero between batches.
+   *     Pointer bound into the device symbol __coqui_cov_pool_ptr so the
+   *     in-kernel __coqui_cov_base() accessor computes (pool + tid*64KB). */
+  unsigned long long cov_pool_bytes =
+      (unsigned long long)ctx->batch_size * 65536ULL;
+  CUdeviceptr d_cov_pool;
+  CUCHECK(cuMemAlloc(&d_cov_pool, cov_pool_bytes));
+  CUCHECK(cuMemsetD8(d_cov_pool, 0, cov_pool_bytes));
+  ctx->d_cov_pool = (unsigned long long)d_cov_pool;
+  {
+    CUdeviceptr cov_pool_sym;
+    size_t cov_pool_sym_sz;
+    CUCHECK(cuModuleGetGlobal(&cov_pool_sym, &cov_pool_sym_sz, mod,
+                              "__coqui_cov_pool_ptr"));
+    if (cov_pool_sym_sz != sizeof(CUdeviceptr)) {
+      FATAL("__coqui_cov_pool_ptr symbol size %zu != %zu",
+            cov_pool_sym_sz, sizeof(CUdeviceptr));
+    }
+    CUCHECK(cuMemcpyHtoD(cov_pool_sym, &d_cov_pool, sizeof(CUdeviceptr)));
+  }
+  OKF("coqui cov_pool: %llu bytes (8192 × 64 KB), bound to __coqui_cov_pool_ptr",
+      cov_pool_bytes);
 
   /* 7. Create streams */
   CUstream sa, sb;
@@ -401,7 +433,7 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
 
-  /* Launch */
+  /* Launch stage A (user code) */
   void *args[] = {
     (void *)&b->d_input_bytes,
     (void *)&b->d_offsets,
@@ -415,7 +447,21 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                           128, 1, 1,     /* block */
                           0, s, args, NULL));
 
-  /* D->H */
+  /* Launch stage B (classify + virgin compare). Same stream ⇒ serialized
+   * after stage A completes without needing an explicit cuStreamSynchronize.
+   * Stage B launches every thread (no empty-slot early-exit), so every warp
+   * is full and the warp-OR atomic fast path is always taken. */
+  void *args_cov[] = {
+    (void *)&b->d_input_lens,
+    (void *)&b->d_novelty,
+    (void *)&b->d_status,
+  };
+  CUCHECK(cuLaunchKernel((CUfunction)ctx->cu_kernel_cov,
+                          grid, 1, 1,    /* grid */
+                          128, 1, 1,     /* block */
+                          0, s, args_cov, NULL));
+
+  /* D->H (after both kernels on the same stream) */
   CUCHECK(cuMemcpyDtoHAsync(b->h_novelty, (CUdeviceptr)b->d_novelty,
                              ctx->batch_size / 8, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
@@ -798,6 +844,8 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_global_statics_pool);
   if (ctx->d_slab_pool)
     cuMemFree((CUdeviceptr)ctx->d_slab_pool);
+  if (ctx->d_cov_pool)
+    cuMemFree((CUdeviceptr)ctx->d_cov_pool);
 
   /* Destroy streams, unload module, destroy context */
   if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);

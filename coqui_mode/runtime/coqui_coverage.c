@@ -87,7 +87,22 @@ void __coqui_classify_counts(u8 *map) {
  * position, so bit-pattern-identical nonzero words at different offsets
  * still diverge) while the word is in a register. Skipping zero words
  * from the hash is safe because the u32 index is always mixed in, so
- * two maps that differ only in which zeros are skipped can't collide. */
+ * two maps that differ only in which zeros are skipped can't collide.
+ *
+ * Zero-on-read: after classifying each nonzero word, the post-classify
+ * result is stored back (as before); all-zero cachelines are skipped
+ * (no store). This preserves AFL coverage semantics (classified map is
+ * consumed by virgin_compare in the same kernel), while keeping the
+ * cov_pool at a known state for the next batch — the virgin_compare
+ * step reads-then-implicitly-consumes (its post-condition for the next
+ * batch is restored once the next stage-A run zeroes bytes via the
+ * AFL increment instrumentation; any surviving classified byte would
+ * remain in place until then, which is identical to today's alloca
+ * behavior for sparse reuse).
+ *
+ * Note: callers in a split kernel model should explicitly reset the
+ * cov_pool words this variant touched, or use the _and_reset variant
+ * below, to keep the pool ready for the next batch. */
 u32 __coqui_classify_counts_and_sig(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
@@ -221,6 +236,12 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     const u32 mask = __coqui_active_mask();
     int novel = 0;
 
+    /* Zero-on-read semantics: once a thread has finished virgin-comparing
+     * its cov_map, the slot is reset to all zeros so the next batch finds
+     * the pool already zeroed. This eliminates the need for an up-front
+     * pool-memset at batch start. Safe because the classified map is no
+     * longer needed after this call returns. */
+
     if (mask == 0xFFFFFFFFu) {
         u32 laneid;
         asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
@@ -242,6 +263,7 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
             }
             u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
             if (mine & ~was) { novel = 1; }
+            if (mine) m64[i] = 0;   /* zero-on-read */
         }
     } else {
         /* Partial warp: original per-thread atomic. */
@@ -251,6 +273,7 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
             u64 was = atomic_fetch_or_explicit(&v64[i], mine,
                                                 memory_order_relaxed);
             if (mine & ~was) { novel = 1; }
+            m64[i] = 0;   /* zero-on-read */
         }
     }
 
