@@ -93,3 +93,102 @@ static inline u32 weighted_splice_pick(u64 *prng, u32 self_idx) {
   if (lo >= n) lo = n - 1;   /* defensive: should not happen with correct CDF */
   return (lo == self_idx) ? COQUI_SPLICE_SELF_SAME : lo;
 }
+
+/* ------------------------------------------------------------------------
+ * MUT_* enum — must match include/afl-mutations.h:46-85 exactly.
+ * ------------------------------------------------------------------------*/
+
+enum {
+  MUT_FLIPBIT,         MUT_INTERESTING8,    MUT_INTERESTING16,
+  MUT_INTERESTING16BE, MUT_INTERESTING32,   MUT_INTERESTING32BE,
+  MUT_ARITH8_,         MUT_ARITH8,          MUT_ARITH16_,
+  MUT_ARITH16BE_,      MUT_ARITH16,         MUT_ARITH16BE,
+  MUT_ARITH32_,        MUT_ARITH32BE_,      MUT_ARITH32,
+  MUT_ARITH32BE,       MUT_RAND8,           MUT_CLONE_COPY,
+  MUT_CLONE_FIXED,     MUT_OVERWRITE_COPY,  MUT_OVERWRITE_FIXED,
+  MUT_BYTEADD,         MUT_BYTESUB,         MUT_FLIP8,
+  MUT_SWITCH,          MUT_DEL,             MUT_SHUFFLE,
+  MUT_DELONE,          MUT_INSERTONE,       MUT_ASCIINUM,
+  MUT_INSERTASCIINUM,  MUT_EXTRA_OVERWRITE, MUT_EXTRA_INSERT,
+  MUT_AUTO_EXTRA_OVERWRITE, MUT_AUTO_EXTRA_INSERT,
+  MUT_SPLICE_OVERWRITE,     MUT_SPLICE_INSERT,
+  MUT_MAX
+};
+
+/* ------------------------------------------------------------------------
+ * choose_block_len --- AFL helper used by CLONE/OVERWRITE/DEL ops. Port of
+ * src/afl-fuzz-one.c choose_block_len.
+ * ------------------------------------------------------------------------*/
+
+static inline u32 choose_block_len(u64 *prng, u32 limit) {
+  u32 min_value, max_value;
+  u32 r = gpu_rand_below(prng, 3);
+  if (r == 0) { min_value = 1;            max_value = HAVOC_BLK_SMALL;   }
+  else if (r == 1) { min_value = HAVOC_BLK_SMALL; max_value = HAVOC_BLK_MEDIUM; }
+  else {
+    if (gpu_rand_below(prng, 10)) {
+      min_value = HAVOC_BLK_MEDIUM;
+      max_value = HAVOC_BLK_LARGE;
+    } else {
+      min_value = HAVOC_BLK_LARGE;
+      max_value = HAVOC_BLK_XL;
+    }
+  }
+  if (min_value >= limit) min_value = 1;
+  u32 span = (max_value < limit ? max_value : limit) - min_value + 1;
+  return min_value + gpu_rand_below(prng, span);
+}
+
+/* ------------------------------------------------------------------------
+ * Public entry: __coqui_havoc_mutate
+ * ------------------------------------------------------------------------*/
+
+u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
+                          u32 self_idx, u64 *prng) {
+  (void)buf; (void)max_len; (void)self_idx;   /* suppress "unused" until ops land */
+  if (len == 0 || max_len == 0) return len;
+
+  u32 stack_max = 1u << (1 + gpu_rand_below(prng, __coqui_havoc_stack_pow2));
+  u32 use_stacking = 1 + gpu_rand_below(prng, stack_max);
+
+  for (u32 i = 0; i < use_stacking; ++i) {
+    retry_havoc_step:;
+    u32 r  = gpu_rand_below(prng, __coqui_mutation_array_size);
+    u32 op = __coqui_mutation_array[r];
+
+    switch (op) {
+      /* Bucket 1 ops — filled in by task 1.6 */
+      case MUT_FLIPBIT: case MUT_INTERESTING8:
+      case MUT_INTERESTING16: case MUT_INTERESTING16BE:
+      case MUT_INTERESTING32: case MUT_INTERESTING32BE:
+      case MUT_ARITH8_: case MUT_ARITH8:
+      case MUT_ARITH16_: case MUT_ARITH16BE_:
+      case MUT_ARITH16: case MUT_ARITH16BE:
+      case MUT_ARITH32_: case MUT_ARITH32BE_:
+      case MUT_ARITH32: case MUT_ARITH32BE:
+      case MUT_RAND8:
+      case MUT_CLONE_COPY: case MUT_CLONE_FIXED:
+      case MUT_OVERWRITE_COPY: case MUT_OVERWRITE_FIXED:
+      case MUT_BYTEADD: case MUT_BYTESUB:
+      case MUT_FLIP8: case MUT_SWITCH:
+      case MUT_DEL: case MUT_SHUFFLE:
+      case MUT_DELONE: case MUT_INSERTONE:
+        goto retry_havoc_step;  /* placeholder; fill in task 1.6 */
+
+      /* Bucket 2 ops — filled in by task 1.7 */
+      case MUT_ASCIINUM:
+      case MUT_INSERTASCIINUM:
+        goto retry_havoc_step;  /* placeholder; fill in task 1.7 */
+
+      /* Bucket 3 ops — filled in by task 1.8 */
+      case MUT_EXTRA_OVERWRITE: case MUT_EXTRA_INSERT:
+      case MUT_AUTO_EXTRA_OVERWRITE: case MUT_AUTO_EXTRA_INSERT:
+      case MUT_SPLICE_OVERWRITE: case MUT_SPLICE_INSERT:
+        goto retry_havoc_step;  /* placeholder; fill in task 1.8 */
+
+      default:
+        goto retry_havoc_step;  /* unknown op code — retry */
+    }
+  }
+  return len;
+}
