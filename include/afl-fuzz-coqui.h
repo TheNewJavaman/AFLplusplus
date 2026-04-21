@@ -113,7 +113,8 @@ typedef struct coqui_ctx {
   /* CUDA handles (populated by coqui_init). void* avoids cuda.h dependency. */
   void *cu_ctx;       /* CUcontext */
   void *cu_module;    /* CUmodule */
-  void *cu_kernel;    /* CUfunction */
+  void *cu_kernel;    /* CUfunction — stage A (user code) */
+  void *cu_kernel_cov;/* CUfunction — stage B (classify + virgin compare) */
   void *stream_a;     /* CUstream */
   void *stream_b;     /* CUstream */
 
@@ -121,6 +122,11 @@ typedef struct coqui_ctx {
   unsigned long long d_virgin_map;
   unsigned long long d_global_statics_pool;
   unsigned long long d_slab_pool;
+  /* Split-kernel: device pool for cov_map, sized batch_size * 64KB.
+   * Moved out of per-thread .local alloca (iter 12) so stage B can read
+   * after stage A exits. Zero-on-read in __coqui_virgin_compare_and_flag
+   * keeps the pool at zeros post-batch, so no up-front memset needed. */
+  unsigned long long d_cov_pool;
 
   /* Config from .conf sidecar */
   unsigned int real_stack_size;
