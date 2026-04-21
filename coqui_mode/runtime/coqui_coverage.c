@@ -1,24 +1,11 @@
 /*
  * coqui_coverage.c --- AFL hash coverage bucketing + virgin comparison.
  *
- * Iteration 20 (warp-shared cov_map): the per-warp cov_map is shared by all
- * 32 lanes. Classify + virgin compare therefore run ONCE per warp, on lane 0:
- *   - __coqui_classify_counts_and_sig: lane 0 walks the 64 KB map; all other
- *     lanes idle. The resulting sig is broadcast via shfl.sync.idx so every
- *     lane returns the same u32 (the host reads status[tid].crash_sig per-lane
- *     but the crash-sig dedup hash-set then collapses duplicates).
- *   - __coqui_virgin_compare_and_flag: lane 0 walks the classified map and
- *     performs atom.or into the global virgin_map. Partial warps (ASan-exited
- *     lane) still route through a slow per-thread fallback for correctness.
- *     When novel, every lane in the warp sets its own bit in the novelty
- *     bitmap so the host processes all 32 slots; crash-sig dedup then
- *     collapses them into a single CPU verify call per warp.
- *
  * Bucketing: 256-entry lookup table; 8-byte-stride zero-skip walk.
- * Fidelity: per-warp novelty (not per-input) — allowed per iter 20 policy.
- * Race tolerance: cov_map edge writes are non-atomic within the warp; the
- * AFL bucket classes compress small count differences so most races are
- * invisible to the classifier.
+ * Virgin compare: warp-level OR reduction + one atom.or.b64 per warp per
+ * word on full warps (32× fewer L2 atomics vs. per-thread). Falls back to
+ * per-thread atom.or.b64 on partial warps (empty-slot boundary warp of a
+ * partial batch, or any warp with an ASan-triggered lane exit).
  *
  * Inline asm used for activemask.b32 / mov %laneid — no clang NVPTX
  * builtin exists outside the CUDA header. Shuffles use clang builtins
@@ -43,7 +30,9 @@ u8 __coqui_count_class_lookup[256] = {
     [128 ... 255] = COQUI_BUCKET_128_UP,
 };
 
-/* Byte-LUT classify of one u64 (in/out via pointer). */
+/* Byte-LUT classify of one u64 (in/out via pointer). Marked static inline
+ * so the chunked outer loop can inline it and the compiler keeps `word` in
+ * a register. Byte-identical output to the previous per-word code. */
 static inline void __coqui_classify_word(u64 *w) {
     u64 word = *w;
     u8 *bytes = (u8 *)&word;
@@ -58,10 +47,15 @@ static inline void __coqui_classify_word(u64 *w) {
     *w = word;
 }
 
-/* Cacheline-chunked classify: 8 u64s (64 bytes) per outer iteration. */
+/* Cacheline-chunked classify: 8 u64s (64 bytes) per outer iteration. A
+ * single OR across the 8 loaded words lets us skip whole cachelines when
+ * they're all zero, which is the common case for sparse cov_maps. The
+ * compiler is free to coalesce the 8 adjacent 64-bit loads into wider
+ * LDG.E.128 instructions. Per-word classify semantics unchanged. */
 void __coqui_classify_counts(u8 *map) {
     u64 *m64 = (u64 *)map;
-    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
+    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
+    /* n_chunks is 8192 == multiple of 8 (1024 cachelines). */
 
     for (u32 i = 0; i < n_chunks; i += 8) {
         u64 w0 = m64[i+0], w1 = m64[i+1], w2 = m64[i+2], w3 = m64[i+3];
@@ -88,142 +82,93 @@ void __coqui_classify_counts(u8 *map) {
 #define COQUI_FNV32_OFFSET  0x811c9dc5u
 #define COQUI_FNV32_PRIME   0x01000193u
 
-/* -- Warp helpers -- */
-
-static inline u32 __coqui_active_mask(void) {
-    u32 m;
-    asm volatile("activemask.b32 %0;" : "=r"(m));
-    return m;
-}
-
-static inline u32 __coqui_laneid(void) {
-    u32 l;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(l));
-    return l;
-}
-
-/* Broadcast a 32-bit value from `src_lane` to every lane in `mask`. */
-static inline u32 __coqui_warp_bcast_u32(u32 mask, u32 v, int src_lane) {
-    return (u32)__nvvm_shfl_sync_idx_i32((int)mask, (int)v, src_lane, 0x1f);
-}
-
-/* Broadcast a 64-bit value from `src_lane` to every lane in `mask`. */
-static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
-    u32 hi = __coqui_warp_bcast_u32(mask, (u32)(v >> 32), src_lane);
-    u32 lo = __coqui_warp_bcast_u32(mask, (u32)v, src_lane);
-    return ((u64)hi << 32) | lo;
-}
-
-/* Butterfly OR across all lanes in `mask`. */
-static inline u64 __coqui_warp_or_u64(u32 mask, u64 v) {
-    u32 hi = (u32)(v >> 32);
-    u32 lo = (u32)v;
-    for (int d = 16; d >= 1; d >>= 1) {
-        hi |= (u32)__nvvm_shfl_sync_bfly_i32((int)mask, (int)hi, d, 0x1f);
-        lo |= (u32)__nvvm_shfl_sync_bfly_i32((int)mask, (int)lo, d, 0x1f);
-    }
-    return ((u64)hi << 32) | lo;
-}
-
-/* Warp-shared one-pass classify + hash. Lane 0 walks the warp's single
- * cov_map (64 KB, shared across 32 lanes). Other lanes idle. The resulting
- * FNV-1a hash is broadcast via shfl.sync.idx so every lane returns the
- * same u32 signature. Partial warps (ASan-exited lanes) fall through to
- * the first surviving lane for the walk. */
+/* One-pass classify + hash. Identical classify semantics to the plain
+ * variant; folds an FNV-1a hash of the classified words (and their
+ * position, so bit-pattern-identical nonzero words at different offsets
+ * still diverge) while the word is in a register. Skipping zero words
+ * from the hash is safe because the u32 index is always mixed in, so
+ * two maps that differ only in which zeros are skipped can't collide. */
 u32 __coqui_classify_counts_and_sig(u8 *map) {
-    u32 mask = __coqui_active_mask();
-    u32 laneid = __coqui_laneid();
+    u64 *m64 = (u64 *)map;
+    const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
+    u32 h = COQUI_FNV32_OFFSET;
+    /* Chunked 8-u64 (64-byte cacheline) walk. FNV semantics preserved:
+     * each nonzero word still folds (i, lo, hi) in ascending-index order,
+     * so the returned hash is byte-identical to the per-word variant. */
 
-    /* Pick the lowest active lane as the walker. For full warps this is 0;
-     * for partial warps (ASan-exited earlier lanes) this is whichever lane
-     * is lowest in `mask`. shfl.sync.idx requires the src lane be active. */
-    int walker = __builtin_ctz(mask);
+    for (u32 i = 0; i < n_chunks; i += 8) {
+        u64 w0 = m64[i+0], w1 = m64[i+1], w2 = m64[i+2], w3 = m64[i+3];
+        u64 w4 = m64[i+4], w5 = m64[i+5], w6 = m64[i+6], w7 = m64[i+7];
 
-    u32 h = 0;
-    if ((int)laneid == walker) {
-        u64 *m64 = (u64 *)map;
-        const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
-        h = COQUI_FNV32_OFFSET;
+        if (i + 8 < n_chunks) {
+            asm volatile("prefetch.global.L1 [%0];" :: "l"((const void *)&m64[i+8]));
+        }
 
-        for (u32 i = 0; i < n_chunks; i += 8) {
-            u64 w0 = m64[i+0], w1 = m64[i+1], w2 = m64[i+2], w3 = m64[i+3];
-            u64 w4 = m64[i+4], w5 = m64[i+5], w6 = m64[i+6], w7 = m64[i+7];
+        if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) continue;
 
-            if (i + 8 < n_chunks) {
-                asm volatile("prefetch.global.L1 [%0];" :: "l"((const void *)&m64[i+8]));
-            }
-
-            if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) continue;
-
-            if (w0) {
-                __coqui_classify_word(&w0);
-                m64[i+0] = w0;
-                h = (h ^ (i+0))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w0))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w0 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w1) {
-                __coqui_classify_word(&w1);
-                m64[i+1] = w1;
-                h = (h ^ (i+1))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w1))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w1 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w2) {
-                __coqui_classify_word(&w2);
-                m64[i+2] = w2;
-                h = (h ^ (i+2))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w2))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w2 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w3) {
-                __coqui_classify_word(&w3);
-                m64[i+3] = w3;
-                h = (h ^ (i+3))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w3))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w3 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w4) {
-                __coqui_classify_word(&w4);
-                m64[i+4] = w4;
-                h = (h ^ (i+4))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w4))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w4 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w5) {
-                __coqui_classify_word(&w5);
-                m64[i+5] = w5;
-                h = (h ^ (i+5))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w5))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w5 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w6) {
-                __coqui_classify_word(&w6);
-                m64[i+6] = w6;
-                h = (h ^ (i+6))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w6))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w6 >> 32))   * COQUI_FNV32_PRIME;
-            }
-            if (w7) {
-                __coqui_classify_word(&w7);
-                m64[i+7] = w7;
-                h = (h ^ (i+7))             * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w7))         * COQUI_FNV32_PRIME;
-                h = (h ^ (u32)(w7 >> 32))   * COQUI_FNV32_PRIME;
-            }
+        if (w0) {
+            __coqui_classify_word(&w0);
+            m64[i+0] = w0;
+            h = (h ^ (i+0))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w0))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w0 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w1) {
+            __coqui_classify_word(&w1);
+            m64[i+1] = w1;
+            h = (h ^ (i+1))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w1))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w1 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w2) {
+            __coqui_classify_word(&w2);
+            m64[i+2] = w2;
+            h = (h ^ (i+2))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w2))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w2 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w3) {
+            __coqui_classify_word(&w3);
+            m64[i+3] = w3;
+            h = (h ^ (i+3))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w3))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w3 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w4) {
+            __coqui_classify_word(&w4);
+            m64[i+4] = w4;
+            h = (h ^ (i+4))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w4))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w4 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w5) {
+            __coqui_classify_word(&w5);
+            m64[i+5] = w5;
+            h = (h ^ (i+5))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w5))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w5 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w6) {
+            __coqui_classify_word(&w6);
+            m64[i+6] = w6;
+            h = (h ^ (i+6))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w6))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w6 >> 32))   * COQUI_FNV32_PRIME;
+        }
+        if (w7) {
+            __coqui_classify_word(&w7);
+            m64[i+7] = w7;
+            h = (h ^ (i+7))             * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w7))         * COQUI_FNV32_PRIME;
+            h = (h ^ (u32)(w7 >> 32))   * COQUI_FNV32_PRIME;
         }
     }
-
-    /* Broadcast the walker's hash to all lanes. */
-    return __coqui_warp_bcast_u32(mask, h, walker);
+    return h;
 }
 
-/* Same FNV-1a fold, read-only (no classify). Used by asan_report when the
- * cov_map is partially written mid-execution. This function is called
- * unpredictably — any lane may crash while others are still executing —
- * so we keep it per-thread walk (each caller walks the shared map
- * independently). Under warp-shared cov this still produces the same sig
- * for all same-warp callers since they read the same map. */
+/* Same FNV-1a fold, read-only (no classify). Used by crash paths that
+ * fire mid-execution (asan_report) where the cov_map is partially
+ * written; the signature groups crashes at the same site. */
 u32 __coqui_trace_sig(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
@@ -239,46 +184,67 @@ u32 __coqui_trace_sig(u8 *map) {
     return h;
 }
 
-/* Warp-shared virgin compare + novelty flag.
- *
- * Under warp-shared cov_map, every lane in a full warp observes the same
- * classified map. So the virgin-compare walk runs ONCE on lane 0 (walker),
- * which performs atom.or on each non-zero word into the global virgin map
- * and tracks whether any novelty was found. The walker then broadcasts
- * novel=1/0 to all lanes; every lane sets its own novelty bit if novel.
- *
- * Partial warps (ASan-exited lane in the same warp) fall through to a
- * per-thread loop — correctness first, speed second. */
+/* -- Warp helpers -- */
+
+static inline u32 __coqui_active_mask(void) {
+    u32 m;
+    asm volatile("activemask.b32 %0;" : "=r"(m));
+    return m;
+}
+
+/* Butterfly OR across all lanes in `mask`. Caller must pass mask =
+ * 0xFFFFFFFF (full warp); under partial masks, shfl.sync produces
+ * undefined values for lanes whose XOR peer is outside the mask. */
+static inline u64 __coqui_warp_or_u64(u32 mask, u64 v) {
+    u32 hi = (u32)(v >> 32);
+    u32 lo = (u32)v;
+    for (int d = 16; d >= 1; d >>= 1) {
+        hi |= (u32)__nvvm_shfl_sync_bfly_i32((int)mask, (int)hi, d, 0x1f);
+        lo |= (u32)__nvvm_shfl_sync_bfly_i32((int)mask, (int)lo, d, 0x1f);
+    }
+    return ((u64)hi << 32) | lo;
+}
+
+/* Broadcast a 64-bit value from `src_lane` to every lane in `mask`. */
+static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
+    u32 hi = (u32)__nvvm_shfl_sync_idx_i32((int)mask, (int)(u32)(v >> 32),
+                                            src_lane, 0x1f);
+    u32 lo = (u32)__nvvm_shfl_sync_idx_i32((int)mask, (int)(u32)v,
+                                            src_lane, 0x1f);
+    return ((u64)hi << 32) | lo;
+}
+
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
     const u32 n = COQUI_COV_MAP_SIZE / 8;
     const u32 mask = __coqui_active_mask();
-    u32 laneid = __coqui_laneid();
+    int novel = 0;
 
     if (mask == 0xFFFFFFFFu) {
-        u32 novel = 0;
-        if (laneid == 0) {
-            for (u32 i = 0; i < n; i++) {
-                u64 mine = m64[i];
-                if (mine == 0) continue;
-                u64 was = atomic_fetch_or_explicit(&v64[i], mine,
-                                                    memory_order_relaxed);
-                if (mine & ~was) novel = 1;
+        u32 laneid;
+        asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
+
+        for (u32 i = 0; i < n; i++) {
+            u64 mine = m64[i];
+            u64 warp_mine = __coqui_warp_or_u64(mask, mine);
+            if (warp_mine == 0) continue;
+
+            /* Lane 0 does the atomic; broadcast `was` (pre-OR virgin) so
+             * every lane can compute its own novelty contribution
+             * mine & ~was. Over-reports novelty within a warp when >1
+             * lane independently set the same bit — benign, CPU verify
+             * rejects false positives. */
+            u64 was0 = 0;
+            if (laneid == 0) {
+                was0 = atomic_fetch_or_explicit(&v64[i], warp_mine,
+                                                memory_order_relaxed);
             }
-        }
-        novel = __coqui_warp_bcast_u32(mask, novel, 0);
-        if (novel) {
-            u32 tid = __coqui_fuzz_tid();
-            _Atomic u32 *nov32 = (_Atomic u32 *)&novelty_bitmap[tid >> 5];
-            atomic_fetch_or_explicit(nov32, 1u << (tid & 31u),
-                                      memory_order_relaxed);
+            u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
+            if (mine & ~was) { novel = 1; }
         }
     } else {
-        /* Partial warp: fall back to per-thread walk. Because cov_map is
-         * warp-shared, multiple lanes redundantly OR the same data into
-         * virgin, but atom.or is idempotent. */
-        int novel = 0;
+        /* Partial warp: original per-thread atomic. */
         for (u32 i = 0; i < n; i++) {
             u64 mine = m64[i];
             if (mine == 0) continue;
@@ -286,11 +252,11 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
                                                 memory_order_relaxed);
             if (mine & ~was) { novel = 1; }
         }
-        if (novel) {
-            u32 tid = __coqui_fuzz_tid();
-            _Atomic u32 *nov32 = (_Atomic u32 *)&novelty_bitmap[tid >> 5];
-            atomic_fetch_or_explicit(nov32, 1u << (tid & 31u),
-                                      memory_order_relaxed);
-        }
+    }
+
+    if (novel) {
+        u32 tid = __coqui_fuzz_tid();
+        _Atomic u32 *nov32 = (_Atomic u32 *)&novelty_bitmap[tid >> 5];
+        atomic_fetch_or_explicit(nov32, 1u << (tid & 31u), memory_order_relaxed);
     }
 }
