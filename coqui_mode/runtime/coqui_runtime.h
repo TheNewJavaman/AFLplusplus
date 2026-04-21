@@ -43,6 +43,22 @@ typedef uint64_t u64;
 #define COQUI_PHASE_COMPLETE    6
 #define COQUI_PHASE_RESERVED    7
 
+/* Slot-info flag values written by host to per-thread slot_info[tid] as
+ * (flag << 24) | (seed_idx & 0xFFFFFF). See spec §3.2.
+ * flag=0: input_bytes+offsets[tid] is pre-mutated (today's path).
+ * flag=1: havoc mutate from __coqui_seed_pool_base[seed_idx].       */
+#define COQUI_FLAG_PREMUT   0u
+#define COQUI_FLAG_HAVOC    1u
+
+/* Sentinel returned by weighted_splice_pick when the draw lands on
+ * self_idx. Caller issues `goto retry_havoc_step`. (~0u) */
+#define COQUI_SPLICE_SELF_SAME  (~0u)
+
+/* Reporting slab cap: up to this many threads can compact-write their
+ * mutated bytes back to the host per batch. Overflow degrades gracefully
+ * (WARNF + skip CPU verify for overflow slots). */
+#define COQUI_REPORTED_CAP  512u
+
 /* Per-thread status reported to the host.
  *
  * Layout is BYTE-IDENTICAL to the host-side coqui_status_t in
@@ -130,5 +146,46 @@ int __coqui_fuzz_execute(const unsigned char *data, unsigned long size);
 
 /* Device-global virgin map (allocated at module load, accessed via cuModuleGetGlobal) */
 extern u8 __coqui_virgin_map[COQUI_COV_MAP_SIZE];
+
+/* -- Module-level globals bound by host.
+ * All of these live on the device; host writes via cuModuleGetGlobal +
+ * cuMemcpyHtoD. See spec §3.1.
+ */
+
+/* Seed pool (ping-pong). __coqui_seed_pool_base etc. are POINTERS that host
+ * updates to alias to either the _a or _b backing store before each launch.
+ * The backing stores themselves are allocated by the host and their device
+ * addresses are written into these pointer-symbols. */
+extern u8  *__coqui_seed_pool_base;
+extern u32 *__coqui_seed_pool_offsets;
+extern u32 *__coqui_seed_pool_lens;
+extern u32 *__coqui_seed_pool_cumw;
+extern u32  __coqui_seed_pool_count;
+extern u32  __coqui_seed_pool_cumw_total;
+
+/* Extras (user dictionary via -x). Once at init. */
+extern u8  *__coqui_extras_base;
+extern u32 *__coqui_extras_offsets;
+extern u32 *__coqui_extras_lens;
+extern u32  __coqui_extras_cnt;
+
+/* Auto-extras (cmplog-learned). Grows during run; opportunistic re-upload. */
+extern u8  *__coqui_a_extras_base;
+extern u32 *__coqui_a_extras_offsets;
+extern u32 *__coqui_a_extras_lens;
+extern u32  __coqui_a_extras_cnt;
+
+/* Current active havoc weight table (constant memory for broadcast efficiency). */
+extern __attribute__((address_space(4))) u32 __coqui_mutation_array[256];
+extern __attribute__((address_space(4))) u32 __coqui_mutation_array_size;
+extern __attribute__((address_space(4))) u32 __coqui_havoc_stack_pow2;
+
+/* Per-batch randomness base. Thread-local PRNG is splitmix64(base ^ tid). */
+extern u64 __coqui_prng_base;
+
+/* Compact-report counter (atomically bumped by kernel novelty/crash path). */
+extern u32 __coqui_reported_count;
+extern u32 *__coqui_reported_tid;    /* length COQUI_REPORTED_CAP */
+extern u32 *__coqui_reported_lens;   /* length COQUI_REPORTED_CAP */
 
 #endif /* _COQUI_RUNTIME_H */
