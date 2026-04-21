@@ -3678,15 +3678,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
     do {
 
-      /* iter25: coqui runs the consumer thread in parallel. The consumer
-       * mutates afl->queue_buf, afl->queued_items, afl->saved_crashes and
-       * ->disabled/->favored/->was_fuzzed inside save_if_interesting().
-       * Take the coqui state mutex for the brief window where the scheduler
-       * reads these to pick the next queue entry. Released before the
-       * fuzz_one call so havoc runs lock-free in parallel with the
-       * consumer's verify phase. */
-      if (unlikely(afl->gpu_mode)) coqui_state_lock(afl);
-
       if (likely(!afl->old_seed_selection)) {
 
         if (likely(afl->pending_favored && afl->smallest_favored >= 0)) {
@@ -3738,11 +3729,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
       }
 
-      /* Release the coqui state lock before running fuzz_one (havoc + any
-       * coqui_submit_input calls use only producer-local batch slots and
-       * the ring mutex — neither needs the coarse AFL-state mutex). */
-      if (unlikely(afl->gpu_mode)) coqui_state_unlock(afl);
-
       skipped_fuzz = fuzz_one(afl);
   #ifdef INTROSPECTION
       ++afl->queue_cur->stats_selected;
@@ -3784,10 +3770,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
       if (unlikely(afl->old_seed_selection)) {
 
-        /* Scheduler reads queue_buf[] + ->disabled — lock against concurrent
-         * consumer mutation. */
-        if (unlikely(afl->gpu_mode)) coqui_state_lock(afl);
-
         while (++afl->current_entry < afl->queued_items &&
                afl->queue_buf[afl->current_entry]->disabled) {};
         if (unlikely(afl->current_entry >= afl->queued_items ||
@@ -3801,8 +3783,6 @@ int main(int argc, char **argv_orig, char **envp) {
           afl->queue_cur = afl->queue_buf[afl->current_entry];
 
         }
-
-        if (unlikely(afl->gpu_mode)) coqui_state_unlock(afl);
 
       }
 

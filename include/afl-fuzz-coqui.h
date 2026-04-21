@@ -12,7 +12,6 @@
 #define _HAVE_AFL_FUZZ_COQUI_H
 
 #include <sys/time.h>
-#include <pthread.h>
 
 #include "types.h"
 #include "forkserver.h"
@@ -22,14 +21,6 @@ struct afl_state;  /* forward */
 /* Tunable defaults. Override with env vars at runtime. */
 #define COQUI_DEFAULT_BATCH_SIZE 8192
 #define COQUI_MAX_INPUT_DEFAULT  4096
-
-/* SPSC ring buffer size for producer/consumer batch hand-off.
- * Producer can have up to (COQUI_RING_SIZE - 1) filled slots waiting +
- * 1 slot being filled. COQUI_RING_SIZE=4 gives the producer 3 queued
- * batches of headroom against consumer latency spikes without burning
- * too much pinned memory (each slot has batch_size×max_input_size/4
- * bytes ≈ 8 MB at default settings). */
-#define COQUI_RING_SIZE 4
 
 /* ------------------------------------------------------------------------
  * Data types
@@ -89,50 +80,10 @@ typedef struct coqui_batch {
 
 /* Per-afl-state coqui context. */
 typedef struct coqui_ctx {
-  /* SPSC ring buffer of batch slots. Producer (AFL main thread) fills
-   * producer_current; when full, it pushes producer_current's index onto
-   * the ring and acquires a new slot from the free pool. Consumer thread
-   * pops slots, runs launch+await+verify sequentially, then returns the
-   * slot to the free pool.
-   *
-   * Ring invariants:
-   *   filled = write_idx - read_idx  (modular, via u32 wraparound)
-   *   ring is empty when write_idx == read_idx
-   *   ring is full when filled == COQUI_RING_SIZE - 1 (one slot always
-   *   reserved for the producer-current in-progress batch). */
-  coqui_batch_t slots[COQUI_RING_SIZE];
-  u32 slot_queue[COQUI_RING_SIZE];  /* slot indices in FIFO order */
-  u32 write_idx;                     /* producer cursor (mod 2^32) */
-  u32 read_idx;                      /* consumer dequeue cursor (launched) */
-  u32 processed_idx;                 /* consumer completion cursor (await+verify done) */
-  u32 producer_current;              /* index of slot producer is filling */
-
-  /* Per-ctx pthread state. The same mutex protects all ring fields and
-   * guards coarse AFL-state mutations during consumer verify.
-   * ring_not_empty / ring_not_full implement the SPSC block/wake; drained
-   * is broadcast by the consumer when ring becomes empty (for flush_batch
-   * and shutdown). */
-  pthread_mutex_t ring_mutex;
-  pthread_cond_t  ring_not_empty;
-  pthread_cond_t  ring_not_full;
-  pthread_cond_t  ring_drained;
-  pthread_t consumer_tid;
-  u8  consumer_started;
-  u8  consumer_should_exit;
-  /* Force-reset synchronization. Consumer sets force_reset_in_progress
-   * under ring_mutex, broadcasts ring_not_full (waking a blocked producer),
-   * and waits for producer_yielded. Producer, seeing the flag at its next
-   * push attempt, sets producer_yielded and waits on ring_not_full. */
-  u8  force_reset_in_progress;
-  u8  producer_yielded;
-
-  /* Coarse AFL-state mutex. Held by the consumer around
-   * process_input_via_cpu_fsrv (write_to_testcase + fuzz_run_target +
-   * save_if_interesting) to serialize all mutations of afl->queue_buf,
-   * afl->virgin_bits, afl->queued_items, afl->saved_crashes, and associated
-   * on-disk files. Producer holds it briefly around queue-scheduling reads
-   * at the top of each fuzz_one iteration. Havoc body does NOT hold it. */
-  pthread_mutex_t afl_state_mutex;
+  coqui_batch_t  ping;
+  coqui_batch_t  pong;
+  coqui_batch_t *pending;    /* filling now (CPU side) */
+  coqui_batch_t *executing;  /* on GPU (or most recent done) */
 
   u32 batch_size;      /* snapshot of afl->gpu_batch_size */
   u32 max_input_size;  /* snapshot of afl->max_length (with fallback) */
@@ -250,12 +201,5 @@ u8 coqui_calibrate_one(struct afl_state *afl, u8 *buf, u32 len);
 /* Free resources and tear down CUDA context on normal exit or SIGINT.
    Stub: free()s host buffers; no CUDA calls. */
 void coqui_shutdown(struct afl_state *afl);
-
-/* Lock the coqui AFL-state mutex. Called by the producer (AFL main thread)
- * at fuzz_one scheduling boundaries to serialize against the consumer's
- * save_if_interesting / write_to_testcase work. Cheap no-op in non-gpu mode
- * (callers gate on afl->gpu_mode). */
-void coqui_state_lock(struct afl_state *afl);
-void coqui_state_unlock(struct afl_state *afl);
 
 #endif /* _HAVE_AFL_FUZZ_COQUI_H */

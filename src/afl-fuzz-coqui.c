@@ -3,16 +3,6 @@
  *
  * Real CUDA driver API backend for coqui_mode per spec §8.4.
  *
- * Threading (iter25): SPSC producer/consumer split. AFL's main thread is
- * the producer — it runs havoc and packs mutated inputs into a ring of
- * coqui_batch_t slots. A dedicated consumer thread (spawned by coqui_init)
- * pops ready slots, launches the GPU kernel, waits for completion, then
- * runs post-processing (novelty walk, crash dedup, CPU forkserver verify,
- * save_if_interesting). Producer and consumer synchronize on a ring-wide
- * pthread mutex + two condvars. A separate coarse mutex (afl_state_mutex)
- * serializes the consumer's mutations of AFL global queue state against
- * the producer's scheduler-side reads at the top of each fuzz_one.
- *
  * Spec: docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md
  */
 
@@ -22,7 +12,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 
 #include <cuda.h>
 
@@ -47,21 +36,14 @@ static unsigned long long getenv_u64(const char *name, unsigned long long dflt) 
   return strtoull(v, NULL, 0);
 }
 
-/* Forward declarations */
-static void alloc_batch_slot_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream stream);
-static void free_batch_slot_cuda(coqui_batch_t *b);
-static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b);
-static int  coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
-static void coqui_force_reset(afl_state_t *afl, const char *cubin_path);
-static void *coqui_consumer_thread(void *arg);
-static void coqui_start_consumer(afl_state_t *afl);
-static void coqui_init_internal(afl_state_t *afl, const char *cubin_path, u8 spawn_consumer);
+/* Forward declaration of internal helper */
+static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream stream);
 
 /* ------------------------------------------------------------------------
  * Internal helpers
  * ------------------------------------------------------------------------*/
 
-static void alloc_batch_slot_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream stream) {
+static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream stream) {
 
   /* Host pinned memory */
   CUCHECK(cuMemHostAlloc((void**)&b->h_input_bytes, ctx->byte_budget, 0));
@@ -101,11 +83,6 @@ static void alloc_batch_slot_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
  * ------------------------------------------------------------------------*/
 
 void coqui_init(afl_state_t *afl, const char *cubin_path) {
-  coqui_init_internal(afl, cubin_path, 1);
-}
-
-static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
-                                 u8 spawn_consumer) {
 
   coqui_ctx_t *ctx = ck_alloc(sizeof(coqui_ctx_t));
 
@@ -149,7 +126,11 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
   CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
 
   /* 4. Probe the device for its maximum allowed per-thread stack size.
-   *    (See iter-history in prior commits for the binary-search story.) */
+   *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
+   *    .local memory budget (per_thread × max-resident-threads × #SMs must
+   *    fit in device memory). There's no direct query API; binary-search
+   *    downward from the sm_75+ hardware ceiling (512 KB) to find the
+   *    largest accepted value. */
   unsigned int total_budget = 524288;   /* sm_75+ hardware ceiling */
   while (total_budget >= 32768) {
     if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget) == CUDA_SUCCESS) break;
@@ -163,6 +144,10 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
   OKF("coqui per-thread stack budget: %u KB (driver returned %zu)",
       total_budget / 1024, actual_set);
 
+  /* Derive heap and stack regions from the budget.
+   *    Layout (per spec §4.2):
+   *      [coverage 64 KB][heap H][shadow H/8][real stack S]
+   *      where H = (total - 64K - S) * 8/9 and shadow = H/8 */
   unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 32768);
   unsigned int cov = 65536;
   if (stack_size + cov >= total_budget) {
@@ -173,6 +158,7 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
   unsigned int heap = (remaining * 8) / 9;
   ctx->real_stack_size = stack_size;
 
+  /* 5. Check static stack usage doesn't exceed budget */
   int static_usage;
   CUCHECK(cuFuncGetAttribute(&static_usage,
     CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel));
@@ -181,69 +167,35 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
           static_usage, total_budget);
   }
 
-  /* 6. Batch sizing */
+  /* 6. Batch sizing (with u64 overflow protection from cuAFL T3.6 fixup) */
   ctx->batch_size = 8192;
   ctx->max_input_size = afl->max_length ? afl->max_length : 4096;
   unsigned long long budget64 = ((unsigned long long)ctx->batch_size
                                   * ctx->max_input_size) / 4;
   unsigned long long floor64 = (unsigned long long)ctx->max_input_size * 256;
   if (budget64 < floor64) budget64 = floor64;
-  if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;
+  if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;  /* MAX_ALLOC cap */
   ctx->byte_budget = (unsigned int)budget64;
   ctx->map_size = 65536;
 
-  /* 7. Create streams (one per ring slot, so async launches don't serialize
-   *    on each other — a slot's stream persists across reuse so enqueue
-   *    ordering is stable). */
-  /* N.b. we still keep stream_a/stream_b fields for backward compat with
-   * the shutdown path but now the slots own their own streams. */
+  /* 7. Create streams */
   CUstream sa, sb;
   CUCHECK(cuStreamCreate(&sa, CU_STREAM_NON_BLOCKING));
   CUCHECK(cuStreamCreate(&sb, CU_STREAM_NON_BLOCKING));
   ctx->stream_a = (void *)sa;
   ctx->stream_b = (void *)sb;
 
-  /* 8. Allocate all ring slots. We rotate stream assignments across slots
-   *    to get some parallelism between back-to-back kernel launches. */
-  for (u32 i = 0; i < COQUI_RING_SIZE; i++) {
-    /* Even slots -> stream_a, odd -> stream_b. With COQUI_RING_SIZE=4 this
-     * gives two slots per stream; sequential launches on the same stream
-     * serialize naturally which is what we want for consumer-side await
-     * ordering. */
-    CUstream s = (i & 1) ? sb : sa;
-    alloc_batch_slot_cuda(&ctx->slots[i], ctx, s);
-  }
+  /* 8. Allocate ping-pong pair */
+  alloc_batch_half_cuda(&ctx->ping, ctx, sa);
+  alloc_batch_half_cuda(&ctx->pong, ctx, sb);
+  ctx->pending   = &ctx->ping;
+  ctx->executing = &ctx->pong;
 
-  /* Initialize ring state. Slot 0 is the producer's starting slot. */
-  ctx->write_idx = 0;
-  ctx->read_idx  = 0;
-  ctx->processed_idx = 0;
-  ctx->producer_current = 0;
-  /* Slot-index queue is populated lazily on push. Default zeros are fine. */
-  memset(ctx->slot_queue, 0, sizeof(ctx->slot_queue));
-
-  /* Pthread state. */
-  pthread_mutex_init(&ctx->ring_mutex, NULL);
-  /* afl_state_mutex is recursive: the consumer holds it across
-   * process_input_via_cpu_fsrv (which calls fuzz_run_target), and
-   * fuzz_run_target in GPU mode ALSO takes it from its own wrapper —
-   * that re-entry is fine with a recursive mutex. */
-  {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&ctx->afl_state_mutex, &attr);
-    pthread_mutexattr_destroy(&attr);
-  }
-  pthread_cond_init(&ctx->ring_not_empty, NULL);
-  pthread_cond_init(&ctx->ring_not_full,  NULL);
-  pthread_cond_init(&ctx->ring_drained,   NULL);
-  ctx->consumer_started        = 0;
-  ctx->consumer_should_exit    = 0;
-  ctx->force_reset_in_progress = 0;
-  ctx->producer_yielded        = 0;
-
-  /* 9. Statics pool — allocate AND bind to the cubin's pool-base symbol. */
+  /* 9. Statics pool — allocate AND bind to the cubin's pool-base symbol.
+   *    StaticGlobals pass emits per-thread accesses as `pool_base + tid * size + offset`,
+   *    where `pool_base` is the extern global `__coqui_global_statics_pool_base`.
+   *    We allocate the backing storage here AND write its device address into
+   *    that symbol so the kernel can compute correct per-thread addresses. */
   CUdeviceptr statics_sym;
   size_t statics_sym_sz;
   if (cuModuleGetGlobal(&statics_sym, &statics_sym_sz, mod,
@@ -258,6 +210,9 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
       CUCHECK(cuMemsetD8(pool, 0, total_pool));
       ctx->d_global_statics_pool = (unsigned long long)pool;
 
+      /* Bind: write `pool` (a CUdeviceptr) into the kernel's
+       * `__coqui_global_statics_pool_base` symbol so device-side accesses
+       * see the correct base. The symbol is declared as `ptr` (8 bytes). */
       CUdeviceptr pool_base_sym;
       size_t pool_base_sz;
       CUresult br = cuModuleGetGlobal(&pool_base_sym, &pool_base_sz, mod,
@@ -283,6 +238,7 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
     CUCHECK(cuMemAlloc(&slab, slab_size));
     CUCHECK(cuMemsetD8(slab, 0, slab_size));
     ctx->d_slab_pool = (unsigned long long)slab;
+    /* TODO: invoke __coqui_slab_setup init kernel when slab runtime ported */
   }
 
   ctx->batch_timeout_us = getenv_u64("AFL_COQUI_TIMEOUT_US", 3000000);
@@ -299,38 +255,25 @@ static void coqui_init_internal(afl_state_t *afl, const char *cubin_path,
   ctx->verify_baseline_sum = 0;
   ctx->verify_baseline_n   = 0;
   ctx->slow_skipped        = 0;
+  /* Adaptive batch-timeout (B1) ring buffer — zero-init. */
   memset(ctx->batch_latency_ring, 0, sizeof(ctx->batch_latency_ring));
   ctx->batch_latency_count  = 0;
   ctx->batch_latency_head   = 0;
-  ctx->t_submit_us = 0;
-  ctx->t_await_us  = 0;
-  ctx->t_verify_us = 0;
+  ctx->ping.launch_start_us = 0;
+  ctx->pong.launch_start_us = 0;
 
   afl->coqui = ctx;
 
-  /* Spawn consumer thread. Must happen AFTER afl->coqui is assigned,
-   * since the consumer will dereference it. On force-reset, the caller
-   * is ALREADY the consumer thread rebuilding state — in that path we
-   * skip the spawn and let the caller continue running its own loop. */
-  if (spawn_consumer) {
-    coqui_start_consumer(afl);
-  } else {
-    /* force-reset path: current thread is the consumer. Adopt the new
-     * CUDA context onto this thread. (coqui_init leaves the context
-     * current on the creating thread; for the spawn path we pop it so
-     * the new consumer thread can adopt it. For the in-place path we
-     * keep it on the current thread.) */
-    /* no-op: cuCtxCreate_v4 above already pushed the new context onto
-     * the current thread's stack. */
-  }
-
-  OKF("coqui initialized: sm_%d%d, batch=%u, stack=%u KB, heap=%u KB, total=%u KB, ring=%d",
-      major, minor, ctx->batch_size, stack_size/1024, heap/1024, total_budget/1024,
-      COQUI_RING_SIZE);
+  OKF("coqui initialized: sm_%d%d, batch=%u, stack=%u KB, heap=%u KB, total=%u KB",
+      major, minor, ctx->batch_size, stack_size/1024, heap/1024, total_budget/1024);
 
 }
 
-/* Translate GPU status fields to an AFL fault code. */
+/* Translate GPU status fields to an AFL fault code.
+ *
+ * Note: the device does not currently set a per-thread timeout_flag — if/when
+ * it does, add a field to coqui_status_t in both runtime.h and afl-fuzz-coqui.h
+ * at matching byte offsets, then check it here. */
 static u8 translate_gpu_status(coqui_status_t *s) {
   if (s->asan_error) return FSRV_RUN_CRASH;
   if (s->ubsan_fatal) return FSRV_RUN_CRASH;
@@ -340,25 +283,25 @@ static u8 translate_gpu_status(coqui_status_t *s) {
 
 /* Run a GPU-flagged or GPU-crashed input through the CPU forkserver for
    real trace_bits, then call save_if_interesting.
-   CPU-side speed gate inherited. Locks afl_state_mutex around the full
-   write_to_testcase + fuzz_run_target + save_if_interesting sequence so
-   AFL state (trace_bits, queue_buf, virgin_bits) is seen consistently by
-   this call and no other thread mutates it mid-sequence. */
+
+   CPU-side speed gate (ported from coqui 9d85772): establish a fixed
+   baseline verify time from the first 10 CPU verifications. Any later
+   input that takes >10× that baseline to verify is rejected from corpus
+   admission. Pathologically slow inputs (deep recursion, hash-collision
+   storms) are what cause GPU kernel timeouts; blocking them from the
+   corpus prevents them from becoming havoc parents that generate even
+   slower children. Fixed (not EMA) baseline so the threshold doesn't
+   drift up as slow inputs appear. */
 static void process_input_via_cpu_fsrv(afl_state_t *afl,
                                         u8 *input, u32 len) {
-  coqui_ctx_t *ctx = afl->coqui;
-  pthread_mutex_lock(&ctx->afl_state_mutex);
-
   u32 new_size = write_to_testcase(afl, (void **)&input, len, 0);
-  if (new_size == 0) {
-    pthread_mutex_unlock(&ctx->afl_state_mutex);
-    return;
-  }
+  if (new_size == 0) return;
 
   u64 t0 = get_cur_time_us();
   u8  cpu_fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
   u64 verify_us = get_cur_time_us() - t0;
 
+  coqui_ctx_t *ctx = afl->coqui;
   if (ctx->verify_baseline_n < 10) {
     ctx->verify_baseline_sum += verify_us;
     ctx->verify_baseline_n++;
@@ -371,15 +314,28 @@ static void process_input_via_cpu_fsrv(afl_state_t *afl,
   } else if (ctx->verify_baseline_us > 0 &&
              verify_us > ctx->verify_baseline_us * 10) {
     ctx->slow_skipped++;
-    pthread_mutex_unlock(&ctx->afl_state_mutex);
-    return;
+    return;   /* don't admit to corpus */
   }
 
   afl->queued_discovered += save_if_interesting(afl, input, len, cpu_fault);
-  pthread_mutex_unlock(&ctx->afl_state_mutex);
 }
 
-/* Adaptive batch-timeout (B1) helpers — unchanged from pre-threading. */
+/* Forward decl — defined below. Returns 1 if the CUDA context was reset
+ * (caller's `ctx` / `b` snapshots are stale; re-fetch from afl->coqui
+ * and abandon the current ping-pong operation). Returns 0 on normal
+ * completion. */
+static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
+static void coqui_force_reset(afl_state_t *afl, const char *cubin_path);
+
+/* Adaptive batch-timeout (B1) helpers.
+ *
+ * Push one healthy-batch latency into the ring buffer, then — if we have
+ * enough samples AND the user did not pin the timeout via AFL_COQUI_TIMEOUT_US
+ * — recompute batch_timeout_us = clamp(MULT * P95, FLOOR, CEIL).
+ *
+ * Only healthy batches (CUDA_SUCCESS before cull deadline) feed this ring.
+ * Culled and force-reset batches are excluded so the estimate tracks the
+ * true steady-state latency, not the pathological tail. */
 static int coqui_u64_cmp(const void *a, const void *b) {
   unsigned long long av = *(const unsigned long long *)a;
   unsigned long long bv = *(const unsigned long long *)b;
@@ -388,6 +344,9 @@ static int coqui_u64_cmp(const void *a, const void *b) {
 
 static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
                                         unsigned long long latency_us) {
+  /* Defensive: huge outliers (e.g., first-batch init cost) could skew P95
+   * upward and defeat the whole point. Cap at 10s so a one-off slow start
+   * doesn't pin us to the 3s ceiling forever. */
   if (latency_us > 10000000ULL) latency_us = 10000000ULL;
 
   ctx->batch_latency_ring[ctx->batch_latency_head] = latency_us;
@@ -397,7 +356,7 @@ static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
     ctx->batch_latency_count++;
   }
 
-  if (ctx->timeout_env_override) return;
+  if (ctx->timeout_env_override) return;  /* user pin wins */
   if (ctx->batch_latency_count < COQUI_LAT_MIN_SAMPLES) return;
 
   unsigned long long tmp[COQUI_LAT_RING_SIZE];
@@ -405,6 +364,9 @@ static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
   memcpy(tmp, ctx->batch_latency_ring, n * sizeof(unsigned long long));
   qsort(tmp, n, sizeof(unsigned long long), coqui_u64_cmp);
 
+  /* P95: index = floor((n-1) * 0.95). For n=32 -> index 29.
+   * Standard nearest-rank on a ring means small-n estimates skew slightly
+   * low, but that is safer than skewing high (high = slower cull). */
   u32 idx = (u32)(((unsigned long long)(n - 1) * COQUI_LAT_P95_PCT) / 100ULL);
   unsigned long long p95 = tmp[idx];
 
@@ -419,12 +381,21 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
 
+  /* Submit-phase timing: wrap the HtoD/memset/launch/DtoH/event-record API
+   * calls so the [coqui-rate] print can split driver-submission cost from
+   * actual GPU wait (measured separately in coqui_await_and_process). */
   struct timeval _tv_submit_t0;
   gettimeofday(&_tv_submit_t0, NULL);
   unsigned long long _submit_t0_us =
       ((unsigned long long)_tv_submit_t0.tv_sec * 1000000ULL) +
       _tv_submit_t0.tv_usec;
 
+  /* H->D — only copy the live prefix of input_bytes. Kernel reads only
+   * input_bytes[offsets[tid]..+lens[tid]] and empty-slot threads
+   * (lens[tid]==0) short-circuit at FuzzEntry.cpp L112-113 before any
+   * read. Stale tail from previous batches is inert. Round up to
+   * 8-byte alignment to match the slot cursor maintained by
+   * coqui_submit_input (off = (bytes_used + 7) & ~7u). */
   size_t input_bytes_len = (b->bytes_used + 7u) & ~(size_t)7u;
   if (input_bytes_len > 0) {
     CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_bytes,
@@ -439,6 +410,7 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
 
+  /* Launch */
   void *args[] = {
     (void *)&b->d_input_bytes,
     (void *)&b->d_offsets,
@@ -448,10 +420,11 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   };
   unsigned grid = ctx->batch_size / 128;
   CUCHECK(cuLaunchKernel((CUfunction)ctx->cu_kernel,
-                          grid, 1, 1,
-                          128, 1, 1,
+                          grid, 1, 1,    /* grid */
+                          128, 1, 1,     /* block */
                           0, s, args, NULL));
 
+  /* D->H */
   CUCHECK(cuMemcpyDtoHAsync(b->h_novelty, (CUdeviceptr)b->d_novelty,
                              ctx->batch_size / 8, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
@@ -460,6 +433,8 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
 
+  /* Close out submit-phase timer now that all driver calls for this batch
+   * have returned. */
   {
     struct timeval _tv_submit_t1;
     gettimeofday(&_tv_submit_t1, NULL);
@@ -469,11 +444,20 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
     ctx->t_submit_us += (_submit_t1_us - _submit_t0_us);
   }
 
+  /* Adaptive batch-timeout (B1): stamp launch time ON THE BATCH so
+   * coqui_await_and_process can compute healthy-batch latency. Per-batch
+   * (not per-context) because ping-pong means launch(X) → flip → wait(Y),
+   * where a context-level field would get clobbered between Y's launch
+   * and Y's wait. */
   struct timeval rate_tv;
   gettimeofday(&rate_tv, NULL);
   b->launch_start_us =
       ((unsigned long long)rate_tv.tv_sec * 1000000ULL) + rate_tv.tv_usec;
 
+  /* Throughput diagnostic: one line per batch launch. Supplements AFL's own
+   * execs_per_sec (accurate now that coqui_submit_input bumps total_execs)
+   * with per-batch visibility — inputs/batch is the key signal that batches
+   * are full (cross-fuzz_one accumulation working) vs partial. */
   if (!ctx->rate_log_init) {
     ctx->rate_log_t0 = rate_tv;
     ctx->rate_log_init = 1;
@@ -485,6 +469,9 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
       (rate_tv.tv_usec - ctx->rate_log_t0.tv_usec);
     u64 dl = ctx->launch_count - ctx->rate_log_last_launches;
     u64 ds = ctx->total_submits - ctx->rate_log_last_submits;
+    /* Throttle: only print if either ≥ 1s elapsed or ≥ 4 batches accumulated,
+     * whichever comes first, so we see signal both when batches flow fast and
+     * when they're slow due to pathological inputs. */
     if (elapsed_us >= 1000000ULL || dl >= 4) {
       if (elapsed_us > 0) {
         double avg_dedup_per_batch = dl > 0
@@ -493,6 +480,11 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
         double avg_verify_per_batch = dl > 0
             ? (double)ctx->crash_verify_calls / (double)ctx->launch_count
             : 0.0;
+        /* Per-batch phase averages over this window. submit is driver-API
+         * time (all async), await is the GPU wait in the poll loop, verify
+         * is CPU-side novelty+crash loops after kernel completion. Summing
+         * submit+await+verify approximates total host wall time per batch;
+         * the gap to 1/batch-rate is AFL's outer stage overhead. */
         double avg_submit_us_batch = dl > 0
             ? (double)ctx->t_submit_us / (double)dl : 0.0;
         double avg_await_us_batch  = dl > 0
@@ -521,6 +513,8 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
       ctx->rate_log_last_launches = ctx->launch_count;
       ctx->rate_log_last_submits  = ctx->total_submits;
       ctx->rate_log_t0 = rate_tv;
+      /* Reset per-window timing accumulators; next print shows the next
+       * window's phase averages. */
       ctx->t_submit_us = 0;
       ctx->t_await_us  = 0;
       ctx->t_verify_us = 0;
@@ -528,22 +522,34 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   }
 }
 
-/* Await the consumer-owned batch's completion, then run post-processing.
- * Acquires afl_state_mutex around the verify work. Returns 1 if force-reset
- * fired (caller must re-fetch ctx pointers). */
 static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
 
+  /* Two-phase bounded wait with seed culling. Coqui's strategy (driver
+   * 2248-2256): when a batch times out, the culprit is usually a single
+   * pathological input; deprioritize the queue entry it came from so the
+   * same mutations aren't retried. Then grant extra time for the kernel to
+   * finish naturally (cuCtxSynchronize-style drain) bounded by a hard
+   * ceiling that forces a FATAL instead of an open-ended block. */
   struct timeval tv;
   gettimeofday(&tv, NULL);
   unsigned long long start_us =
     ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
   unsigned long long cull_deadline_us = start_us + ctx->batch_timeout_us;
+  /* Hard ceiling: if the kernel hasn't finished 1s after culling, assume an
+   * infinite loop and force-reset (kills the kernel). Reset costs ~1s, which
+   * is cheaper than waiting longer for a pathological kernel to finish.
+   *
+   * iter17 tightening: was 5s. Profile evidence (P1 iter6) showed truly-
+   * pathological cjson kernels hang 5–22+ seconds, well beyond any plausible
+   * grace window; the 5s grace was almost never recovering legitimately-slow
+   * batches and was costing ~4s per pathology cycle. 1s grace gives near-done
+   * kernels a fair chance to complete while keeping recovery latency low. */
   unsigned long long hard_deadline_us = cull_deadline_us + 1000000ULL;
 
   int culled = 0;
-  unsigned long long wait_end_us = 0;
+  unsigned long long wait_end_us = 0;  /* set when cuStreamQuery reports success */
   while (1) {
     CUresult r = cuStreamQuery(s);
     if (r == CUDA_SUCCESS) {
@@ -556,32 +562,38 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       break;
     }
     if (r != CUDA_ERROR_NOT_READY) {
-      CUCHECK(r);
+      CUCHECK(r);   /* genuine GPU fault */
     }
     gettimeofday(&tv, NULL);
     unsigned long long now =
       ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
 
     if (!culled && now >= cull_deadline_us) {
-      /* Reading afl->queue_cur from the consumer — snapshot under the state
-       * mutex to avoid a torn read vs. the producer updating queue_cur. */
-      const char *fname = "(none)";
-      pthread_mutex_lock(&ctx->afl_state_mutex);
-      if (afl->queue_cur) fname = (const char *)afl->queue_cur->fname;
       WARNF("coqui batch timeout after %llu us — disabling queue entry "
             "'%s' and extending wait by 1s",
-            ctx->batch_timeout_us, fname);
+            ctx->batch_timeout_us,
+            afl->queue_cur ? (const char *)afl->queue_cur->fname : "(none)");
       if (afl->queue_cur) {
+        /* Hard skip from scheduling. Also set exec_us so the information
+         * survives in AFL's stats dump and the weight formula treats the
+         * entry as expensive even if it's later re-enabled. disabled=1
+         * and exec_us both persist in fastresume.bin (they live in the
+         * queue_entry block serialized at shutdown), so restarts keep
+         * the cull — no need to rediscover pathological entries every
+         * session. */
         afl->queue_cur->disabled = 1;
         afl->queue_cur->exec_us = (u64)ctx->batch_timeout_us;
         afl->queue_cur->fuzz_level += 1000;
       }
-      pthread_mutex_unlock(&ctx->afl_state_mutex);
       culled = 1;
       continue;
     }
 
     if (now >= hard_deadline_us) {
+      /* Kernel still running after cull + grace period. Force-kill via
+       * context destroy and rebuild: we need the kernel dead NOW so the
+       * queue entry we culled can't keep blocking throughput. Any pending
+       * work in this batch is lost; caller must re-fetch ctx pointers. */
       WARNF("coqui kernel stuck past %llu us — force-resetting CUDA context "
             "to kill runaway kernel. In-flight inputs lost.",
             (hard_deadline_us - start_us));
@@ -591,10 +603,17 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       return 1;
     }
 
-    usleep(1000);
+    usleep(1000);   /* 1ms poll — matches coqui driver */
   }
-  (void)ctx;
+  (void)ctx;  /* silence unused-after-reset-path warnings */
 
+  /* Adaptive batch-timeout (B1): record latency of this batch ONLY if it
+   * completed healthily (CUDA_SUCCESS before the cull deadline fired).
+   * Culled and force-reset batches are the pathology we are trying to
+   * escape faster — including them in the stat would drive the timeout
+   * estimate UP, which is the opposite of the goal. The `culled` flag
+   * is the single source of truth here: we break out of the wait loop
+   * on CUDA_SUCCESS, and this code runs only after that break. */
   if (!culled && b->launch_start_us > 0) {
     struct timeval done_tv;
     gettimeofday(&done_tv, NULL);
@@ -604,13 +623,6 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       coqui_push_healthy_latency(ctx, done_us - b->launch_start_us);
     }
   }
-
-  /* Post-kernel work. We don't hold afl_state_mutex across the whole verify
-   * phase — instead, each process_input_via_cpu_fsrv call takes the lock
-   * around its own write_to_testcase + fuzz_run_target + save_if_interesting
-   * sequence. This avoids a producer-consumer priority inversion: if the
-   * producer is mid-fuzz_one and hits a path that takes the state lock, it
-   * doesn't have to wait for a full verify phase to complete. */
 
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
@@ -627,6 +639,23 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
+  /* Also process crashes not flagged as novel.
+   * A GPU crash may not set new coverage bits but still needs to be saved.
+   *
+   * Crash-signature dedup (iter5 P1): each crashed thread stores an FNV-1a
+   * hash of its classified cov_map in status[i].crash_sig. Malformed inputs
+   * that fail at the same parser site converge to the same signature, so
+   * we only invoke the (expensive) CPU forkserver verify on the FIRST slot
+   * with each unique signature. Subsequent duplicates increment
+   * crash_dedup_hits and are skipped; the FIRST slot (lowest index) is
+   * deterministic and independent of iteration order.
+   *
+   * Hash-set: 256 slots of open-addressing (power of 2 → bitmask probe).
+   * Inserting 4085 keys into 256 slots has worst-case degraded probe
+   * length but distinct-signatures count is expected to be O(10-50), so
+   * in practice the set is sparsely populated. If the set fills (unlikely),
+   * we treat any new probe sequence as "seen" to avoid runaway probing and
+   * accept the false-positive (dropped verify). */
   coqui_status_t *hs = b->h_status;
 
   #define COQUI_CRASH_DEDUP_SLOTS 256u
@@ -638,11 +667,14 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   for (u32 i = 0; i < ctx->batch_size; i++) {
     if (b->h_input_lens[i] == 0) continue;
     u8 nov = (b->h_novelty[i / 8] >> (i % 8)) & 1;
-    if (nov) continue;
+    if (nov) continue;   /* already processed above */
 
     u8 gpu_fault = translate_gpu_status(&hs[i]);
     if (gpu_fault != FSRV_RUN_CRASH && gpu_fault != FSRV_RUN_TMOUT) continue;
 
+    /* Dedup lookup — open-addressing linear probe. sig==0 is a valid key
+     * (treated the same as any other). A full table (no empty slot found
+     * after batch_size probes) falls through to "seen" to cap work. */
     u32 sig = hs[i].crash_sig;
     u32 idx = sig & (COQUI_CRASH_DEDUP_SLOTS - 1u);
     int seen = 0;
@@ -658,6 +690,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       if (dedup_slots[slot] == sig) { seen = 1; break; }
     }
     if (!inserted && !seen) {
+      /* Table full — treat as seen to stop runaway probing. */
       seen = 1;
     }
 
@@ -673,6 +706,9 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   }
   #undef COQUI_CRASH_DEDUP_SLOTS
 
+  /* Close out verify-phase timer: wait_end_us was captured at the CUDA_SUCCESS
+   * break out of the poll loop; everything between there and here is the
+   * post-kernel host work (novelty walk + crash-sig dedup + fsrv verifies). */
   if (wait_end_us > 0) {
     struct timeval _tv_verify_end;
     gettimeofday(&_tv_verify_end, NULL);
@@ -687,216 +723,14 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   return 0;
 }
 
-/* -----------------------------------------------------------------------
- * Consumer thread
- * -----------------------------------------------------------------------*/
-
-static void *coqui_consumer_thread(void *arg) {
-  afl_state_t *afl = (afl_state_t *)arg;
-  coqui_ctx_t *ctx = afl->coqui;
-
-  /* The consumer thread is the CUDA caller after coqui_init returns; bind
-   * it to the context we built on the main thread. */
-  CUCHECK(cuCtxSetCurrent((CUcontext)ctx->cu_ctx));
-
-  /* Pipelined consumer: keep one batch "in flight" (launched but not yet
-   * awaited) so the GPU is busy during the CPU-side verify of the previous
-   * batch. This mirrors the original ping-pong scheme but with arbitrary
-   * ring depth.
-   *
-   *   iter 0: pop A, launch A. inflight = A.
-   *   iter 1: pop B, launch B (async, GPU now running B after A). await A,
-   *           verify A, release slot A. inflight = B.
-   *   iter 2: pop C, launch C. await B, verify B, release slot B. inflight = C.
-   *   ...
-   *
-   * This keeps a 2-stage pipeline (launch N+1 while verifying N) which
-   * ensures the GPU's idle window is only the gap between one kernel
-   * finishing and the next being submitted — typically microseconds. */
-  u32 inflight_slot_i = 0xFFFFFFFFu;   /* no inflight at boot */
-
-  /* Two cursors: read_idx = slot most recently dequeued for launch,
-   *              processed_idx = slot most recently awaited + verified + reset.
-   * Producer reserves slots between [processed_idx, write_idx) as busy.
-   * The pipeline: launch slot at read_idx, await+verify slot at processed_idx.
-   * In steady state, read_idx is always 1 ahead of processed_idx (the
-   * inflight). */
-  for (;;) {
-    u32 slot_i = 0;
-    u8 have_next = 0;
-
-    pthread_mutex_lock(&ctx->ring_mutex);
-
-    if (inflight_slot_i != 0xFFFFFFFFu) {
-      /* We have an inflight. Opportunistically launch the next one if a
-       * slot is available in the ring (i.e., producer has pushed past
-       * our read_idx). */
-      if (ctx->write_idx != ctx->read_idx) {
-        u32 slot_pos = ctx->read_idx % COQUI_RING_SIZE;
-        slot_i = ctx->slot_queue[slot_pos];
-        have_next = 1;
-        ctx->read_idx++;      /* dequeue now; producer won't touch this slot */
-      }
-    } else {
-      /* No inflight. Block until work arrives. */
-      while (ctx->write_idx == ctx->read_idx && !ctx->consumer_should_exit) {
-        pthread_cond_wait(&ctx->ring_not_empty, &ctx->ring_mutex);
-      }
-      if (ctx->consumer_should_exit && ctx->write_idx == ctx->read_idx) {
-        pthread_mutex_unlock(&ctx->ring_mutex);
-        break;
-      }
-      u32 slot_pos = ctx->read_idx % COQUI_RING_SIZE;
-      slot_i = ctx->slot_queue[slot_pos];
-      have_next = 1;
-      ctx->read_idx++;
-    }
-    pthread_mutex_unlock(&ctx->ring_mutex);
-
-    /* Launch the next batch NOW (async). */
-    if (have_next) {
-      coqui_launch_batch(afl, &ctx->slots[slot_i]);
-    }
-
-    /* Process the inflight slot (previous batch's await + verify). */
-    if (inflight_slot_i != 0xFFFFFFFFu) {
-      coqui_batch_t *inflight_b = &ctx->slots[inflight_slot_i];
-      int reset_occurred = coqui_await_and_process(afl, inflight_b);
-      if (reset_occurred) {
-        /* ctx was torn down. */
-        ctx = afl->coqui;
-        inflight_slot_i = 0xFFFFFFFFu;
-        continue;
-      }
-
-      inflight_b->n_inputs = 0;
-      inflight_b->bytes_used = 0;
-      inflight_b->launch_start_us = 0;
-
-      /* Mark this slot as processed so the producer can refill it.
-       * processed_idx tracks "fully processed" slots; producer uses it to
-       * determine "busy" = [processed_idx, write_idx). Incrementing it
-       * releases the slot for refill. */
-      pthread_mutex_lock(&ctx->ring_mutex);
-      ctx->processed_idx = (ctx->processed_idx + 1);
-      pthread_cond_broadcast(&ctx->ring_not_full);
-      if (ctx->write_idx == ctx->processed_idx) {
-        pthread_cond_broadcast(&ctx->ring_drained);
-      }
-      pthread_mutex_unlock(&ctx->ring_mutex);
-
-      inflight_slot_i = 0xFFFFFFFFu;
-    }
-
-    /* Slide: the one we just launched becomes the new inflight. */
-    if (have_next) {
-      inflight_slot_i = slot_i;
-    }
-  }
-
-  /* Drain any still-inflight batch before exiting. */
-  if (inflight_slot_i != 0xFFFFFFFFu) {
-    coqui_batch_t *inflight_b = &ctx->slots[inflight_slot_i];
-    int reset_occurred = coqui_await_and_process(afl, inflight_b);
-    if (!reset_occurred) {
-      inflight_b->n_inputs = 0;
-      inflight_b->bytes_used = 0;
-      pthread_mutex_lock(&ctx->ring_mutex);
-      ctx->processed_idx++;
-      pthread_cond_broadcast(&ctx->ring_drained);
-      pthread_mutex_unlock(&ctx->ring_mutex);
-    }
-  }
-
-  return NULL;
-}
-
-static void coqui_start_consumer(afl_state_t *afl) {
-  coqui_ctx_t *ctx = afl->coqui;
-  if (ctx->consumer_started) return;
-
-  /* Pop the current context off the main thread so the consumer can adopt
-   * it via cuCtxSetCurrent. (CUDA 4.0+ supports a context being current on
-   * any single thread at a time; before pushing ourselves back, the main
-   * thread shouldn't touch CUDA anymore — and in fact our producer path
-   * does NO CUDA calls after coqui_init returns.) */
-  CUcontext popped = NULL;
-  cuCtxPopCurrent(&popped);
-  (void)popped;
-
-  int rc = pthread_create(&ctx->consumer_tid, NULL,
-                          coqui_consumer_thread, afl);
-  if (rc != 0) {
-    FATAL("coqui: pthread_create failed: %s", strerror(rc));
-  }
-  ctx->consumer_started = 1;
-}
-
-/* -----------------------------------------------------------------------
- * Producer-side API
- * -----------------------------------------------------------------------*/
-
-/* Push the producer_current slot onto the ring and acquire a fresh slot.
- * Must be called with ring_mutex NOT held. Blocks if ring is full. */
-static void producer_push_and_acquire(coqui_ctx_t *ctx) {
-  pthread_mutex_lock(&ctx->ring_mutex);
-
-  /* Record the pushed slot in the FIFO queue at write_idx. */
-  u32 wpos = ctx->write_idx % COQUI_RING_SIZE;
-  ctx->slot_queue[wpos] = ctx->producer_current;
-  ctx->write_idx++;
-  pthread_cond_signal(&ctx->ring_not_empty);
-
-  /* Acquire a fresh slot. "Busy" slots are ones between processed_idx
-   * (not yet fully processed) and write_idx. We need a free slot — one
-   * not in that range. Ring is full when (write_idx - processed_idx) ==
-   * COQUI_RING_SIZE, meaning all slots are pushed/inflight/launched. */
-  while (!ctx->consumer_should_exit) {
-    if (ctx->force_reset_in_progress) {
-      ctx->producer_yielded = 1;
-      pthread_cond_broadcast(&ctx->ring_not_full);
-      while (ctx->force_reset_in_progress && !ctx->consumer_should_exit) {
-        pthread_cond_wait(&ctx->ring_not_full, &ctx->ring_mutex);
-      }
-      ctx->producer_yielded = 0;
-      break;
-    }
-    u32 busy_count = ctx->write_idx - ctx->processed_idx;
-    /* Reserve one slot for the producer's next in-progress. */
-    if (busy_count < COQUI_RING_SIZE) break;
-    pthread_cond_wait(&ctx->ring_not_full, &ctx->ring_mutex);
-  }
-
-  /* Find a free slot: not in slot_queue[processed_idx..write_idx) (those
-   * are busy: either queued, being launched, or being processed). */
-  u32 busy[COQUI_RING_SIZE] = {0};
-  for (u32 k = ctx->processed_idx; k != ctx->write_idx; k++) {
-    u32 sk = ctx->slot_queue[k % COQUI_RING_SIZE];
-    if (sk < COQUI_RING_SIZE) busy[sk] = 1;
-  }
-  u32 new_slot = 0xFFFFFFFFu;
-  for (u32 k = 0; k < COQUI_RING_SIZE; k++) {
-    if (!busy[k]) { new_slot = k; break; }
-  }
-  if (new_slot == 0xFFFFFFFFu) {
-    new_slot = 0;  /* shouldn't happen given the while-loop above */
-  }
-  ctx->producer_current = new_slot;
-
-  pthread_mutex_unlock(&ctx->ring_mutex);
-
-  /* Zero out the slot state so the caller fills cleanly. */
-  coqui_batch_t *nb = &ctx->slots[new_slot];
-  nb->n_inputs = 0;
-  nb->bytes_used = 0;
-  nb->launch_start_us = 0;
-}
-
 u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
   coqui_ctx_t *ctx = afl->coqui;
-  coqui_batch_t *b = &ctx->slots[ctx->producer_current];
+  coqui_batch_t *b = ctx->pending;
 
   ctx->total_submits++;
+  /* Count each submission as one exec — the corresponding increment in
+   * afl_fsrv_run_target is suppressed in coqui_mode to avoid double-counting
+   * GPU-flagged inputs that also run through CPU verification. */
   afl->fsrv.total_execs++;
 
   if (len > ctx->byte_budget) {
@@ -906,13 +740,29 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
 
   u32 off = (b->bytes_used + 7) & ~7u;
   if (off + len > ctx->byte_budget || b->n_inputs == ctx->batch_size) {
-    /* Current slot is full. Hand it off to the consumer and acquire a
-     * fresh one. */
-    producer_push_and_acquire(ctx);
-    /* ctx may have been replaced on force-reset; re-fetch. */
-    ctx = afl->coqui;
-    b = &ctx->slots[ctx->producer_current];
+    /* Launch the full batch async */
+    coqui_launch_batch(afl, b);
+
+    /* Flip ping-pong */
+    coqui_batch_t *tmp = ctx->pending;
+    ctx->pending = ctx->executing;
+    ctx->executing = tmp;
+
+    b = ctx->pending;
     off = 0;
+
+    /* If the new pending has in-flight work from a previous flip, drain it
+       before reusing */
+    if (b->n_inputs > 0) {
+      if (coqui_await_and_process(afl, b) == 1) {
+        /* Context was reset under us; ctx/b are stale. Drop this input —
+         * the context is now functional but the old batch pointers are
+         * freed. Caller (havoc loop) will retry on the next iteration. */
+        return 0;
+      }
+      b->n_inputs = 0;
+      b->bytes_used = 0;
+    }
   }
 
   memcpy(b->h_input_bytes + off, buf, len);
@@ -925,106 +775,63 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
 
 void coqui_flush_batch(afl_state_t *afl) {
   coqui_ctx_t *ctx = afl->coqui;
-  coqui_batch_t *b = &ctx->slots[ctx->producer_current];
 
-  /* If the current slot has data, push it. */
-  if (b->n_inputs > 0) {
-    producer_push_and_acquire(ctx);
-    ctx = afl->coqui;
+  /* Drain the executing batch if it has in-flight work */
+  if (ctx->executing->n_inputs > 0) {
+    if (coqui_await_and_process(afl, ctx->executing) == 1) return;
+    ctx->executing->n_inputs = 0;
+    ctx->executing->bytes_used = 0;
   }
 
-  /* Wait for ring to fully drain: all pushed slots must be BOTH launched
-   * (read_idx == write_idx) AND processed (processed_idx == write_idx). */
-  pthread_mutex_lock(&ctx->ring_mutex);
-  while (ctx->write_idx != ctx->processed_idx && !ctx->consumer_should_exit) {
-    pthread_cond_wait(&ctx->ring_drained, &ctx->ring_mutex);
+  /* Launch + drain pending if partial */
+  if (ctx->pending->n_inputs > 0) {
+    coqui_launch_batch(afl, ctx->pending);
+    if (coqui_await_and_process(afl, ctx->pending) == 1) return;
+    ctx->pending->n_inputs = 0;
+    ctx->pending->bytes_used = 0;
   }
-  pthread_mutex_unlock(&ctx->ring_mutex);
 }
 
 u8 coqui_calibrate_one(afl_state_t *afl, u8 *buf, u32 len) {
   (void)afl; (void)buf; (void)len;
+  /* Deprecated under the coexistence model (coqui internals spec §8.10).
+     Calibration now flows through AFL's standard fuzz_run_target on the
+     CPU forkserver at afl->fsrv. Kept as a no-op for ABI compatibility;
+     reserved for future GPU-side calibration optimization. */
   return FSRV_RUN_OK;
 }
 
-void coqui_state_lock(afl_state_t *afl) {
-  if (!afl->coqui) return;
-  coqui_ctx_t *ctx = afl->coqui;
-  pthread_mutex_lock(&ctx->afl_state_mutex);
-}
-
-void coqui_state_unlock(afl_state_t *afl) {
-  if (!afl->coqui) return;
-  coqui_ctx_t *ctx = afl->coqui;
-  pthread_mutex_unlock(&ctx->afl_state_mutex);
-}
-
-/* Force teardown + rebuild for the stuck-kernel path. Called ONLY from the
- * consumer thread (inside coqui_await_and_process when the hard deadline
- * expires). We re-init in place without spawning a new consumer thread,
- * and the CURRENT thread (this consumer) continues running against the
- * fresh ctx.
- *
- * Producer synchronization: we set force_reset_in_progress under ring_mutex
- * on the OLD ctx so if the producer happens to be blocked on ring_not_full,
- * it wakes up and yields. For a producer mid-havoc (not blocked), we rely
- * on the fact that host-side pinned memory remains a valid virtual mapping
- * until we cuMemFreeHost it below; the producer may write into the old
- * slot's h_input_bytes but those writes get discarded. After we rebuild
- * ctx and set afl->coqui to the new ctx, the producer's next submit
- * re-fetches afl->coqui (we do this in coqui_submit_input). Any in-flight
- * inputs in the old slot are lost — already the documented semantic. */
+/* Force teardown + rebuild for the stuck-kernel path. Destroys the CUDA
+ * context unconditionally (which kills the runaway kernel, all streams, and
+ * all context-bound device memory), frees host pinned memory (process-scoped,
+ * so safe post-destroy), then rebuilds via coqui_init. Does NOT call the
+ * regular coqui_shutdown because that cuStreamSynchronizes the stuck streams
+ * and would block forever. */
 static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (!afl->coqui) return;
   coqui_ctx_t *ctx = afl->coqui;
 
-  /* Wake any producer blocked on the old ring so it can observe the
-   * teardown and retry cleanly on the new ctx. */
-  pthread_mutex_lock(&ctx->ring_mutex);
-  ctx->force_reset_in_progress = 1;
-  ctx->consumer_should_exit = 1;  /* old ctx's consumer (us) will not re-enter the loop */
-  pthread_cond_broadcast(&ctx->ring_not_empty);
-  pthread_cond_broadcast(&ctx->ring_not_full);
-  pthread_cond_broadcast(&ctx->ring_drained);
-  pthread_mutex_unlock(&ctx->ring_mutex);
-
-  /* Tear down CUDA. */
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
 
-  for (u32 i = 0; i < COQUI_RING_SIZE; i++) {
-    coqui_batch_t *b = &ctx->slots[i];
-    if (b->h_input_bytes) cuMemFreeHost(b->h_input_bytes);
-    if (b->h_offsets)     cuMemFreeHost(b->h_offsets);
-    if (b->h_input_lens)  cuMemFreeHost(b->h_input_lens);
-    if (b->h_novelty)     cuMemFreeHost(b->h_novelty);
-    if (b->h_status)      cuMemFreeHost(b->h_status);
-  }
-
-  pthread_mutex_destroy(&ctx->ring_mutex);
-  pthread_mutex_destroy(&ctx->afl_state_mutex);
-  pthread_cond_destroy(&ctx->ring_not_empty);
-  pthread_cond_destroy(&ctx->ring_not_full);
-  pthread_cond_destroy(&ctx->ring_drained);
-
-  pthread_t old_consumer_tid = ctx->consumer_tid;
-  u8 old_consumer_started    = ctx->consumer_started;
-  (void)old_consumer_tid; (void)old_consumer_started;
+  /* Host pinned buffers are independent of context lifecycle. */
+  if (ctx->ping.h_input_bytes) cuMemFreeHost(ctx->ping.h_input_bytes);
+  if (ctx->ping.h_offsets)     cuMemFreeHost(ctx->ping.h_offsets);
+  if (ctx->ping.h_input_lens)  cuMemFreeHost(ctx->ping.h_input_lens);
+  if (ctx->ping.h_novelty)     cuMemFreeHost(ctx->ping.h_novelty);
+  if (ctx->ping.h_status)      cuMemFreeHost(ctx->ping.h_status);
+  if (ctx->pong.h_input_bytes) cuMemFreeHost(ctx->pong.h_input_bytes);
+  if (ctx->pong.h_offsets)     cuMemFreeHost(ctx->pong.h_offsets);
+  if (ctx->pong.h_input_lens)  cuMemFreeHost(ctx->pong.h_input_lens);
+  if (ctx->pong.h_novelty)     cuMemFreeHost(ctx->pong.h_novelty);
+  if (ctx->pong.h_status)      cuMemFreeHost(ctx->pong.h_status);
 
   ck_free(ctx);
   afl->coqui = NULL;
 
-  /* Rebuild in-place; do NOT spawn a new consumer. The CURRENT thread
-   * continues as the consumer. The new ctx's consumer_tid/consumer_started
-   * are set as if the current thread owns the role. */
-  coqui_init_internal(afl, cubin_path, 0);
-
-  /* Record that the current thread IS the consumer. */
-  coqui_ctx_t *new_ctx = afl->coqui;
-  new_ctx->consumer_tid     = pthread_self();
-  new_ctx->consumer_started = 1;
+  coqui_init(afl, cubin_path);
 }
 
-static void free_batch_slot_cuda(coqui_batch_t *b) {
+static void free_batch_half_cuda(coqui_batch_t *b) {
   if (b->h_input_bytes) cuMemFreeHost(b->h_input_bytes);
   if (b->h_offsets)     cuMemFreeHost(b->h_offsets);
   if (b->h_input_lens)  cuMemFreeHost(b->h_input_lens);
@@ -1046,37 +853,13 @@ void coqui_shutdown(afl_state_t *afl) {
   if (!afl->coqui) return;
   coqui_ctx_t *ctx = afl->coqui;
 
-  /* Signal + join consumer thread. Flush any pending producer slot. */
-  if (ctx->consumer_started) {
-    /* Push any partial slot the producer was filling. */
-    coqui_batch_t *b = &ctx->slots[ctx->producer_current];
-    if (b->n_inputs > 0) {
-      /* Ring mutex NOT held; push via the producer helper. */
-      producer_push_and_acquire(ctx);
-      ctx = afl->coqui;
-    }
-
-    pthread_mutex_lock(&ctx->ring_mutex);
-    ctx->consumer_should_exit = 1;
-    pthread_cond_broadcast(&ctx->ring_not_empty);
-    pthread_mutex_unlock(&ctx->ring_mutex);
-
-    pthread_join(ctx->consumer_tid, NULL);
-    ctx->consumer_started = 0;
-  }
-
-  /* Consumer thread may have dropped the CUDA context off its own stack
-   * when exiting. Re-adopt on the main (shutdown) thread. */
-  if (ctx->cu_ctx) cuCtxSetCurrent((CUcontext)ctx->cu_ctx);
-
   /* Drain streams */
   if (ctx->stream_a) cuStreamSynchronize((CUstream)ctx->stream_a);
   if (ctx->stream_b) cuStreamSynchronize((CUstream)ctx->stream_b);
 
-  /* Free ring slots */
-  for (u32 i = 0; i < COQUI_RING_SIZE; i++) {
-    free_batch_slot_cuda(&ctx->slots[i]);
-  }
+  /* Free ping-pong */
+  free_batch_half_cuda(&ctx->ping);
+  free_batch_half_cuda(&ctx->pong);
 
   /* Free persistent device buffers */
   if (ctx->d_global_statics_pool)
@@ -1089,12 +872,6 @@ void coqui_shutdown(afl_state_t *afl) {
   if (ctx->stream_b) cuStreamDestroy((CUstream)ctx->stream_b);
   if (ctx->cu_module) cuModuleUnload((CUmodule)ctx->cu_module);
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
-
-  pthread_mutex_destroy(&ctx->ring_mutex);
-  pthread_mutex_destroy(&ctx->afl_state_mutex);
-  pthread_cond_destroy(&ctx->ring_not_empty);
-  pthread_cond_destroy(&ctx->ring_not_full);
-  pthread_cond_destroy(&ctx->ring_drained);
 
   ck_free(ctx);
   afl->coqui = NULL;
