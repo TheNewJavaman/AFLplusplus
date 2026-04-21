@@ -160,6 +160,16 @@ typedef struct coqui_ctx {
   u32                batch_latency_count;      /* total samples pushed */
   u32                batch_latency_head;       /* next write index */
   u8                 timeout_env_override;     /* 1 if AFL_COQUI_TIMEOUT_US set */
+
+  /* GPU-side kernel phase cycles, summed across all threads in the batch.
+   * Read from __coqui_kernel_timing[5] after each batch completes,
+   * accumulated across the rate-log window. Divide by (dl * batch_size) for
+   * average cycles/thread per phase; divide by ~1.5 GHz to convert to µs.
+   * Slots: 0=memory_init, 1=fuzz_execute, 2=classify+sig, 3=virgin_compare,
+   * 4=total (clk_e - clk_a). */
+  unsigned long long d_kernel_timing;  /* CUdeviceptr to the 5-u64 array */
+  u64                k_cycles[5];      /* host-side accumulator, reset at print */
+  u32                k_batch_count;    /* batches contributing to accumulator */
 } coqui_ctx_t;
 
 /* Adaptive batch-timeout tunables (B1). */

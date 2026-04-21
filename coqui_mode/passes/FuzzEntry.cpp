@@ -86,6 +86,22 @@ bool runFuzzEntry(Module &M) {
       nullptr, "__coqui_virgin_map");
   }
 
+  /* 4b. Per-phase kernel timing accumulators: [init, exec, classify,
+   * virgin, total] u64 cycles. Each thread atomic-adds its phase cycles
+   * into the appropriate slot; host reads + zeros per batch and reports
+   * averages. Clock source is clock64() — SM clock register, 1 cycle per
+   * tick, runs at GPU clock rate (~1.5 GHz on TITAN RTX). */
+  ArrayType *TimingArrTy = ArrayType::get(i64, 5);
+  GlobalVariable *KernelTiming = M.getGlobalVariable("__coqui_kernel_timing", true);
+  if (!KernelTiming) {
+    KernelTiming = new GlobalVariable(
+      M, TimingArrTy, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      ConstantAggregateZero::get(TimingArrTy), "__coqui_kernel_timing");
+  }
+  FunctionCallee Clock64 = M.getOrInsertFunction(
+      "llvm.nvvm.read.ptx.sreg.clock64",
+      FunctionType::get(i64, false));
+
   /* 5. __coqui_status_array pointer global (runtime will read this) */
   GlobalVariable *StatusArrayPtr = M.getGlobalVariable("__coqui_status_array", true);
   if (!StatusArrayPtr) {
@@ -120,8 +136,14 @@ bool runFuzzEntry(Module &M) {
   /* PHASE_START = 1 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 1)});
 
+  /* clk_a: start of instrumented body */
+  Value *clkA = Builder.CreateCall(Clock64, {}, "clk_a");
+
   /* __coqui_memory_init() */
   Builder.CreateCall(MemoryInit, {});
+
+  /* clk_b: after memory_init */
+  Value *clkB = Builder.CreateCall(Clock64, {}, "clk_b");
 
   /* off = offsets[tid]; input_ptr = input_bytes + off */
   Value *offPtr   = Builder.CreateGEP(i32, offsetsArg, {tid}, "offsets_tid");
@@ -138,6 +160,9 @@ bool runFuzzEntry(Module &M) {
   FunctionType *ExecType = FunctionType::get(i32, {i8p, i64}, false);
   Builder.CreateCall(ExecType, User, {inputPtr, len64});
 
+  /* clk_c: after fuzz_execute (user harness) */
+  Value *clkC = Builder.CreateCall(Clock64, {}, "clk_c");
+
   /* PHASE_BUCKETING = 4 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 4)});
 
@@ -146,12 +171,37 @@ bool runFuzzEntry(Module &M) {
   /* sig = __coqui_classify_counts_and_sig(cov) */
   Value *sig = Builder.CreateCall(ClassifyAndSig, {cov}, "sig");
 
+  /* clk_d: after classify_counts_and_sig */
+  Value *clkD = Builder.CreateCall(Clock64, {}, "clk_d");
+
   /* PHASE_VIRGIN_CMP = 5 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 5)});
 
   /* With opaque pointers, VirginMap (ptr to [65536 x i8]) is already
      an i8* — no bitcast needed; pass directly as i8p. */
   Builder.CreateCall(VirginCmp, {cov, VirginMap, noveltyArg});
+
+  /* clk_e: after virgin_compare */
+  Value *clkE = Builder.CreateCall(Clock64, {}, "clk_e");
+
+  /* Atomically accumulate per-phase cycle deltas into __coqui_kernel_timing.
+   * Slot 0: memory_init, 1: fuzz_execute, 2: classify+sig, 3: virgin_compare,
+   * 4: total (clk_e - clk_a). Using atomicrmw add with monotonic ordering —
+   * lowers to atom.add.u64 on global memory. Non-crashing threads only; an
+   * ASan-aborted thread won't reach here (calls __coqui_exit earlier). */
+  auto emitTimingAdd = [&](unsigned slot, Value *delta) {
+    Value *slotPtr = Builder.CreateGEP(
+        TimingArrTy, KernelTiming,
+        {ConstantInt::get(i32, 0), ConstantInt::get(i32, slot)},
+        "timing_slot");
+    Builder.CreateAtomicRMW(AtomicRMWInst::Add, slotPtr, delta,
+                            MaybeAlign(8), AtomicOrdering::Monotonic);
+  };
+  emitTimingAdd(0, Builder.CreateSub(clkB, clkA, "d_init"));
+  emitTimingAdd(1, Builder.CreateSub(clkC, clkB, "d_exec"));
+  emitTimingAdd(2, Builder.CreateSub(clkD, clkC, "d_classify"));
+  emitTimingAdd(3, Builder.CreateSub(clkE, clkD, "d_virgin"));
+  emitTimingAdd(4, Builder.CreateSub(clkE, clkA, "d_total"));
 
   /* Store sig into status[tid].crash_sig.
    *

@@ -125,6 +125,21 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->d_virgin_map = (unsigned long long)d_virgin;
   CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
 
+  /* Bind __coqui_kernel_timing[5] — 5 u64 slots accumulating per-phase
+   * cycles across all threads in the batch. The kernel atomic-adds its
+   * phase deltas to this; host memsets before each launch and DtoH
+   * reads afterwards. */
+  CUdeviceptr d_timing;
+  size_t timing_sz;
+  CUCHECK(cuModuleGetGlobal(&d_timing, &timing_sz, mod, "__coqui_kernel_timing"));
+  if (timing_sz != 5 * sizeof(unsigned long long)) {
+    FATAL("__coqui_kernel_timing symbol size %zu != 40B", timing_sz);
+  }
+  ctx->d_kernel_timing = (unsigned long long)d_timing;
+  CUCHECK(cuMemsetD8(d_timing, 0, timing_sz));
+  memset(ctx->k_cycles, 0, sizeof(ctx->k_cycles));
+  ctx->k_batch_count = 0;
+
   /* 4. Probe the device for its maximum allowed per-thread stack size.
    *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must
@@ -491,12 +506,34 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
             ? (double)ctx->t_await_us  / (double)dl : 0.0;
         double avg_verify_us_batch = dl > 0
             ? (double)ctx->t_verify_us / (double)dl : 0.0;
+
+        /* GPU-side kernel phase timing: synchronous DtoH of the 5-u64
+         * cumulative cycle counter; subtract prior reading to get cycles
+         * consumed during this window; divide by dl*batch_size for avg
+         * cycles/thread. Percentages are slot[0..3] / slot[4] — total
+         * includes memory_init+exec+classify+virgin, so pct sums to ~100. */
+        unsigned long long cur_cycles[5] = {0};
+        cuMemcpyDtoH(cur_cycles, (CUdeviceptr)ctx->d_kernel_timing,
+                     sizeof(cur_cycles));
+        unsigned long long delta_cycles[5];
+        for (int i = 0; i < 5; i++) {
+          delta_cycles[i] = cur_cycles[i] - ctx->k_cycles[i];
+          ctx->k_cycles[i] = cur_cycles[i];  /* store for next window */
+        }
+        double pct[4] = {0,0,0,0};
+        if (delta_cycles[4] > 0) {
+          for (int i = 0; i < 4; i++) {
+            pct[i] = 100.0 * (double)delta_cycles[i] / (double)delta_cycles[4];
+          }
+        }
+
         fprintf(stderr,
                 "[coqui-rate] %.1f batches/s, %llu submits/s "
                 "(avg %.0f inputs/batch, %llu slow-skipped, "
                 "crash_dedup_hits=%llu avg=%.1f/batch, "
                 "crash_verify_calls=%llu avg=%.1f/batch, "
-                "submit=%.0fus await=%.0fus verify=%.0fus /batch)\n",
+                "submit=%.0fus await=%.0fus verify=%.0fus /batch, "
+                "kern: init=%.0f%% exec=%.0f%% classify=%.0f%% virgin=%.0f%%)\n",
                 (double)dl * 1e6 / (double)elapsed_us,
                 (unsigned long long)(ds * 1000000ULL / elapsed_us),
                 dl > 0 ? (double)ds / (double)dl : 0.0,
@@ -507,7 +544,8 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                 avg_verify_per_batch,
                 avg_submit_us_batch,
                 avg_await_us_batch,
-                avg_verify_us_batch);
+                avg_verify_us_batch,
+                pct[0], pct[1], pct[2], pct[3]);
         fflush(stderr);
       }
       ctx->rate_log_last_launches = ctx->launch_count;
