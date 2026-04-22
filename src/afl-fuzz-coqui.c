@@ -31,6 +31,19 @@
   }                                                                           \
 } while (0)
 
+/* AFL mutation-array selectors --- defined in src/afl-fuzz-one.c (included via
+ * afl-mutations.h in that TU). We reference them by extern to avoid pulling
+ * the full afl-mutations.h here (it emits multi-defined globals). */
+extern u32 binary_array[];
+extern u32 text_array[];
+extern u32 mutation_strategy_exploration_binary[];
+extern u32 mutation_strategy_exploitation_binary[];
+/* The MUT_*_ARRAY_SIZE macros we need inline-define locally to match
+ * afl-mutations.h:34,88,290. */
+#define COQUI_MUT_STRATEGY_ARRAY_SIZE 256
+#define COQUI_MUT_TXT_ARRAY_SIZE      200
+#define COQUI_MUT_BIN_ARRAY_SIZE      256
+
 static unsigned int getenv_u32(const char *name, unsigned int dflt) {
   const char *v = getenv(name);
   if (!v) return dflt;
@@ -551,6 +564,162 @@ static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
   if (target > COQUI_LAT_CEIL_US)  target = COQUI_LAT_CEIL_US;
 
   ctx->batch_timeout_us = target;
+}
+
+void coqui_refresh_seed_pool(afl_state_t *afl) {
+  coqui_ctx_t *ctx = afl->coqui;
+  if (!ctx) return;
+  CUstream sp = (CUstream)ctx->stream_pool;
+  u8 next = 1 - ctx->seed_pool_active;
+
+  /* Pick destination buffers for the new side. */
+  u8  *dst_bytes   = (next == 0) ? ctx->h_seed_pool_bytes_a   : ctx->h_seed_pool_bytes_b;
+  u32 *dst_offsets = (next == 0) ? ctx->h_seed_pool_offsets_a : ctx->h_seed_pool_offsets_b;
+  u32 *dst_lens    = (next == 0) ? ctx->h_seed_pool_lens_a    : ctx->h_seed_pool_lens_b;
+  u32 *dst_cumw    = (next == 0) ? ctx->h_seed_pool_cumw_a    : ctx->h_seed_pool_cumw_b;
+
+  unsigned long long d_bytes   = (next == 0) ? ctx->d_seed_pool_bytes_a   : ctx->d_seed_pool_bytes_b;
+  unsigned long long d_offsets = (next == 0) ? ctx->d_seed_pool_offsets_a : ctx->d_seed_pool_offsets_b;
+  unsigned long long d_lens    = (next == 0) ? ctx->d_seed_pool_lens_a    : ctx->d_seed_pool_lens_b;
+  unsigned long long d_cumw    = (next == 0) ? ctx->d_seed_pool_cumw_a    : ctx->d_seed_pool_cumw_b;
+
+  /* Slot 0: queue_cur (always). Guard against missing/too-large input. */
+  u32 cursor = 0;
+  u32 count = 0;
+  u64 cumw_total = 0;
+
+  u8 *cur_buf = NULL;
+  if (afl->queue_cur && afl->queue_cur->len > 0 &&
+      afl->queue_cur->len <= ctx->seed_pool_cap_bytes) {
+    cur_buf = queue_testcase_get(afl, afl->queue_cur);
+  }
+  if (cur_buf) {
+    memcpy(dst_bytes + cursor, cur_buf, afl->queue_cur->len);
+    dst_offsets[0] = cursor;
+    dst_lens[0]    = afl->queue_cur->len;
+    cursor += afl->queue_cur->len;
+    cumw_total += (u64)afl->queue_cur->weight;
+    dst_cumw[0] = (u32)cumw_total;
+    count = 1;
+  } else {
+    /* No usable queue_cur --- produce empty pool; kernel will fall through splice
+     * rejection paths and no thread can splice. */
+    ctx->h_seed_pool_count_next = 0;
+    ctx->h_seed_pool_cumw_total_next = 0;
+    ctx->seed_pool_active = next;
+    u32 zero = 0;
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_count,      &zero, 4));
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_cumw_total, &zero, 4));
+    return;
+  }
+
+  /* Slots 1..255: weighted-random-with-replacement samples of queue_buf.
+   * Build a cumulative weight array (over all enabled queue entries) once,
+   * then sample N-1 times. O(Q) build + O(log Q * N) sample. */
+  u32 Q = afl->queued_items;
+  if (Q > 1 && count < 256) {
+    u64 *cdf = ck_alloc(Q * sizeof(u64));
+    u64 total = 0;
+    for (u32 i = 0; i < Q; ++i) {
+      struct queue_entry *q = afl->queue_buf[i];
+      u64 w = (q && !q->disabled) ? (u64)q->weight : 0;
+      total += w;
+      cdf[i] = total;
+    }
+    if (total > 0) {
+      for (u32 slot = count; slot < 256; ++slot) {
+        u64 r = (u64)rand_below(afl, (u32)(total > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)total));
+        u32 lo = 0, hi = Q;
+        while (lo < hi) {
+          u32 m = (lo + hi) >> 1;
+          if (cdf[m] <= r) lo = m + 1; else hi = m;
+        }
+        if (lo >= Q) lo = Q - 1;
+        struct queue_entry *q = afl->queue_buf[lo];
+        if (!q || q->len == 0) continue;
+        if (cursor + q->len > ctx->seed_pool_cap_bytes) break;
+        u8 *q_buf = queue_testcase_get(afl, q);
+        if (!q_buf) continue;
+        memcpy(dst_bytes + cursor, q_buf, q->len);
+        dst_offsets[slot] = cursor;
+        dst_lens[slot]    = q->len;
+        cursor += q->len;
+        cumw_total += (u64)q->weight;
+        dst_cumw[slot] = (u32)cumw_total;
+        count++;
+      }
+    }
+    ck_free(cdf);
+  }
+
+  /* HtoD on stream_pool --- overlaps in-flight kernel on stream_a/b. */
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_bytes,   dst_bytes,   cursor,       sp));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_offsets, dst_offsets, count * 4,    sp));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_lens,    dst_lens,    count * 4,    sp));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_cumw,    dst_cumw,    count * 4,    sp));
+
+  /* Fence: subsequent kernel launches on stream_a/b must wait for this upload. */
+  CUevent ev;
+  CUCHECK(cuEventCreate(&ev, CU_EVENT_DISABLE_TIMING));
+  CUCHECK(cuEventRecord(ev, sp));
+  CUCHECK(cuStreamWaitEvent((CUstream)ctx->stream_a, ev, 0));
+  CUCHECK(cuStreamWaitEvent((CUstream)ctx->stream_b, ev, 0));
+  CUCHECK(cuEventDestroy(ev));
+
+  /* Flip pointer symbols + scalar count/cumw_total. */
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_base,    &d_bytes,   8));
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_offsets, &d_offsets, 8));
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_lens,    &d_lens,    8));
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_cumw,    &d_cumw,    8));
+  u32 cnt_u32 = count;
+  u32 cumw_u32 = (u32)(cumw_total & 0xFFFFFFFFu);
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_count,      &cnt_u32,  4));
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_cumw_total, &cumw_u32, 4));
+
+  ctx->h_seed_pool_count_next = count;
+  ctx->h_seed_pool_cumw_total_next = cumw_u32;
+  ctx->seed_pool_active = next;
+
+  /* Upload mutation_array if (input_mode, fuzz_mode) changed. */
+  if (!ctx->mut_array_uploaded ||
+      ctx->mut_array_input_mode != afl->input_mode ||
+      ctx->mut_array_fuzz_mode  != afl->fuzz_mode) {
+    u32 *active = binary_array;   /* default/generic exploration */
+    u32  size   = COQUI_MUT_BIN_ARRAY_SIZE;
+    if (afl->input_mode == 1 /* TEXT */) {
+      if (afl->fuzz_mode == 0) { active = binary_array; size = COQUI_MUT_BIN_ARRAY_SIZE; }
+      else                     { active = text_array;   size = COQUI_MUT_TXT_ARRAY_SIZE; }
+    } else if (afl->input_mode == 2 /* BINARY */) {
+      if (afl->fuzz_mode == 0) { active = mutation_strategy_exploration_binary;
+                                  size   = COQUI_MUT_STRATEGY_ARRAY_SIZE; }
+      else                     { active = mutation_strategy_exploitation_binary;
+                                  size   = COQUI_MUT_STRATEGY_ARRAY_SIZE; }
+    }
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array,      active, 256 * 4));
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array_size, &size, 4));
+    ctx->mut_array_input_mode = afl->input_mode;
+    ctx->mut_array_fuzz_mode  = afl->fuzz_mode;
+    ctx->mut_array_uploaded = 1;
+  }
+
+  /* Always update havoc_stack_pow2 + queue_cycle + run_over10m (cheap scalars). */
+  u32 pow2 = afl->havoc_stack_pow2;
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_havoc_stack_pow2, &pow2, 4));
+  u32 qc = afl->queue_cycle;
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_queue_cycle, &qc, 4));
+  u32 over10m = afl->run_over10m ? 1u : 0u;
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_run_over10m, &over10m, 4));
+
+  /* Opportunistic a_extras re-upload if cnt changed. */
+  if (afl->a_extras_cnt != ctx->a_extras_cnt_uploaded) {
+    /* For v1 we update the count but skip the actual bytes upload. a_extras
+     * slots remain empty so EXTRA_AUTO_* ops fall through retry. This avoids
+     * having to free-and-realloc device buffers every time cmplog finds a
+     * new extra; can be tightened in a follow-up if bench shows it matters. */
+    ctx->a_extras_cnt_uploaded = afl->a_extras_cnt;
+    u32 zero = 0;
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_a_extras_cnt, &zero, 4));
+  }
 }
 
 static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
