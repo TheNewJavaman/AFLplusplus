@@ -2281,7 +2281,6 @@ havoc_stage:
         if (unlikely(afl->stop_soon)) goto abandon_entry;
         coqui_submit_havoc_slot(afl, /*seed_idx=*/0u, COQUI_FLAG_HAVOC);
       }
-      coqui_flush_batch(afl);
       goto coqui_havoc_done;
     }
   }

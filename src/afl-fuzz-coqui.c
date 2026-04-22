@@ -567,6 +567,10 @@ static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
 void coqui_refresh_seed_pool(afl_state_t *afl) {
   coqui_ctx_t *ctx = afl->coqui;
   if (!ctx) return;
+  /* Flush any pending batch under the OLD seed pool before we flip the
+   * pointer symbols. Otherwise pending flag=1 slots (seed_idx=0) would
+   * reference the NEW queue_cur's slot 0 when they finally launch. */
+  coqui_flush_batch(afl);
   CUstream sp = (CUstream)ctx->stream_pool;
   u8 next = 1 - ctx->seed_pool_active;
 
