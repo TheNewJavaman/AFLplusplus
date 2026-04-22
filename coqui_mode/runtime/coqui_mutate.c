@@ -228,8 +228,46 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[off] = (u8)(buf[off] + item);
         break;
       }
-      case MUT_ARITH16_: case MUT_ARITH16BE_:
-      case MUT_ARITH16: case MUT_ARITH16BE:
+      case MUT_ARITH16_: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 1);
+        u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
+        u16 v = (u16)buf[pos] | ((u16)buf[pos + 1] << 8);
+        v = v - item;
+        buf[pos]     = (u8)(v & 0xFF);
+        buf[pos + 1] = (u8)((v >> 8) & 0xFF);
+        break;
+      }
+      case MUT_ARITH16BE_: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 1);
+        u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
+        u16 v = ((u16)buf[pos] << 8) | (u16)buf[pos + 1];
+        v = v - item;
+        buf[pos]     = (u8)((v >> 8) & 0xFF);
+        buf[pos + 1] = (u8)(v & 0xFF);
+        break;
+      }
+      case MUT_ARITH16: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 1);
+        u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
+        u16 v = (u16)buf[pos] | ((u16)buf[pos + 1] << 8);
+        v = v + item;
+        buf[pos]     = (u8)(v & 0xFF);
+        buf[pos + 1] = (u8)((v >> 8) & 0xFF);
+        break;
+      }
+      case MUT_ARITH16BE: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 1);
+        u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
+        u16 v = ((u16)buf[pos] << 8) | (u16)buf[pos + 1];
+        v = v + item;
+        buf[pos]     = (u8)((v >> 8) & 0xFF);
+        buf[pos + 1] = (u8)(v & 0xFF);
+        break;
+      }
       case MUT_ARITH32_: case MUT_ARITH32BE_:
       case MUT_ARITH32: case MUT_ARITH32BE:
       case MUT_RAND8:
