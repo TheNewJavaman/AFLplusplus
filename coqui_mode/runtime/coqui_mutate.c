@@ -268,8 +268,66 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 1] = (u8)(v & 0xFF);
         break;
       }
-      case MUT_ARITH32_: case MUT_ARITH32BE_:
-      case MUT_ARITH32: case MUT_ARITH32BE:
+      case MUT_ARITH32_: {
+        if (len < 4) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 3);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        u32 v = (u32)buf[pos]
+              | ((u32)buf[pos + 1] << 8)
+              | ((u32)buf[pos + 2] << 16)
+              | ((u32)buf[pos + 3] << 24);
+        v = v - item;
+        buf[pos]     = (u8)(v & 0xFF);
+        buf[pos + 1] = (u8)((v >> 8) & 0xFF);
+        buf[pos + 2] = (u8)((v >> 16) & 0xFF);
+        buf[pos + 3] = (u8)((v >> 24) & 0xFF);
+        break;
+      }
+      case MUT_ARITH32BE_: {
+        if (len < 4) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 3);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        u32 v = ((u32)buf[pos] << 24)
+              | ((u32)buf[pos + 1] << 16)
+              | ((u32)buf[pos + 2] << 8)
+              | (u32)buf[pos + 3];
+        v = v - item;
+        buf[pos]     = (u8)((v >> 24) & 0xFF);
+        buf[pos + 1] = (u8)((v >> 16) & 0xFF);
+        buf[pos + 2] = (u8)((v >> 8) & 0xFF);
+        buf[pos + 3] = (u8)(v & 0xFF);
+        break;
+      }
+      case MUT_ARITH32: {
+        if (len < 4) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 3);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        u32 v = (u32)buf[pos]
+              | ((u32)buf[pos + 1] << 8)
+              | ((u32)buf[pos + 2] << 16)
+              | ((u32)buf[pos + 3] << 24);
+        v = v + item;
+        buf[pos]     = (u8)(v & 0xFF);
+        buf[pos + 1] = (u8)((v >> 8) & 0xFF);
+        buf[pos + 2] = (u8)((v >> 16) & 0xFF);
+        buf[pos + 3] = (u8)((v >> 24) & 0xFF);
+        break;
+      }
+      case MUT_ARITH32BE: {
+        if (len < 4) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 3);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        u32 v = ((u32)buf[pos] << 24)
+              | ((u32)buf[pos + 1] << 16)
+              | ((u32)buf[pos + 2] << 8)
+              | (u32)buf[pos + 3];
+        v = v + item;
+        buf[pos]     = (u8)((v >> 24) & 0xFF);
+        buf[pos + 1] = (u8)((v >> 16) & 0xFF);
+        buf[pos + 2] = (u8)((v >> 8) & 0xFF);
+        buf[pos + 3] = (u8)(v & 0xFF);
+        break;
+      }
       case MUT_RAND8:
       case MUT_CLONE_COPY: case MUT_CLONE_FIXED:
       case MUT_OVERWRITE_COPY: case MUT_OVERWRITE_FIXED:
