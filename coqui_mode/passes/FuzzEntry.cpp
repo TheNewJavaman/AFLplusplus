@@ -43,18 +43,21 @@ bool runFuzzEntry(Module &M) {
 
   /* 2. Build the kernel function type and create */
   FunctionType *KernelType = FunctionType::get(
-    voidT, {i8p, i8p, i8p, i8p, i8p}, false);
+    voidT, {i8p, i8p, i8p, i8p, i8p, i8p, i8p}, false);
   Function *Kernel = Function::Create(
     KernelType, GlobalValue::ExternalLinkage,
     "__coqui_fuzz_kernel", &M);
 
   /* Name the args for readability */
   auto argIt = Kernel->arg_begin();
-  Value *inputBytes = &*argIt++; inputBytes->setName("input_bytes");
-  Value *offsetsArg = &*argIt++; offsetsArg->setName("offsets");
-  Value *lensArg    = &*argIt++; lensArg->setName("lens");
-  Value *noveltyArg = &*argIt++; noveltyArg->setName("novelty");
-  Value *statusArg  = &*argIt++; statusArg->setName("status");
+  Value *inputBytes      = &*argIt++; inputBytes->setName("input_bytes");
+  Value *offsetsArg      = &*argIt++; offsetsArg->setName("offsets");
+  Value *lensArg         = &*argIt++; lensArg->setName("lens");
+  Value *slotInfoArg     = &*argIt++; slotInfoArg->setName("slot_info");
+  Value *noveltyArg      = &*argIt++; noveltyArg->setName("novelty");
+  Value *statusArg       = &*argIt++; statusArg->setName("status");
+  Value *reportedSlabArg = &*argIt++; reportedSlabArg->setName("reported_slab");
+  (void)reportedSlabArg;  /* used by compact-report block in Task 2.8 */
 
   /* 3. Declare / look up helpers */
   FunctionType *VoidNoArg = FunctionType::get(voidT, false);
@@ -123,15 +126,56 @@ bool runFuzzEntry(Module &M) {
   /* tid = __coqui_fuzz_tid() */
   Value *tid = Builder.CreateCall(GetTid, {}, "tid");
 
-  /* len = lens[tid]  — GEP into i32 array at index tid */
-  Value *lensPtr = Builder.CreateGEP(i32, lensArg, {tid}, "lens_tid");
-  Value *len     = Builder.CreateLoad(i32, lensPtr, "len");
+  /* slot = slot_info[tid]; flag = slot >> 24; seed_idx = slot & 0xFFFFFF */
+  Value *slotPtr = Builder.CreateGEP(i32, slotInfoArg, {tid}, "slot_tid");
+  Value *slot    = Builder.CreateLoad(i32, slotPtr, "slot");
+  Value *flagV   = Builder.CreateLShr(slot, ConstantInt::get(i32, 24), "flag");
+  Value *idxV    = Builder.CreateAnd(slot, ConstantInt::get(i32, 0xFFFFFF), "seed_idx");
+  (void)idxV;  /* seed_idx consumed by havoc path in Task 2.7 */
 
-  /* if (len == 0) goto exit; else goto run */
-  Value *isEmpty = Builder.CreateICmpEQ(len, ConstantInt::get(i32, 0));
-  Builder.CreateCondBr(isEmpty, ExitBB, RunBB);
+  /* Create flag-dispatch blocks. */
+  BasicBlock *PremutBB        = BasicBlock::Create(C, "premut", Kernel);
+  BasicBlock *HavocBB         = BasicBlock::Create(C, "havoc", Kernel);
+  BasicBlock *DispatchHavocBB = BasicBlock::Create(C, "dispatch_havoc", Kernel);
 
+  /* if flag == 0 -> premut else -> dispatch_havoc */
+  Value *isPremut = Builder.CreateICmpEQ(flagV, ConstantInt::get(i32, 0), "is_premut");
+  Builder.CreateCondBr(isPremut, PremutBB, DispatchHavocBB);
+
+  /* DispatchHavocBB: if flag == 1 -> havoc else -> exit */
+  Builder.SetInsertPoint(DispatchHavocBB);
+  Value *isHavoc = Builder.CreateICmpEQ(flagV, ConstantInt::get(i32, 1), "is_havoc");
+  Builder.CreateCondBr(isHavoc, HavocBB, ExitBB);
+
+  /* PREMUT path — existing flag=0 logic. */
+  Builder.SetInsertPoint(PremutBB);
+  Value *pm_lensPtr = Builder.CreateGEP(i32, lensArg, {tid}, "pm_lens_tid");
+  Value *pm_len     = Builder.CreateLoad(i32, pm_lensPtr, "pm_len");
+  Value *pm_isEmpty = Builder.CreateICmpEQ(pm_len, ConstantInt::get(i32, 0));
+  BasicBlock *PremutContBB = BasicBlock::Create(C, "premut_cont", Kernel);
+  Builder.CreateCondBr(pm_isEmpty, ExitBB, PremutContBB);
+
+  Builder.SetInsertPoint(PremutContBB);
+  Value *pm_offPtr   = Builder.CreateGEP(i32, offsetsArg, {tid}, "pm_offsets_tid");
+  Value *pm_off      = Builder.CreateLoad(i32, pm_offPtr, "pm_off");
+  Value *pm_off64    = Builder.CreateZExt(pm_off, i64, "pm_off64");
+  Value *pm_inputPtr = Builder.CreateGEP(i8, inputBytes, {pm_off64}, "pm_input_ptr");
+  Value *pm_len64    = Builder.CreateZExt(pm_len, i64, "pm_len64");
+  Builder.CreateBr(RunBB);
+
+  /* HAVOC path — empty body for this task. Task 2.7 fills it. For now just
+   * jump to exit so the kernel still runs (flag=1 slots become no-ops). */
+  Builder.SetInsertPoint(HavocBB);
+  Builder.CreateBr(ExitBB);
+
+  /* RunBB: existing body, but with PHIs at the top merging the two paths.
+   * Capacity hint is 2 (premut + havoc) but only 1 incoming today since
+   * HavocBB branches to ExitBB; Task 2.7 will add the havoc incoming. */
   Builder.SetInsertPoint(RunBB);
+  PHINode *inputPtrPhi = Builder.CreatePHI(i8p, 2, "input_ptr");
+  PHINode *lenPhi      = Builder.CreatePHI(i64, 2, "len");
+  inputPtrPhi->addIncoming(pm_inputPtr, PremutContBB);
+  lenPhi->addIncoming(pm_len64, PremutContBB);
 
   /* PHASE_START = 1 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 1)});
@@ -145,20 +189,9 @@ bool runFuzzEntry(Module &M) {
   /* clk_b: after memory_init */
   Value *clkB = Builder.CreateCall(Clock64, {}, "clk_b");
 
-  /* off = offsets[tid]; input_ptr = input_bytes + off */
-  Value *offPtr   = Builder.CreateGEP(i32, offsetsArg, {tid}, "offsets_tid");
-  Value *off      = Builder.CreateLoad(i32, offPtr, "off");
-  /* Byte-stride GEP into the flat byte buffer: input_bytes + off
-     off is i32; widen to i64 for pointer arithmetic */
-  Value *off64    = Builder.CreateZExt(off, i64, "off64");
-  Value *inputPtr = Builder.CreateGEP(i8, inputBytes, {off64}, "input_ptr");
-
-  /* len64 = zext len to i64 */
-  Value *len64 = Builder.CreateZExt(len, i64, "len64");
-
   /* __coqui_fuzz_execute(input_ptr, len64) */
   FunctionType *ExecType = FunctionType::get(i32, {i8p, i64}, false);
-  Builder.CreateCall(ExecType, User, {inputPtr, len64});
+  Builder.CreateCall(ExecType, User, {inputPtrPhi, lenPhi});
 
   /* clk_c: after fuzz_execute (user harness) */
   Value *clkC = Builder.CreateCall(Clock64, {}, "clk_c");
