@@ -170,9 +170,52 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[off] ^= 1u << bit;
         break;
       }
-      case MUT_INTERESTING8:
-      case MUT_INTERESTING16: case MUT_INTERESTING16BE:
-      case MUT_INTERESTING32: case MUT_INTERESTING32BE:
+      case MUT_INTERESTING8: {
+        u32 pos = gpu_rand_below(prng, len);
+        u32 item = gpu_rand_below(prng, INTERESTING_8_CNT);
+        buf[pos] = (u8)interesting_8[item];
+        break;
+      }
+      case MUT_INTERESTING16: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 1);
+        u32 item = gpu_rand_below(prng, INTERESTING_16_CNT);
+        u16 v = (u16)interesting_16[item];
+        buf[pos]     = (u8)(v & 0xFF);
+        buf[pos + 1] = (u8)((v >> 8) & 0xFF);
+        break;
+      }
+      case MUT_INTERESTING16BE: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 1);
+        u32 item = gpu_rand_below(prng, INTERESTING_16_CNT);
+        u16 v = (u16)interesting_16[item];
+        buf[pos]     = (u8)((v >> 8) & 0xFF);
+        buf[pos + 1] = (u8)(v & 0xFF);
+        break;
+      }
+      case MUT_INTERESTING32: {
+        if (len < 4) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 3);
+        u32 item = gpu_rand_below(prng, INTERESTING_32_CNT);
+        u32 v = (u32)interesting_32[item];
+        buf[pos]     = (u8)(v & 0xFF);
+        buf[pos + 1] = (u8)((v >> 8)  & 0xFF);
+        buf[pos + 2] = (u8)((v >> 16) & 0xFF);
+        buf[pos + 3] = (u8)((v >> 24) & 0xFF);
+        break;
+      }
+      case MUT_INTERESTING32BE: {
+        if (len < 4) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len - 3);
+        u32 item = gpu_rand_below(prng, INTERESTING_32_CNT);
+        u32 v = (u32)interesting_32[item];
+        buf[pos]     = (u8)((v >> 24) & 0xFF);
+        buf[pos + 1] = (u8)((v >> 16) & 0xFF);
+        buf[pos + 2] = (u8)((v >> 8)  & 0xFF);
+        buf[pos + 3] = (u8)(v & 0xFF);
+        break;
+      }
       case MUT_ARITH8_: case MUT_ARITH8:
       case MUT_ARITH16_: case MUT_ARITH16BE_:
       case MUT_ARITH16: case MUT_ARITH16BE:
