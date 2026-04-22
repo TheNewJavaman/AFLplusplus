@@ -22,6 +22,13 @@ struct afl_state;  /* forward */
 #define COQUI_DEFAULT_BATCH_SIZE 8192
 #define COQUI_MAX_INPUT_DEFAULT  4096
 
+/* Slot-info flags (shared with coqui_mode/runtime/coqui_runtime.h). */
+#define COQUI_FLAG_PREMUT   0u
+#define COQUI_FLAG_HAVOC    1u
+
+/* Compact-report buffer cap (shared with runtime). */
+#define COQUI_REPORTED_CAP  512u
+
 /* ------------------------------------------------------------------------
  * Data types
  * ------------------------------------------------------------------------*/
@@ -61,6 +68,23 @@ typedef struct coqui_batch {
   unsigned long long d_input_lens;
   unsigned long long d_novelty;
   unsigned long long d_status;
+
+  /* Slot-info: per-thread (flag << 24) | (seed_idx & 0xFFFFFF).
+   * u32 per thread, set by the host before each launch. */
+  u32            *h_slot_info;
+  unsigned long long d_slot_info;
+
+  /* Compact-report: threads setting novelty or crash atomically pack their
+   * mutated bytes into reported_slab[slot * max_input_size]. Host reads back
+   * only the populated prefix. See spec §3.3. */
+  u8             *h_reported_slab;   /* COQUI_REPORTED_CAP * max_input_size bytes */
+  u32            *h_reported_tid;    /* COQUI_REPORTED_CAP u32 */
+  u32            *h_reported_lens;   /* COQUI_REPORTED_CAP u32 */
+  u32             h_reported_count;
+  unsigned long long d_reported_slab;
+  unsigned long long d_reported_tid;
+  unsigned long long d_reported_lens;
+  unsigned long long d_reported_count;
 
   /* Stream + completion event (CUstream / CUevent) */
   void *stream;
@@ -142,6 +166,74 @@ typedef struct coqui_ctx {
   unsigned int real_stack_size;
   unsigned long long batch_timeout_us;
 
+  /* Third CUDA stream: seed pool uploads, fenced against stream_a/b via events. */
+  void *stream_pool;
+
+  /* Seed pool (ping-pong). Host pinned mirrors + device backing stores.
+   * Pointer symbols in the cubin alias to whichever side is live. */
+  u8   *h_seed_pool_bytes_a;     /* packed seed bytes */
+  u8   *h_seed_pool_bytes_b;
+  u32  *h_seed_pool_offsets_a;   /* u32[256] */
+  u32  *h_seed_pool_offsets_b;
+  u32  *h_seed_pool_lens_a;
+  u32  *h_seed_pool_lens_b;
+  u32  *h_seed_pool_cumw_a;      /* prefix-sum weights (unused post-1.8 but kept) */
+  u32  *h_seed_pool_cumw_b;
+  u32   h_seed_pool_count_next;
+  u32   h_seed_pool_cumw_total_next;
+
+  unsigned long long d_seed_pool_bytes_a;
+  unsigned long long d_seed_pool_bytes_b;
+  unsigned long long d_seed_pool_offsets_a;
+  unsigned long long d_seed_pool_offsets_b;
+  unsigned long long d_seed_pool_lens_a;
+  unsigned long long d_seed_pool_lens_b;
+  unsigned long long d_seed_pool_cumw_a;
+  unsigned long long d_seed_pool_cumw_b;
+
+  u8    seed_pool_active;   /* 0 = a live, 1 = b live */
+  u32   seed_pool_cap_bytes;  /* per-side byte capacity (=1MB default) */
+
+  /* Module-level pointer/scalar symbols we rebind via cuMemcpyHtoD. */
+  unsigned long long sym_seed_pool_base;
+  unsigned long long sym_seed_pool_offsets;
+  unsigned long long sym_seed_pool_lens;
+  unsigned long long sym_seed_pool_cumw;
+  unsigned long long sym_seed_pool_count;
+  unsigned long long sym_seed_pool_cumw_total;
+  unsigned long long sym_prng_base;
+  unsigned long long sym_reported_count;
+  unsigned long long sym_reported_tid;
+  unsigned long long sym_reported_lens;
+  unsigned long long sym_mutation_array;
+  unsigned long long sym_mutation_array_size;
+  unsigned long long sym_havoc_stack_pow2;
+  unsigned long long sym_queue_cycle;
+  unsigned long long sym_run_over10m;
+
+  /* Extras state. */
+  u32 extras_cnt_uploaded;
+  u32 a_extras_cnt_uploaded;
+  unsigned long long d_extras_base;
+  unsigned long long d_extras_offsets;
+  unsigned long long d_extras_lens;
+  unsigned long long sym_extras_base;
+  unsigned long long sym_extras_offsets;
+  unsigned long long sym_extras_lens;
+  unsigned long long sym_extras_cnt;
+  unsigned long long d_a_extras_base;
+  unsigned long long d_a_extras_offsets;
+  unsigned long long d_a_extras_lens;
+  unsigned long long sym_a_extras_base;
+  unsigned long long sym_a_extras_offsets;
+  unsigned long long sym_a_extras_lens;
+  unsigned long long sym_a_extras_cnt;
+
+  /* Last-seen mutation-array selector (so we only re-upload when changed). */
+  u8 mut_array_input_mode;
+  u8 mut_array_fuzz_mode;
+  u8 mut_array_uploaded;   /* 0 until first upload */
+
   /* Adaptive batch-timeout (sub-proposal B1).
    *
    * Healthy batch wall-clock latency ring buffer. A "healthy" batch is one
@@ -211,5 +303,15 @@ u8 coqui_calibrate_one(struct afl_state *afl, u8 *buf, u32 len);
 /* Free resources and tear down CUDA context on normal exit or SIGINT.
    Stub: free()s host buffers; no CUDA calls. */
 void coqui_shutdown(struct afl_state *afl);
+
+/* Refresh the GPU-resident seed pool for a new queue_cur havoc entry.
+ * Slot 0 = queue_cur; slots 1..N-1 = weighted sample of other queue entries.
+ * Uploaded on stream_pool and fenced against stream_a/b via a CUevent. */
+void coqui_refresh_seed_pool(struct afl_state *afl);
+
+/* Append one havoc slot to the pending batch — (flag<<24) | (seed_idx).
+ * Same ping-pong flip + launch semantics as coqui_submit_input.
+ * Returns 0 unconditionally. */
+u8 coqui_submit_havoc_slot(struct afl_state *afl, u32 seed_idx, u8 flag);
 
 #endif /* _HAVE_AFL_FUZZ_COQUI_H */
