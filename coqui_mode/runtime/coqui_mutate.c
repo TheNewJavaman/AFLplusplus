@@ -13,6 +13,43 @@
 #include "coqui_runtime.h"
 #include "coqui_mutate.h"
 
+/* -- Definitions for the extern symbols declared in coqui_runtime.h.
+ * These variables live in the cubin's module globals and are bound by
+ * the host via cuModuleGetGlobal + cuMemcpyHtoD. All start at null/zero. */
+
+u8  *__coqui_seed_pool_base     = 0;
+u32 *__coqui_seed_pool_offsets  = 0;
+u32 *__coqui_seed_pool_lens     = 0;
+u32 *__coqui_seed_pool_cumw     = 0;
+u32  __coqui_seed_pool_count      = 0;
+u32  __coqui_seed_pool_cumw_total = 0;
+
+u8  *__coqui_extras_base        = 0;
+u32 *__coqui_extras_offsets     = 0;
+u32 *__coqui_extras_lens        = 0;
+u32  __coqui_extras_cnt           = 0;
+
+u8  *__coqui_a_extras_base      = 0;
+u32 *__coqui_a_extras_offsets   = 0;
+u32 *__coqui_a_extras_lens      = 0;
+u32  __coqui_a_extras_cnt         = 0;
+
+u64  __coqui_prng_base            = 0;
+
+u32  __coqui_reported_count       = 0;
+u32 *__coqui_reported_tid       = 0;
+u32 *__coqui_reported_lens      = 0;
+
+/* The three __constant__-memory globals need to be defined with the
+ * address_space(4) attribute to match the extern declaration. */
+__attribute__((address_space(4))) u32 __coqui_mutation_array[256] = {0};
+__attribute__((address_space(4))) u32 __coqui_mutation_array_size = 0;
+__attribute__((address_space(4))) u32 __coqui_havoc_stack_pow2    = 0;
+
+/* queue_cycle / run_over10m added by choose_block_len fidelity fix. */
+u32  __coqui_queue_cycle          = 0;
+u32  __coqui_run_over10m          = 0;
+
 #ifndef MAX_INPUT_SIZE
   #error "MAX_INPUT_SIZE must be defined by the build (-DMAX_INPUT_SIZE=N)"
 #endif
