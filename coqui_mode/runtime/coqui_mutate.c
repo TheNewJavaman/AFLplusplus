@@ -358,7 +358,29 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[off] = (u8)(buf[off] - (u8)item);
         break;
       }
-      case MUT_CLONE_COPY: case MUT_CLONE_FIXED:
+      case MUT_CLONE_COPY: {
+        if (len + HAVOC_BLK_XL >= max_len) goto retry_havoc_step;
+        u32 clone_len = choose_block_len(prng, HAVOC_BLK_XL);
+        u32 clone_from = gpu_rand_below(prng, len);
+        u32 clone_to   = gpu_rand_below(prng, len + 1);
+        if (clone_from + clone_len > len) clone_len = len - clone_from;
+        if (len + clone_len >= max_len) goto retry_havoc_step;
+        for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
+        for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = buf[clone_from + i];
+        len += clone_len;
+        break;
+      }
+      case MUT_CLONE_FIXED: {
+        if (len + HAVOC_BLK_XL >= max_len) goto retry_havoc_step;
+        u32 clone_len = choose_block_len(prng, HAVOC_BLK_XL);
+        u32 clone_to  = gpu_rand_below(prng, len + 1);
+        if (len + clone_len >= max_len) goto retry_havoc_step;
+        u8 fill = (u8)gpu_rand_below(prng, 256);
+        for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
+        for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = fill;
+        len += clone_len;
+        break;
+      }
       case MUT_OVERWRITE_COPY: case MUT_OVERWRITE_FIXED:
       case MUT_DEL: case MUT_SHUFFLE:
       case MUT_DELONE: case MUT_INSERTONE:
