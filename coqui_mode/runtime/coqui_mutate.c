@@ -151,7 +151,6 @@ static inline u32 choose_block_len(u64 *prng, u32 limit) {
 
 u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
                           u32 self_idx, u64 *prng) {
-  (void)buf; (void)max_len; (void)self_idx;   /* suppress "unused" until ops land */
   if (len == 0 || max_len == 0) return len;
 
   u32 stack_max = 1u << (1 + gpu_rand_below(prng, __coqui_havoc_stack_pow2));
@@ -420,8 +419,28 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         len -= 1;
         break;
       }
-      case MUT_SHUFFLE: case MUT_INSERTONE:
-        goto retry_havoc_step;  /* placeholder; fill in task 1.6 */
+      case MUT_SHUFFLE: {
+        if (len < 4) goto retry_havoc_step;
+        u32 shuf_len = choose_block_len(prng, len - 1);
+        if (shuf_len < 2) goto retry_havoc_step;
+        u32 shuf_from = gpu_rand_below(prng, len - shuf_len + 1);
+        for (u32 i = shuf_len - 1; i > 0; --i) {
+          u32 j = gpu_rand_below(prng, i + 1);
+          u8 t = buf[shuf_from + i];
+          buf[shuf_from + i] = buf[shuf_from + j];
+          buf[shuf_from + j] = t;
+        }
+        break;
+      }
+      case MUT_INSERTONE: {
+        if (len + 1 >= max_len) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len + 1);
+        u8 byte = (u8)gpu_rand_below(prng, 256);
+        for (u32 i = len; i > pos; --i) buf[i] = buf[i - 1];
+        buf[pos] = byte;
+        len += 1;
+        break;
+      }
 
       /* Bucket 2 ops — filled in by task 1.7 */
       case MUT_ASCIINUM:
