@@ -263,6 +263,16 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->total_submits    = 0;
   ctx->crash_dedup_hits = 0;
   ctx->crash_verify_calls = 0;
+
+  /* Persistent cross-batch crash-sig dedup set (1M slots = ~5 MB host RAM).
+   * Saturates after ~500 s at the observed 2k-new-sigs/s rate for cjson; for
+   * longer runs the fall-through-to-verify behavior keeps correctness intact
+   * at the cost of losing dedup benefit as the table fills. */
+  ctx->crash_sig_seen_cap   = 1u << 20;   /* 1,048,576 */
+  ctx->crash_sig_seen_count = 0;
+  ctx->crash_sig_persistent_hits = 0;
+  ctx->crash_sig_seen       = ck_alloc(ctx->crash_sig_seen_cap * sizeof(u32));
+  ctx->crash_sig_seen_used  = ck_alloc(ctx->crash_sig_seen_cap);
   ctx->rate_log_init    = 0;
   ctx->rate_log_last_launches = 0;
   ctx->rate_log_last_submits  = 0;
@@ -396,14 +406,25 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
 
-  /* Submit-phase timing: wrap the HtoD/memset/launch/DtoH/event-record API
-   * calls so the [coqui-rate] print can split driver-submission cost from
-   * actual GPU wait (measured separately in coqui_await_and_process). */
-  struct timeval _tv_submit_t0;
-  gettimeofday(&_tv_submit_t0, NULL);
-  unsigned long long _submit_t0_us =
-      ((unsigned long long)_tv_submit_t0.tv_sec * 1000000ULL) +
-      _tv_submit_t0.tv_usec;
+  /* Finer-grained submit-phase timing: split the single "submit" wall
+   * into HtoD/launch/DtoH buckets so the [coqui-rate] print can show
+   * which driver call is the bottleneck. Overall t_submit_us is still
+   * measured (end-of-block - start) for back-compat.
+   *
+   * The gettimeofday wrappers add ~1 us each (3 gettimeofdays per batch
+   * on top of the original 2); negligible vs batch cycle. */
+  struct timeval _tv;
+#define STAMP_US(var) do {                                                  \
+    gettimeofday(&_tv, NULL);                                               \
+    (var) = ((unsigned long long)_tv.tv_sec * 1000000ULL) + _tv.tv_usec;    \
+  } while (0)
+
+  unsigned long long _submit_t0_us;
+  STAMP_US(_submit_t0_us);
+
+  /* HtoD block */
+  unsigned long long _htod_t0;
+  STAMP_US(_htod_t0);
 
   /* H->D — only copy the live prefix of input_bytes. Kernel reads only
    * input_bytes[offsets[tid]..+lens[tid]] and empty-slot threads
@@ -425,7 +446,13 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
 
+  unsigned long long _htod_t1;
+  STAMP_US(_htod_t1);
+  ctx->t_htod_us += (_htod_t1 - _htod_t0);
+
   /* Launch */
+  unsigned long long _launch_t0;
+  STAMP_US(_launch_t0);
   void *args[] = {
     (void *)&b->d_input_bytes,
     (void *)&b->d_offsets,
@@ -438,8 +465,13 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                           grid, 1, 1,    /* grid */
                           128, 1, 1,     /* block */
                           0, s, args, NULL));
+  unsigned long long _launch_t1;
+  STAMP_US(_launch_t1);
+  ctx->t_launch_us += (_launch_t1 - _launch_t0);
 
   /* D->H */
+  unsigned long long _dtoh_t0;
+  STAMP_US(_dtoh_t0);
   CUCHECK(cuMemcpyDtoHAsync(b->h_novelty, (CUdeviceptr)b->d_novelty,
                              ctx->batch_size / 8, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
@@ -447,17 +479,18 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
 
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
+  unsigned long long _dtoh_t1;
+  STAMP_US(_dtoh_t1);
+  ctx->t_dtoh_us += (_dtoh_t1 - _dtoh_t0);
 
   /* Close out submit-phase timer now that all driver calls for this batch
    * have returned. */
   {
-    struct timeval _tv_submit_t1;
-    gettimeofday(&_tv_submit_t1, NULL);
-    unsigned long long _submit_t1_us =
-        ((unsigned long long)_tv_submit_t1.tv_sec * 1000000ULL) +
-        _tv_submit_t1.tv_usec;
+    unsigned long long _submit_t1_us;
+    STAMP_US(_submit_t1_us);
     ctx->t_submit_us += (_submit_t1_us - _submit_t0_us);
   }
+#undef STAMP_US
 
   /* Adaptive batch-timeout (B1): stamp launch time ON THE BATCH so
    * coqui_await_and_process can compute healthy-batch latency. Per-batch
@@ -502,10 +535,24 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
          * the gap to 1/batch-rate is AFL's outer stage overhead. */
         double avg_submit_us_batch = dl > 0
             ? (double)ctx->t_submit_us / (double)dl : 0.0;
+        double avg_htod_us_batch = dl > 0
+            ? (double)ctx->t_htod_us / (double)dl : 0.0;
+        double avg_launch_us_batch = dl > 0
+            ? (double)ctx->t_launch_us / (double)dl : 0.0;
+        double avg_dtoh_us_batch = dl > 0
+            ? (double)ctx->t_dtoh_us / (double)dl : 0.0;
         double avg_await_us_batch  = dl > 0
             ? (double)ctx->t_await_us  / (double)dl : 0.0;
         double avg_verify_us_batch = dl > 0
             ? (double)ctx->t_verify_us / (double)dl : 0.0;
+        /* Wall clock per batch from the batch-rate itself; residual is
+         * "mutation + AFL overhead" (not inside any measured phase). */
+        double wall_per_batch_us = dl > 0
+            ? (double)elapsed_us / (double)dl : 0.0;
+        double avg_mut_other_us_batch =
+            wall_per_batch_us -
+            (avg_submit_us_batch + avg_await_us_batch + avg_verify_us_batch);
+        if (avg_mut_other_us_batch < 0) avg_mut_other_us_batch = 0;
 
         /* GPU-side kernel phase timing: synchronous DtoH of the 5-u64
          * cumulative cycle counter; subtract prior reading to get cycles
@@ -527,12 +574,17 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
           }
         }
 
+        double avg_persist_per_batch = ctx->launch_count > 0
+            ? (double)ctx->crash_sig_persistent_hits
+                / (double)ctx->launch_count : 0.0;
         fprintf(stderr,
                 "[coqui-rate] %.1f batches/s, %llu submits/s "
                 "(avg %.0f inputs/batch, %llu slow-skipped, "
                 "crash_dedup_hits=%llu avg=%.1f/batch, "
                 "crash_verify_calls=%llu avg=%.1f/batch, "
-                "submit=%.0fus await=%.0fus verify=%.0fus /batch, "
+                "persist_dedup=%llu avg=%.1f/batch cap=%u/%u, "
+                "host_us/batch: wall=%.0f mut_other=%.0f submit=%.0f "
+                "[htod=%.0f launch=%.0f dtoh=%.0f] await=%.0f verify=%.0f, "
                 "kern: init=%.0f%% exec=%.0f%% classify=%.0f%% virgin=%.0f%%)\n",
                 (double)dl * 1e6 / (double)elapsed_us,
                 (unsigned long long)(ds * 1000000ULL / elapsed_us),
@@ -542,7 +594,16 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                 avg_dedup_per_batch,
                 (unsigned long long)ctx->crash_verify_calls,
                 avg_verify_per_batch,
+                (unsigned long long)ctx->crash_sig_persistent_hits,
+                avg_persist_per_batch,
+                ctx->crash_sig_seen_count,
+                ctx->crash_sig_seen_cap,
+                wall_per_batch_us,
+                avg_mut_other_us_batch,
                 avg_submit_us_batch,
+                avg_htod_us_batch,
+                avg_launch_us_batch,
+                avg_dtoh_us_batch,
                 avg_await_us_batch,
                 avg_verify_us_batch,
                 pct[0], pct[1], pct[2], pct[3]);
@@ -554,6 +615,9 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
       /* Reset per-window timing accumulators; next print shows the next
        * window's phase averages. */
       ctx->t_submit_us = 0;
+      ctx->t_htod_us = 0;
+      ctx->t_launch_us = 0;
+      ctx->t_dtoh_us = 0;
       ctx->t_await_us  = 0;
       ctx->t_verify_us = 0;
     }
@@ -737,6 +801,35 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       continue;
     }
 
+    /* Survived intra-batch dedup — now check the persistent cross-batch set.
+     * Open-addressing linear probe on a power-of-2-sized table. `used[]`
+     * tracks occupancy so sig==0 is a valid key. On full table (no empty
+     * slot after probing the whole capacity), return "not seen" so we still
+     * verify — a safe fallback that degrades gracefully from fully-dedup'd
+     * to fully-verified as the set saturates. */
+    u32 pcap   = ctx->crash_sig_seen_cap;
+    u32 pmask  = pcap - 1u;
+    u32 pstart = sig & pmask;
+    int p_seen = 0;
+    int p_inserted = 0;
+    for (u32 probe = 0; probe < pcap; probe++) {
+      u32 pslot = (pstart + probe) & pmask;
+      if (!ctx->crash_sig_seen_used[pslot]) {
+        ctx->crash_sig_seen[pslot]      = sig;
+        ctx->crash_sig_seen_used[pslot] = 1;
+        ctx->crash_sig_seen_count++;
+        p_inserted = 1;
+        break;
+      }
+      if (ctx->crash_sig_seen[pslot] == sig) { p_seen = 1; break; }
+    }
+    (void)p_inserted;  /* telemetry-only hook point */
+
+    if (p_seen) {
+      ctx->crash_sig_persistent_hits++;
+      continue;
+    }
+
     ctx->crash_verify_calls++;
     u8 *input = b->h_input_bytes + b->h_offsets[i];
     u32 len = b->h_input_lens[i];
@@ -849,6 +942,18 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (!afl->coqui) return;
   coqui_ctx_t *ctx = afl->coqui;
 
+  /* Preserve persistent crash-sig dedup across CUDA context reset. The set
+   * is pure host-side RAM with no CUDA bindings; rebuilding it from scratch
+   * after every force-reset would blow away many minutes of dedup learning
+   * (this is a recovery path triggered by pathological GPU kernels, which is
+   * exactly the moment we most need dedup to suppress repeat crash verifies).
+   * Pointers are captured here and swapped back in after coqui_init re-allocs. */
+  u32 *saved_seen      = ctx->crash_sig_seen;
+  u8  *saved_used      = ctx->crash_sig_seen_used;
+  u32  saved_cap       = ctx->crash_sig_seen_cap;
+  u32  saved_count     = ctx->crash_sig_seen_count;
+  u64  saved_persist   = ctx->crash_sig_persistent_hits;
+
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
 
   /* Host pinned buffers are independent of context lifecycle. */
@@ -867,6 +972,17 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   afl->coqui = NULL;
 
   coqui_init(afl, cubin_path);
+
+  /* Swap the freshly-allocated (and zero-initialized) sig set for the one
+   * carried across the reset.  Free the fresh one to avoid leaking 5 MB. */
+  ctx = afl->coqui;
+  if (ctx->crash_sig_seen)      ck_free(ctx->crash_sig_seen);
+  if (ctx->crash_sig_seen_used) ck_free(ctx->crash_sig_seen_used);
+  ctx->crash_sig_seen            = saved_seen;
+  ctx->crash_sig_seen_used       = saved_used;
+  ctx->crash_sig_seen_cap        = saved_cap;
+  ctx->crash_sig_seen_count      = saved_count;
+  ctx->crash_sig_persistent_hits = saved_persist;
 }
 
 static void free_batch_half_cuda(coqui_batch_t *b) {
@@ -910,6 +1026,9 @@ void coqui_shutdown(afl_state_t *afl) {
   if (ctx->stream_b) cuStreamDestroy((CUstream)ctx->stream_b);
   if (ctx->cu_module) cuModuleUnload((CUmodule)ctx->cu_module);
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
+
+  if (ctx->crash_sig_seen)      ck_free(ctx->crash_sig_seen);
+  if (ctx->crash_sig_seen_used) ck_free(ctx->crash_sig_seen_used);
 
   ck_free(ctx);
   afl->coqui = NULL;

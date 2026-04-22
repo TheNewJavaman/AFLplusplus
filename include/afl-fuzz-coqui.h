@@ -96,6 +96,26 @@ typedef struct coqui_ctx {
   u64 crash_dedup_hits;/* crash-verify calls skipped because signature already seen in batch */
   u64 crash_verify_calls; /* crash-verify calls actually issued (for ratio sanity) */
 
+  /* Persistent cross-batch crash-sig dedup set. Layered above the intra-batch
+   * 256-slot dedup: for each crashed non-novel slot that SURVIVES intra-batch
+   * dedup, probe this set; if seen, skip (persistent_dedup_hits++); if new,
+   * insert and verify via CPU forkserver.
+   *
+   * Rationale: intra-batch dedup catches ~85% of crashes (most recur within
+   * one batch). The remaining 15% (~195 unique sigs/batch for cjson) often
+   * recur across batches from the same parser failure site — those are the
+   * target of this persistent layer.
+   *
+   * Open-addressing linear probe. u8 used[] tracks slot occupancy so sig==0
+   * is a valid key. Table full → insertion fails, but probe returns "not
+   * seen" so we still verify (safe/conservative fallback vs. silently
+   * dropping potential new crashes). Size: 1M slots × (4B+1B) = 5 MB. */
+  u32 *crash_sig_seen;            /* hash-set of sigs, length = crash_sig_seen_cap */
+  u8  *crash_sig_seen_used;       /* 1 = slot occupied, 0 = empty */
+  u32  crash_sig_seen_cap;        /* capacity (power of 2) */
+  u32  crash_sig_seen_count;      /* slots in use (observability) */
+  u64  crash_sig_persistent_hits; /* cross-batch dedup hits (telemetry) */
+
   /* Host-side per-phase timing accumulators (reset at each [coqui-rate]
    * print).  Each batch contributes one sample; dividing by dl
    * (batches-in-window) gives avg us/batch for that phase.
@@ -111,6 +131,17 @@ typedef struct coqui_ctx {
   u64 t_submit_us;
   u64 t_await_us;
   u64 t_verify_us;
+
+  /* Finer-grained submit-phase breakdown (subsets of t_submit_us). Each
+   * measures the wall-clock wrap around the corresponding CUDA driver
+   * calls: HtoD memcpy+memset issues, kernel launch, DtoH memcpy issues.
+   * Residual (t_submit_us - htod - launch - dtoh) is small-change glue. */
+  u64 t_htod_us;
+  u64 t_launch_us;
+  u64 t_dtoh_us;
+
+  /* CPU mutation time per batch is computed as a RESIDUAL in the
+   * [coqui-rate] print: (wall_per_batch - submit - await - verify). */
 
   /* CPU-side speed gate (ported from coqui driver 9d85772). Blocks corpus
    * admission of inputs that verify >10× slower than baseline, preventing
