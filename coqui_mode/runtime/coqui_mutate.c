@@ -532,10 +532,150 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         break;
       }
 
-      /* Bucket 2 ops — filled in by task 1.7 */
-      case MUT_ASCIINUM:
-      case MUT_INSERTASCIINUM:
-        goto retry_havoc_step;  /* placeholder; fill in task 1.7 */
+      /* ---------- Bucket 2: port of src/afl-fuzz-one.c:3044-3229 ---------- */
+
+      case MUT_ASCIINUM: {
+        /* Find an ASCII decimal run in buf[], parse it, apply one of 8
+         * strategies, write back (may grow or shrink).
+         * AFL line 3044. "no retry" guard on len < 4. */
+        if (len < 4) break;
+
+        u32 off = gpu_rand_below(prng, len);
+        u32 off2 = off, cnt = 0;
+        /* Scan forward from off for first ASCII digit. */
+        while (off2 + cnt < len &&
+               !(buf[off2 + cnt] >= '0' && buf[off2 + cnt] <= '9')) {
+          ++cnt;
+        }
+        /* No digit found to the right — wrap: search [0, off) from the start. */
+        if (off2 + cnt == len) {
+          off2 = 0;
+          cnt = 0;
+          while (cnt < off &&
+                 !(buf[off2 + cnt] >= '0' && buf[off2 + cnt] <= '9')) {
+            ++cnt;
+          }
+          if (cnt == off) {
+            /* No digit anywhere in the input. */
+            if (len < 8) break;
+            goto retry_havoc_step;
+          }
+        }
+        off = off2 + cnt;          /* position of first digit */
+        off2 = off + 1;
+        while (off2 < len && buf[off2] >= '0' && buf[off2] <= '9') {
+          ++off2;
+        }
+        /* buf[off..off2) is the digit run. Parse it as s64. */
+        s64 val = (s64)(buf[off] - '0');
+        for (u32 i = off + 1; i < off2; ++i) {
+          val = (val * 10) + (s64)(buf[i] - '0');
+        }
+        /* Negative sign? AFL checks out_buf[off - 1] == '-'. */
+        if (off > 0 && buf[off - 1] == '-') val = -val;
+
+        /* Apply one of 8 strategies. */
+        u32 strat = gpu_rand_below(prng, 8);
+        switch (strat) {
+          case 0: val++; break;
+          case 1: val--; break;
+          case 2: val *= 2; break;
+          case 3: val /= 2; break;
+          case 4:
+            /* AFL: if (val && (u64)val < 0x19999999) val = rand_next % (val*10);
+             *      else val = rand_below(256); */
+            if (val != 0 && (u64)val < 0x19999999ULL) {
+              u64 r = splitmix64(prng);
+              val = (s64)(r % ((u64)val * 10ULL));
+            } else {
+              val = (s64)gpu_rand_below(prng, 256);
+            }
+            break;
+          case 5: val += (s64)gpu_rand_below(prng, 256); break;
+          case 6: val -= (s64)gpu_rand_below(prng, 256); break;
+          case 7: val = ~val; break;
+        }
+
+        /* Convert val to decimal string (signed, up to 20 chars + sign). */
+        u8 tmp[21];
+        u32 new_len = 0;
+        {
+          u64 absval;
+          int is_neg = 0;
+          if (val < 0) { is_neg = 1; absval = (u64)(-val); }
+          else          { absval = (u64)val; }
+          u8 rev[20];
+          u32 nrev = 0;
+          if (absval == 0) { rev[nrev++] = '0'; }
+          else {
+            while (absval > 0 && nrev < 20) {
+              rev[nrev++] = (u8)('0' + (absval % 10ULL));
+              absval /= 10ULL;
+            }
+          }
+          if (is_neg) tmp[new_len++] = '-';
+          for (u32 i = 0; i < nrev; ++i) tmp[new_len++] = rev[nrev - 1 - i];
+        }
+
+        /* Replace buf[off..off2) with tmp[0..new_len). */
+        u32 old_len = off2 - off;
+        if (old_len == new_len) {
+          for (u32 i = 0; i < new_len; ++i) buf[off + i] = tmp[i];
+        } else if (new_len < old_len) {
+          u32 shrink = old_len - new_len;
+          for (u32 i = 0; i < new_len; ++i) buf[off + i] = tmp[i];
+          /* Shift tail left to close the gap. */
+          for (u32 i = off + new_len; i + shrink < len; ++i) {
+            buf[i] = buf[i + shrink];
+          }
+          len -= shrink;
+        } else {
+          u32 grow = new_len - old_len;
+          /* GPU-specific: we can't realloc, only grow if room. AFL would
+           * succeed here via afl_realloc; we break on overflow. */
+          if (len + grow > max_len) break;
+          /* Shift tail right to make room. Iterate from buf[len-1] down
+           * through buf[off2] so we don't overwrite unread tail bytes. */
+          for (u32 i = len; i > off2; --i) buf[i - 1 + grow] = buf[i - 1];
+          for (u32 i = 0; i < new_len; ++i) buf[off + i] = tmp[i];
+          len += grow;
+        }
+        break;
+      }
+
+      case MUT_INSERTASCIINUM: {
+        /* AFL line 3199. Despite the name, this OVERWRITES len bytes at a
+         * random position with ASCII digits of a random u64 (plus possibly
+         * uninitialized bytes when the number's decimal repr is shorter than
+         * the requested write length). We zero-pad to make the "tail" bytes
+         * deterministic. */
+        u32 ilen = 1 + gpu_rand_below(prng, 8);        /* 1..8 */
+        u32 pos  = gpu_rand_below(prng, len);
+        if (len < pos + ilen) {
+          /* Not enough room to overwrite at this position. */
+          if (len < 8) break;
+          goto retry_havoc_step;
+        }
+        u64 val = splitmix64(prng);                    /* random u64 */
+        /* Stringify val (unsigned) up to 20 digits. */
+        u8 tmpbuf[20];
+        u32 n = 0;
+        if (val == 0) { tmpbuf[n++] = '0'; }
+        else {
+          u8 rev[20];
+          u32 nrev = 0;
+          while (val > 0 && nrev < 20) {
+            rev[nrev++] = (u8)('0' + (val % 10ULL));
+            val /= 10ULL;
+          }
+          for (u32 i = 0; i < nrev; ++i) tmpbuf[n++] = rev[nrev - 1 - i];
+        }
+        /* Overwrite ilen bytes at pos with tmpbuf (zero-pad beyond n). */
+        for (u32 i = 0; i < ilen; ++i) {
+          buf[pos + i] = (i < n) ? tmpbuf[i] : (u8)0;
+        }
+        break;
+      }
 
       /* Bucket 3 ops — filled in by task 1.8 */
       case MUT_EXTRA_OVERWRITE: case MUT_EXTRA_INSERT:
