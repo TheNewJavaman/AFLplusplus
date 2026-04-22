@@ -166,6 +166,12 @@ extern __attribute__((address_space(4))) u32 __coqui_havoc_stack_pow2;
 /* Per-batch randomness base. Thread-local PRNG is splitmix64(base ^ tid). */
 extern u64 __coqui_prng_base;
 
+/* AFL state fields mirrored to device for fidelity of choose_block_len.
+ * queue_cycle: afl->queue_cycle (u32). run_over10m: afl->run_over10m (u8-as-u32).
+ * Re-uploaded by host in coqui_refresh_seed_pool (cheap; both are 4B). */
+extern u32 __coqui_queue_cycle;
+extern u32 __coqui_run_over10m;
+
 /* Compact-report counter (atomically bumped by kernel novelty/crash path). */
 extern u32 __coqui_reported_count;
 extern u32 *__coqui_reported_tid;    /* length COQUI_REPORTED_CAP */
@@ -230,7 +236,7 @@ static const signed short interesting_16[] = {
 static const signed int   interesting_32[] = {
     -128, -1, 0, 1, 16, 32, 64, 100, 127,
     -32768, -129, 128, 255, 256, 512, 1000, 1024, 4096, 32767,
-    -2147483648, -100663046, -32769, 32768, 65535, 65536, 100663045, 2147483647
+    -2147483648, -100663046, -32769, 32768, 65535, 65536, 100663045, 2139095040, 2147483647
 };
 
 #define INTERESTING_8_CNT  (sizeof(interesting_8)  / sizeof(interesting_8[0]))
@@ -395,7 +401,13 @@ enum {
 
 static inline u32 choose_block_len(u64 *prng, u32 limit) {
   u32 min_value, max_value;
-  u32 r = gpu_rand_below(prng, 3);
+  /* Port of include/afl-mutations.h:1760-1793.
+   * rlim = MIN(queue_cycle, 3); if (!run_over10m) rlim = 1 — early in the
+   * run we only pick the small-block tier, same as AFL. */
+  u32 rlim = __coqui_queue_cycle < 3u ? __coqui_queue_cycle : 3u;
+  if (!__coqui_run_over10m) rlim = 1;
+  if (rlim == 0) rlim = 1;  /* defensive against queue_cycle=0 early boot */
+  u32 r = gpu_rand_below(prng, rlim);
   if (r == 0) { min_value = 1;            max_value = HAVOC_BLK_SMALL;   }
   else if (r == 1) { min_value = HAVOC_BLK_SMALL; max_value = HAVOC_BLK_MEDIUM; }
   else {
@@ -1171,6 +1183,8 @@ Insert new fields inside `coqui_ctx_t` just before the adaptive-timeout block (a
   unsigned long long sym_mutation_array;
   unsigned long long sym_mutation_array_size;
   unsigned long long sym_havoc_stack_pow2;
+  unsigned long long sym_queue_cycle;
+  unsigned long long sym_run_over10m;
 
   /* Extras state. */
   u32 extras_cnt_uploaded;
@@ -1385,6 +1399,8 @@ After the existing `cuModuleGetGlobal(..., "__coqui_virgin_map", ...)` at line 1
   BIND_SYM(sym_mutation_array,       "__coqui_mutation_array",       256 * 4);
   BIND_SYM(sym_mutation_array_size,  "__coqui_mutation_array_size",  4);
   BIND_SYM(sym_havoc_stack_pow2,     "__coqui_havoc_stack_pow2",     4);
+  BIND_SYM(sym_queue_cycle,          "__coqui_queue_cycle",          4);
+  BIND_SYM(sym_run_over10m,          "__coqui_run_over10m",          4);
   BIND_SYM(sym_extras_base,          "__coqui_extras_base",          sizeof(void*));
   BIND_SYM(sym_extras_offsets,       "__coqui_extras_offsets",       sizeof(void*));
   BIND_SYM(sym_extras_lens,          "__coqui_extras_lens",          sizeof(void*));
@@ -1617,6 +1633,12 @@ void coqui_refresh_seed_pool(afl_state_t *afl) {
   }
   u32 pow2 = afl->havoc_stack_pow2;
   CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_havoc_stack_pow2, &pow2, 4));
+
+  /* Mirror AFL fidelity inputs to choose_block_len. Cheap (8 B total). */
+  u32 qc = afl->queue_cycle;
+  u32 over10m = afl->run_over10m ? 1u : 0u;
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_queue_cycle, &qc, 4));
+  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_run_over10m, &over10m, 4));
 
   /* Opportunistic a_extras re-upload if grown. */
   if (afl->a_extras_cnt != ctx->a_extras_cnt_uploaded) {
@@ -2508,7 +2530,7 @@ Collect:
 - Summary table
 - Any WARNF/FATAL lines from `/tmp/gpu-havoc-bench/*/stdout.log`
 
-Maintainer decides **accept** (leave commits; merge branch) or **revert** (`git revert <Phase 3 commit>` — Phases 1, 2 stay as inert dead code).
+Maintainer decides **accept** (leave commits on `cuAFL`) or **revert** (`git revert <Phase 3 commit>` on `cuAFL` — Phases 1, 2 stay as inert dead code). **Never** merge `cuAFL` into `main`; that's the user's decision to make separately.
 
 - [ ] **Step 5: Commit bench script**
 
