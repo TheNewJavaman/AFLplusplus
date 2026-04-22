@@ -230,6 +230,15 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
             u64 warp_mine = __coqui_warp_or_u64(mask, mine);
             if (warp_mine == 0) continue;
 
+            /* Non-atomic pre-read of virgin[i]. All lanes map to the same
+             * address so L1 serves them from one cacheline. Virgin is
+             * monotonic (bits only go 0->1), so skipping the atomic when
+             * `warp_mine & ~v == 0` is safe: any bit that flips between
+             * this read and when we would have done the atomic was claimed
+             * by another warp first, which is the correct outcome. */
+            u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
+            if ((warp_mine & ~v_pre) == 0) continue;
+
             /* Lane 0 does the atomic; broadcast `was` (pre-OR virgin) so
              * every lane can compute its own novelty contribution
              * mine & ~was. Over-reports novelty within a warp when >1
@@ -248,6 +257,9 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
         for (u32 i = 0; i < n; i++) {
             u64 mine = m64[i];
             if (mine == 0) continue;
+            /* Same non-atomic pre-read + skip as full-warp path. */
+            u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
+            if ((mine & ~v_pre) == 0) continue;
             u64 was = atomic_fetch_or_explicit(&v64[i], mine,
                                                 memory_order_relaxed);
             if (mine & ~was) { novel = 1; }
