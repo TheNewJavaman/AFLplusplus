@@ -328,11 +328,38 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 3] = (u8)(v & 0xFF);
         break;
       }
-      case MUT_RAND8:
+      case MUT_RAND8: {
+        u32 off = gpu_rand_below(prng, len);
+        buf[off] = (u8)gpu_rand_below(prng, 256);
+        break;
+      }
+      case MUT_FLIP8: {
+        u32 off = gpu_rand_below(prng, len);
+        buf[off] = ~buf[off];
+        break;
+      }
+      case MUT_SWITCH: {
+        if (len < 2) goto retry_havoc_step;
+        u32 a = gpu_rand_below(prng, len);
+        u32 b = gpu_rand_below(prng, len);
+        if (a == b) break;
+        u8 tmp = buf[a]; buf[a] = buf[b]; buf[b] = tmp;
+        break;
+      }
+      case MUT_BYTEADD: {
+        u32 off = gpu_rand_below(prng, len);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        buf[off] = (u8)(buf[off] + (u8)item);
+        break;
+      }
+      case MUT_BYTESUB: {
+        u32 off = gpu_rand_below(prng, len);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        buf[off] = (u8)(buf[off] - (u8)item);
+        break;
+      }
       case MUT_CLONE_COPY: case MUT_CLONE_FIXED:
       case MUT_OVERWRITE_COPY: case MUT_OVERWRITE_FIXED:
-      case MUT_BYTEADD: case MUT_BYTESUB:
-      case MUT_FLIP8: case MUT_SWITCH:
       case MUT_DEL: case MUT_SHUFFLE:
       case MUT_DELONE: case MUT_INSERTONE:
         goto retry_havoc_step;  /* placeholder; fill in task 1.6 */
