@@ -405,8 +405,22 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         for (u32 i = 0; i < copy_len; ++i) buf[copy_to + i] = fill;
         break;
       }
-      case MUT_DEL: case MUT_SHUFFLE:
-      case MUT_DELONE: case MUT_INSERTONE:
+      case MUT_DEL: {
+        if (len < 2) goto retry_havoc_step;
+        u32 del_len = choose_block_len(prng, len - 1);
+        u32 del_from = gpu_rand_below(prng, len - del_len + 1);
+        for (u32 i = del_from; i + del_len < len; ++i) buf[i] = buf[i + del_len];
+        len -= del_len;
+        break;
+      }
+      case MUT_DELONE: {
+        if (len < 2) goto retry_havoc_step;
+        u32 pos = gpu_rand_below(prng, len);
+        for (u32 i = pos; i + 1 < len; ++i) buf[i] = buf[i + 1];
+        len -= 1;
+        break;
+      }
+      case MUT_SHUFFLE: case MUT_INSERTONE:
         goto retry_havoc_step;  /* placeholder; fill in task 1.6 */
 
       /* Bucket 2 ops — filled in by task 1.7 */
