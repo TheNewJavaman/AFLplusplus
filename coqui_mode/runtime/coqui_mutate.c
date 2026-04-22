@@ -164,7 +164,13 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
 
     switch (op) {
       /* Bucket 1 ops — filled in by task 1.6 */
-      case MUT_FLIPBIT: case MUT_INTERESTING8:
+      case MUT_FLIPBIT: {
+        u8 bit = (u8)gpu_rand_below(prng, 8);
+        u32 off = gpu_rand_below(prng, len);
+        buf[off] ^= 1u << bit;
+        break;
+      }
+      case MUT_INTERESTING8:
       case MUT_INTERESTING16: case MUT_INTERESTING16BE:
       case MUT_INTERESTING32: case MUT_INTERESTING32BE:
       case MUT_ARITH8_: case MUT_ARITH8:
