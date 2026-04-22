@@ -162,41 +162,55 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
     u32 op = __coqui_mutation_array[r];
 
     switch (op) {
-      /* Bucket 1 ops — filled in by task 1.6 */
+      /* ---------- Bucket 1: 22 ports of src/afl-fuzz-one.c:2320-3050 ----------
+       * Semantic invariants (from AFL source):
+       *   - "no retry" guards use `break`, not `goto retry_havoc_step`
+       *   - MUT_RAND8 XORs with 1..255 (no no-op)
+       *   - MUT_BYTEADD/BYTESUB are `++` / `--` (always ±1)
+       *   - MUT_SWITCH: guard < 4, do-while distinct, BLOCK swap
+       *   - CLONE_FIXED / OVERWRITE_FIXED / INSERTONE use 50/50 random-vs-neighbor fill
+       *   - SHUFFLE inner loop uses do-while to reject i==j
+       * GPU adaptation: MAX_FILE→max_len is small (4096), so CLONE_* guards
+       * are simplified to "any-growth-possible" with clone_len clipping.
+       */
+
       case MUT_FLIPBIT: {
-        u8 bit = (u8)gpu_rand_below(prng, 8);
+        u8  bit = (u8)gpu_rand_below(prng, 8);
         u32 off = gpu_rand_below(prng, len);
         buf[off] ^= 1u << bit;
         break;
       }
+
       case MUT_INTERESTING8: {
-        u32 pos = gpu_rand_below(prng, len);
         u32 item = gpu_rand_below(prng, INTERESTING_8_CNT);
-        buf[pos] = (u8)interesting_8[item];
+        buf[gpu_rand_below(prng, len)] = (u8)interesting_8[item];
         break;
       }
+
       case MUT_INTERESTING16: {
-        if (len < 2) goto retry_havoc_step;
-        u32 pos = gpu_rand_below(prng, len - 1);
+        if (len < 2) break;                          /* no retry */
         u32 item = gpu_rand_below(prng, INTERESTING_16_CNT);
+        u32 pos = gpu_rand_below(prng, len - 1);
         u16 v = (u16)interesting_16[item];
         buf[pos]     = (u8)(v & 0xFF);
         buf[pos + 1] = (u8)((v >> 8) & 0xFF);
         break;
       }
+
       case MUT_INTERESTING16BE: {
-        if (len < 2) goto retry_havoc_step;
-        u32 pos = gpu_rand_below(prng, len - 1);
+        if (len < 2) break;                          /* no retry */
         u32 item = gpu_rand_below(prng, INTERESTING_16_CNT);
+        u32 pos = gpu_rand_below(prng, len - 1);
         u16 v = (u16)interesting_16[item];
         buf[pos]     = (u8)((v >> 8) & 0xFF);
         buf[pos + 1] = (u8)(v & 0xFF);
         break;
       }
+
       case MUT_INTERESTING32: {
-        if (len < 4) goto retry_havoc_step;
-        u32 pos = gpu_rand_below(prng, len - 3);
+        if (len < 4) break;                          /* no retry */
         u32 item = gpu_rand_below(prng, INTERESTING_32_CNT);
+        u32 pos = gpu_rand_below(prng, len - 3);
         u32 v = (u32)interesting_32[item];
         buf[pos]     = (u8)(v & 0xFF);
         buf[pos + 1] = (u8)((v >> 8)  & 0xFF);
@@ -204,10 +218,11 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 3] = (u8)((v >> 24) & 0xFF);
         break;
       }
+
       case MUT_INTERESTING32BE: {
-        if (len < 4) goto retry_havoc_step;
-        u32 pos = gpu_rand_below(prng, len - 3);
+        if (len < 4) break;                          /* no retry */
         u32 item = gpu_rand_below(prng, INTERESTING_32_CNT);
+        u32 pos = gpu_rand_below(prng, len - 3);
         u32 v = (u32)interesting_32[item];
         buf[pos]     = (u8)((v >> 24) & 0xFF);
         buf[pos + 1] = (u8)((v >> 16) & 0xFF);
@@ -215,20 +230,23 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 3] = (u8)(v & 0xFF);
         break;
       }
+
       case MUT_ARITH8_: {
-        u32 off = gpu_rand_below(prng, len);
+        u32 pos = gpu_rand_below(prng, len);
         u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        buf[off] = (u8)(buf[off] - item);
+        buf[pos] = (u8)(buf[pos] - item);
         break;
       }
+
       case MUT_ARITH8: {
-        u32 off = gpu_rand_below(prng, len);
+        u32 pos = gpu_rand_below(prng, len);
         u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        buf[off] = (u8)(buf[off] + item);
+        buf[pos] = (u8)(buf[pos] + item);
         break;
       }
+
       case MUT_ARITH16_: {
-        if (len < 2) goto retry_havoc_step;
+        if (len < 2) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 1);
         u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
         u16 v = (u16)buf[pos] | ((u16)buf[pos + 1] << 8);
@@ -237,18 +255,20 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 1] = (u8)((v >> 8) & 0xFF);
         break;
       }
+
       case MUT_ARITH16BE_: {
-        if (len < 2) goto retry_havoc_step;
+        if (len < 2) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 1);
-        u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
-        u16 v = ((u16)buf[pos] << 8) | (u16)buf[pos + 1];
-        v = v - item;
-        buf[pos]     = (u8)((v >> 8) & 0xFF);
+        u16 num = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
+        u16 v = ((u16)buf[pos] << 8) | (u16)buf[pos + 1];      /* BE load */
+        v = v - num;
+        buf[pos]     = (u8)((v >> 8) & 0xFF);                  /* BE store */
         buf[pos + 1] = (u8)(v & 0xFF);
         break;
       }
+
       case MUT_ARITH16: {
-        if (len < 2) goto retry_havoc_step;
+        if (len < 2) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 1);
         u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
         u16 v = (u16)buf[pos] | ((u16)buf[pos + 1] << 8);
@@ -257,24 +277,24 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 1] = (u8)((v >> 8) & 0xFF);
         break;
       }
+
       case MUT_ARITH16BE: {
-        if (len < 2) goto retry_havoc_step;
+        if (len < 2) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 1);
-        u16 item = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
+        u16 num = (u16)(1 + gpu_rand_below(prng, ARITH_MAX));
         u16 v = ((u16)buf[pos] << 8) | (u16)buf[pos + 1];
-        v = v + item;
+        v = v + num;
         buf[pos]     = (u8)((v >> 8) & 0xFF);
         buf[pos + 1] = (u8)(v & 0xFF);
         break;
       }
+
       case MUT_ARITH32_: {
-        if (len < 4) goto retry_havoc_step;
+        if (len < 4) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 3);
         u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        u32 v = (u32)buf[pos]
-              | ((u32)buf[pos + 1] << 8)
-              | ((u32)buf[pos + 2] << 16)
-              | ((u32)buf[pos + 3] << 24);
+        u32 v = (u32)buf[pos] | ((u32)buf[pos + 1] << 8)
+              | ((u32)buf[pos + 2] << 16) | ((u32)buf[pos + 3] << 24);
         v = v - item;
         buf[pos]     = (u8)(v & 0xFF);
         buf[pos + 1] = (u8)((v >> 8) & 0xFF);
@@ -282,29 +302,27 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 3] = (u8)((v >> 24) & 0xFF);
         break;
       }
+
       case MUT_ARITH32BE_: {
-        if (len < 4) goto retry_havoc_step;
+        if (len < 4) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 3);
-        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        u32 v = ((u32)buf[pos] << 24)
-              | ((u32)buf[pos + 1] << 16)
-              | ((u32)buf[pos + 2] << 8)
-              | (u32)buf[pos + 3];
-        v = v - item;
+        u32 num = 1 + gpu_rand_below(prng, ARITH_MAX);
+        u32 v = ((u32)buf[pos] << 24) | ((u32)buf[pos + 1] << 16)
+              | ((u32)buf[pos + 2] << 8) | (u32)buf[pos + 3];
+        v = v - num;
         buf[pos]     = (u8)((v >> 24) & 0xFF);
         buf[pos + 1] = (u8)((v >> 16) & 0xFF);
         buf[pos + 2] = (u8)((v >> 8) & 0xFF);
         buf[pos + 3] = (u8)(v & 0xFF);
         break;
       }
+
       case MUT_ARITH32: {
-        if (len < 4) goto retry_havoc_step;
+        if (len < 4) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 3);
         u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        u32 v = (u32)buf[pos]
-              | ((u32)buf[pos + 1] << 8)
-              | ((u32)buf[pos + 2] << 16)
-              | ((u32)buf[pos + 3] << 24);
+        u32 v = (u32)buf[pos] | ((u32)buf[pos + 1] << 8)
+              | ((u32)buf[pos + 2] << 16) | ((u32)buf[pos + 3] << 24);
         v = v + item;
         buf[pos]     = (u8)(v & 0xFF);
         buf[pos + 1] = (u8)((v >> 8) & 0xFF);
@@ -312,132 +330,197 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 3] = (u8)((v >> 24) & 0xFF);
         break;
       }
+
       case MUT_ARITH32BE: {
-        if (len < 4) goto retry_havoc_step;
+        if (len < 4) break;                          /* no retry */
         u32 pos = gpu_rand_below(prng, len - 3);
-        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        u32 v = ((u32)buf[pos] << 24)
-              | ((u32)buf[pos + 1] << 16)
-              | ((u32)buf[pos + 2] << 8)
-              | (u32)buf[pos + 3];
-        v = v + item;
+        u32 num = 1 + gpu_rand_below(prng, ARITH_MAX);
+        u32 v = ((u32)buf[pos] << 24) | ((u32)buf[pos + 1] << 16)
+              | ((u32)buf[pos + 2] << 8) | (u32)buf[pos + 3];
+        v = v + num;
         buf[pos]     = (u8)((v >> 24) & 0xFF);
         buf[pos + 1] = (u8)((v >> 16) & 0xFF);
         buf[pos + 2] = (u8)((v >> 8) & 0xFF);
         buf[pos + 3] = (u8)(v & 0xFF);
         break;
       }
+
       case MUT_RAND8: {
-        u32 off = gpu_rand_below(prng, len);
-        buf[off] = (u8)gpu_rand_below(prng, 256);
+        /* AFL: out_buf[pos] ^= 1 + rand(255) — XOR with non-zero byte to
+         * eliminate no-op. Not random-overwrite. */
+        u32 pos = gpu_rand_below(prng, len);
+        u32 item = 1 + gpu_rand_below(prng, 255);
+        buf[pos] ^= (u8)item;
         break;
       }
+
       case MUT_FLIP8: {
-        u32 off = gpu_rand_below(prng, len);
-        buf[off] = ~buf[off];
+        /* AFL: out_buf[rand] ^= 0xff (equivalent to ~out_buf[rand]) */
+        buf[gpu_rand_below(prng, len)] ^= 0xFF;
         break;
       }
+
       case MUT_SWITCH: {
-        if (len < 2) goto retry_havoc_step;
-        u32 a = gpu_rand_below(prng, len);
-        u32 b = gpu_rand_below(prng, len);
-        if (a == b) break;
-        u8 tmp = buf[a]; buf[a] = buf[b]; buf[b] = tmp;
-        break;
-      }
-      case MUT_BYTEADD: {
-        u32 off = gpu_rand_below(prng, len);
-        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        buf[off] = (u8)(buf[off] + (u8)item);
-        break;
-      }
-      case MUT_BYTESUB: {
-        u32 off = gpu_rand_below(prng, len);
-        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
-        buf[off] = (u8)(buf[off] - (u8)item);
-        break;
-      }
-      case MUT_CLONE_COPY: {
-        if (len + HAVOC_BLK_XL >= max_len) goto retry_havoc_step;
-        u32 clone_len = choose_block_len(prng, HAVOC_BLK_XL);
-        u32 clone_from = gpu_rand_below(prng, len);
-        u32 clone_to   = gpu_rand_below(prng, len + 1);
-        if (clone_from + clone_len > len) clone_len = len - clone_from;
-        if (len + clone_len >= max_len) goto retry_havoc_step;
-        for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
-        for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = buf[clone_from + i];
-        len += clone_len;
-        break;
-      }
-      case MUT_CLONE_FIXED: {
-        if (len + HAVOC_BLK_XL >= max_len) goto retry_havoc_step;
-        u32 clone_len = choose_block_len(prng, HAVOC_BLK_XL);
-        u32 clone_to  = gpu_rand_below(prng, len + 1);
-        if (len + clone_len >= max_len) goto retry_havoc_step;
-        u8 fill = (u8)gpu_rand_below(prng, 256);
-        for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
-        for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = fill;
-        len += clone_len;
-        break;
-      }
-      case MUT_OVERWRITE_COPY: {
-        if (len < 2) goto retry_havoc_step;
-        u32 copy_len  = choose_block_len(prng, len - 1);
-        u32 copy_from = gpu_rand_below(prng, len - copy_len + 1);
-        u32 copy_to   = gpu_rand_below(prng, len - copy_len + 1);
-        if (copy_from != copy_to) {
-          if (copy_to > copy_from) {
-            for (u32 i = copy_len; i > 0; --i)
-              buf[copy_to + i - 1] = buf[copy_from + i - 1];
-          } else {
-            for (u32 i = 0; i < copy_len; ++i)
-              buf[copy_to + i] = buf[copy_from + i];
-          }
+        /* AFL: guard < 4 with break; do-while distinct; BLOCK swap of size
+         * choose_block_len(MIN(switch_len, to_end)). */
+        if (len < 4) break;                          /* no retry */
+        u32 switch_from = gpu_rand_below(prng, len);
+        u32 switch_to;
+        do {
+          switch_to = gpu_rand_below(prng, len);
+        } while (switch_from == switch_to);
+        u32 switch_len, to_end;
+        if (switch_from < switch_to) {
+          switch_len = switch_to - switch_from;
+          to_end = len - switch_to;
+        } else {
+          switch_len = switch_from - switch_to;
+          to_end = len - switch_from;
+        }
+        u32 limit = switch_len < to_end ? switch_len : to_end;
+        switch_len = choose_block_len(prng, limit);
+        /* Block swap, byte-by-byte (ranges are non-overlapping by construction). */
+        for (u32 i = 0; i < switch_len; ++i) {
+          u8 t = buf[switch_from + i];
+          buf[switch_from + i] = buf[switch_to + i];
+          buf[switch_to + i] = t;
         }
         break;
       }
-      case MUT_OVERWRITE_FIXED: {
-        if (len < 1) goto retry_havoc_step;
-        u32 copy_len = choose_block_len(prng, len);
-        u32 copy_to  = gpu_rand_below(prng, len - copy_len + 1);
-        u8 fill = (u8)gpu_rand_below(prng, 256);
-        for (u32 i = 0; i < copy_len; ++i) buf[copy_to + i] = fill;
+
+      case MUT_BYTEADD: {
+        /* AFL: out_buf[rand]++ — always +1 */
+        buf[gpu_rand_below(prng, len)]++;
         break;
       }
+
+      case MUT_BYTESUB: {
+        /* AFL: out_buf[rand]-- — always -1 */
+        buf[gpu_rand_below(prng, len)]--;
+        break;
+      }
+
+      case MUT_CLONE_COPY: {
+        /* AFL's guard is `temp_len + HAVOC_BLK_XL < MAX_FILE`; with MAX_FILE
+         * ~= 1MB, that's typically true. Our max_len is small (<=4KB), so
+         * HAVOC_BLK_XL (32KB) > max_len always — original guard never passes.
+         * Adapt: allow cloning whenever any growth is possible; clip clone_len. */
+        if (len + 1 < max_len) {
+          u32 clone_len = choose_block_len(prng, len);
+          if (clone_len > max_len - len - 1) clone_len = max_len - len - 1;
+          if (clone_len == 0) break;
+          u32 clone_from = gpu_rand_below(prng, len - clone_len + 1);
+          u32 clone_to   = gpu_rand_below(prng, len);
+          for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
+          for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = buf[clone_from + i];
+          len += clone_len;
+        } else if (len < 8) {
+          break;
+        } else {
+          goto retry_havoc_step;
+        }
+        break;
+      }
+
+      case MUT_CLONE_FIXED: {
+        /* Same GPU adaptation as CLONE_COPY. 50/50 strat for fill byte
+         * (random vs neighbor-copy), matching AFL. */
+        if (len + 1 < max_len) {
+          u32 clone_len = choose_block_len(prng, HAVOC_BLK_XL);
+          if (clone_len > max_len - len - 1) clone_len = max_len - len - 1;
+          if (clone_len == 0) break;
+          u32 clone_to = gpu_rand_below(prng, len);
+          u32 strat = gpu_rand_below(prng, 2);
+          u32 clone_from = clone_to ? clone_to - 1 : 0;
+          u8  item = strat ? (u8)gpu_rand_below(prng, 256) : buf[clone_from];
+          for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
+          for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = item;
+          len += clone_len;
+        } else if (len < 8) {
+          break;
+        } else {
+          goto retry_havoc_step;
+        }
+        break;
+      }
+
+      case MUT_OVERWRITE_COPY: {
+        if (len < 2) break;                          /* no retry */
+        u32 copy_len = choose_block_len(prng, len - 1);
+        u32 copy_from, copy_to;
+        do {
+          copy_from = gpu_rand_below(prng, len - copy_len + 1);
+          copy_to   = gpu_rand_below(prng, len - copy_len + 1);
+        } while (copy_from == copy_to);
+        /* memmove semantics for possibly overlapping ranges. */
+        if (copy_to > copy_from) {
+          for (u32 i = copy_len; i > 0; --i)
+            buf[copy_to + i - 1] = buf[copy_from + i - 1];
+        } else {
+          for (u32 i = 0; i < copy_len; ++i)
+            buf[copy_to + i] = buf[copy_from + i];
+        }
+        break;
+      }
+
+      case MUT_OVERWRITE_FIXED: {
+        if (len < 2) break;                          /* no retry */
+        u32 copy_len = choose_block_len(prng, len - 1);
+        u32 copy_to  = gpu_rand_below(prng, len - copy_len + 1);
+        u32 strat = gpu_rand_below(prng, 2);
+        u32 copy_from = copy_to ? copy_to - 1 : 0;
+        u8 item = strat ? (u8)gpu_rand_below(prng, 256) : buf[copy_from];
+        for (u32 i = 0; i < copy_len; ++i) buf[copy_to + i] = item;
+        break;
+      }
+
       case MUT_DEL: {
-        if (len < 2) goto retry_havoc_step;
+        if (len < 2) break;                          /* no retry */
         u32 del_len = choose_block_len(prng, len - 1);
         u32 del_from = gpu_rand_below(prng, len - del_len + 1);
         for (u32 i = del_from; i + del_len < len; ++i) buf[i] = buf[i + del_len];
         len -= del_len;
         break;
       }
+
       case MUT_DELONE: {
-        if (len < 2) goto retry_havoc_step;
-        u32 pos = gpu_rand_below(prng, len);
-        for (u32 i = pos; i + 1 < len; ++i) buf[i] = buf[i + 1];
-        len -= 1;
+        if (len < 2) break;                          /* no retry */
+        u32 del_len = 1;
+        u32 del_from = gpu_rand_below(prng, len - del_len + 1);
+        for (u32 i = del_from; i + del_len < len; ++i) buf[i] = buf[i + del_len];
+        len -= del_len;
         break;
       }
+
       case MUT_SHUFFLE: {
-        if (len < 4) goto retry_havoc_step;
-        u32 shuf_len = choose_block_len(prng, len - 1);
-        if (shuf_len < 2) goto retry_havoc_step;
-        u32 shuf_from = gpu_rand_below(prng, len - shuf_len + 1);
-        for (u32 i = shuf_len - 1; i > 0; --i) {
-          u32 j = gpu_rand_below(prng, i + 1);
-          u8 t = buf[shuf_from + i];
-          buf[shuf_from + i] = buf[shuf_from + j];
-          buf[shuf_from + j] = t;
+        if (len < 4) break;                          /* no retry */
+        u32 slen = choose_block_len(prng, len - 1);
+        u32 off = gpu_rand_below(prng, len - slen + 1);
+        /* AFL Fisher-Yates inner loop uses do-while(i==j) to reject
+         * degenerate swaps. */
+        for (u32 i = slen - 1; i > 0; --i) {
+          u32 j;
+          do {
+            j = gpu_rand_below(prng, i + 1);
+          } while (j == i);
+          u8 t = buf[off + i];
+          buf[off + i] = buf[off + j];
+          buf[off + j] = t;
         }
         break;
       }
+
       case MUT_INSERTONE: {
-        if (len + 1 >= max_len) goto retry_havoc_step;
-        u32 pos = gpu_rand_below(prng, len + 1);
-        u8 byte = (u8)gpu_rand_below(prng, 256);
-        for (u32 i = len; i > pos; --i) buf[i] = buf[i - 1];
-        buf[pos] = byte;
+        if (len < 2) break;                          /* no retry (AFL's guard) */
+        /* GPU-specific overflow guard: also break if no room to grow (AFL
+         * can always grow via realloc; we have a fixed max_len). */
+        if (len + 1 >= max_len) break;
+        u32 clone_to = gpu_rand_below(prng, len);
+        u32 strat = gpu_rand_below(prng, 2);
+        u32 clone_from = clone_to ? clone_to - 1 : 0;
+        u8 item = strat ? (u8)gpu_rand_below(prng, 256) : buf[clone_from];
+        for (u32 i = len; i > clone_to; --i) buf[i] = buf[i - 1];
+        buf[clone_to] = item;
         len += 1;
         break;
       }
