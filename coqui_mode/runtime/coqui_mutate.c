@@ -412,7 +412,14 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
           u32 clone_from = gpu_rand_below(prng, len - clone_len + 1);
           u32 clone_to   = gpu_rand_below(prng, len);
           for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
-          for (u32 i = 0; i < clone_len; ++i)  buf[clone_to + i] = buf[clone_from + i];
+          /* In-place copy: after the shift above, bytes originally at position
+           * s (for s >= clone_to) now live at s + clone_len. Re-address source
+           * reads that fall into the shifted region. */
+          for (u32 i = 0; i < clone_len; ++i) {
+            u32 src = clone_from + i;
+            if (src >= clone_to) src += clone_len;
+            buf[clone_to + i] = buf[src];
+          }
           len += clone_len;
         } else if (len < 8) {
           break;
