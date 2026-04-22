@@ -84,7 +84,6 @@ typedef struct coqui_batch {
   unsigned long long d_reported_slab;
   unsigned long long d_reported_tid;
   unsigned long long d_reported_lens;
-  unsigned long long d_reported_count;
 
   /* Stream + completion event (CUstream / CUevent) */
   void *stream;

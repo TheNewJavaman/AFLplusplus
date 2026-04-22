@@ -103,8 +103,6 @@ static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
   b->d_reported_tid  = (unsigned long long)p;
   CUCHECK(cuMemAlloc(&p, COQUI_REPORTED_CAP * 4));
   b->d_reported_lens = (unsigned long long)p;
-  CUCHECK(cuMemAlloc(&p, 4));
-  b->d_reported_count = (unsigned long long)p;
   b->h_reported_count = 0;
 
   b->stream = (void *)stream;
@@ -768,13 +766,13 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_slot_info,
                              b->h_slot_info, ctx->batch_size * 4, s));
 
-  /* Zero reported_count so compact-write starts fresh. */
-  CUCHECK(cuMemsetD32Async((CUdeviceptr)b->d_reported_count, 0, 1, s));
+  /* Zero reported_count so compact-write starts fresh. __coqui_reported_count
+   * is a u32 counter (kernel atomicAdds on the module global directly), not
+   * a pointer slot — so we zero the module global directly, no HtoD rebind. */
+  CUCHECK(cuMemsetD32Async((CUdeviceptr)ctx->sym_reported_count, 0, 1, s));
 
   /* Bind this batch's reported_tid/lens pointers into the module globals so
    * the kernel's compact-report block writes to the correct side. */
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_count,
-                             &b->d_reported_count, 8, s));
   CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_tid,
                              &b->d_reported_tid, 8, s));
   CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_lens,
@@ -811,7 +809,7 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   /* DtoH reported_count + full slab (we'll only read the populated prefix
    * on the host). Overhead: ~2 MB per batch, acceptable. */
   CUCHECK(cuMemcpyDtoHAsync(&b->h_reported_count,
-                             (CUdeviceptr)b->d_reported_count, 4, s));
+                             (CUdeviceptr)ctx->sym_reported_count, 4, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_reported_slab,
                              (CUdeviceptr)b->d_reported_slab,
                              (size_t)COQUI_REPORTED_CAP * ctx->max_input_size, s));
@@ -1375,7 +1373,6 @@ static void free_batch_half_cuda(coqui_batch_t *b) {
   if (b->d_reported_slab)  cuMemFree((CUdeviceptr)b->d_reported_slab);
   if (b->d_reported_tid)   cuMemFree((CUdeviceptr)b->d_reported_tid);
   if (b->d_reported_lens)  cuMemFree((CUdeviceptr)b->d_reported_lens);
-  if (b->d_reported_count) cuMemFree((CUdeviceptr)b->d_reported_count);
 
   if (b->completion_event) cuEventDestroy((CUevent)b->completion_event);
 
