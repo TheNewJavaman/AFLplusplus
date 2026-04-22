@@ -2256,6 +2256,38 @@ havoc_stage:
 
   // + (afl->extras_cnt ? 2 : 0) + (afl->a_extras_cnt ? 2 : 0);
 
+  /* GPU-havoc: refresh the resident seed pool for this queue_cur entry. */
+  if (afl->coqui) {
+    /* Custom mutators aren't supported by GPU-havoc. Fall back to CPU path
+     * for queue entries that have a stacked custom mutator. */
+    int gpu_havoc_disabled_by_custom = 0;
+    if (afl->custom_mutators_count > 0) {
+      LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+        if (el->stacked_custom) { gpu_havoc_disabled_by_custom = 1; break; }
+      });
+    }
+    if (gpu_havoc_disabled_by_custom) {
+      static u32 warned_qid = (u32)-1;
+      if (afl->queue_cur && warned_qid != afl->queue_cur->id) {
+        WARNF("coqui_mode: custom stacked mutator on queue entry %u — "
+              "GPU havoc disabled for this entry",
+              (unsigned)afl->queue_cur->id);
+        warned_qid = afl->queue_cur->id;
+      }
+      /* Fall through to the CPU havoc branch below. */
+    } else {
+      coqui_refresh_seed_pool(afl);
+      for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max; ++afl->stage_cur) {
+        if (unlikely(afl->stop_soon)) goto abandon_entry;
+        coqui_submit_havoc_slot(afl, /*seed_idx=*/0u, COQUI_FLAG_HAVOC);
+      }
+      coqui_flush_batch(afl);
+      goto coqui_havoc_done;
+    }
+  }
+
+  /* CPU havoc path — original body below, unchanged. */
+
   for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max; ++afl->stage_cur) {
 
     u32 use_stacking = 1 + rand_below(afl, stack_max);
@@ -3535,6 +3567,8 @@ havoc_stage:
    * so batches fill to batch_size (8192) before launching. Previous behavior
    * launched partial batches at every stage boundary, capping throughput at
    * ~150 execs/batch. Auto-flush still fires when the buffer fills. */
+
+coqui_havoc_done:;
 
   new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
