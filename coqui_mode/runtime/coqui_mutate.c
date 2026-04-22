@@ -381,7 +381,30 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         len += clone_len;
         break;
       }
-      case MUT_OVERWRITE_COPY: case MUT_OVERWRITE_FIXED:
+      case MUT_OVERWRITE_COPY: {
+        if (len < 2) goto retry_havoc_step;
+        u32 copy_len  = choose_block_len(prng, len - 1);
+        u32 copy_from = gpu_rand_below(prng, len - copy_len + 1);
+        u32 copy_to   = gpu_rand_below(prng, len - copy_len + 1);
+        if (copy_from != copy_to) {
+          if (copy_to > copy_from) {
+            for (u32 i = copy_len; i > 0; --i)
+              buf[copy_to + i - 1] = buf[copy_from + i - 1];
+          } else {
+            for (u32 i = 0; i < copy_len; ++i)
+              buf[copy_to + i] = buf[copy_from + i];
+          }
+        }
+        break;
+      }
+      case MUT_OVERWRITE_FIXED: {
+        if (len < 1) goto retry_havoc_step;
+        u32 copy_len = choose_block_len(prng, len);
+        u32 copy_to  = gpu_rand_below(prng, len - copy_len + 1);
+        u8 fill = (u8)gpu_rand_below(prng, 256);
+        for (u32 i = 0; i < copy_len; ++i) buf[copy_to + i] = fill;
+        break;
+      }
       case MUT_DEL: case MUT_SHUFFLE:
       case MUT_DELONE: case MUT_INSERTONE:
         goto retry_havoc_step;  /* placeholder; fill in task 1.6 */
