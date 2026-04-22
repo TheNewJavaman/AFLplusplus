@@ -9,13 +9,6 @@
 #include "afl-fuzz.h"
 #include "afl-fuzz-coqui.h"
 #include "forkserver.h"
-/* Intentionally NOT including "afl-mutations.h": that header emits non-static
- * array/function definitions (interesting_8/16/32, text_array, binary_array,
- * afl_mutate, ...) into every translation unit that includes it. afl-fuzz-one.c
- * already includes it; including it here too produces multiple-definition
- * link errors under LTO. Task 2.4 (coqui_refresh_seed_pool) uses local
- * `extern u32 binary_array[];` declarations at the point of use, per plan
- * line 1613-1616. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -30,19 +23,6 @@
     FATAL("CUDA error at %s:%d: %s", __FILE__, __LINE__, _name ? _name : "?");\
   }                                                                           \
 } while (0)
-
-/* AFL mutation-array selectors --- defined in src/afl-fuzz-one.c (included via
- * afl-mutations.h in that TU). We reference them by extern to avoid pulling
- * the full afl-mutations.h here (it emits multi-defined globals). */
-extern u32 binary_array[];
-extern u32 text_array[];
-extern u32 mutation_strategy_exploration_binary[];
-extern u32 mutation_strategy_exploitation_binary[];
-/* The MUT_*_ARRAY_SIZE macros we need inline-define locally to match
- * afl-mutations.h:34,88,290. */
-#define COQUI_MUT_STRATEGY_ARRAY_SIZE 256
-#define COQUI_MUT_TXT_ARRAY_SIZE      200
-#define COQUI_MUT_BIN_ARRAY_SIZE      256
 
 static unsigned int getenv_u32(const char *name, unsigned int dflt) {
   const char *v = getenv(name);
@@ -85,25 +65,6 @@ static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
   b->d_novelty = (unsigned long long)p;
   CUCHECK(cuMemAlloc(&p, ctx->batch_size * sizeof(coqui_status_t)));
   b->d_status = (unsigned long long)p;
-
-  /* slot_info — host pinned + device mirror. u32 per thread. */
-  CUCHECK(cuMemHostAlloc((void**)&b->h_slot_info, ctx->batch_size * 4, 0));
-  CUCHECK(cuMemAlloc(&p, ctx->batch_size * 4));
-  b->d_slot_info = (unsigned long long)p;
-
-  /* reported_slab + metadata — compact output for novel/crash threads.
-   * REPORTED_CAP * max_input_size bytes on host pinned and device. */
-  size_t slab_bytes = (size_t)COQUI_REPORTED_CAP * ctx->max_input_size;
-  CUCHECK(cuMemHostAlloc((void**)&b->h_reported_slab, slab_bytes, 0));
-  CUCHECK(cuMemHostAlloc((void**)&b->h_reported_tid,  COQUI_REPORTED_CAP * 4, 0));
-  CUCHECK(cuMemHostAlloc((void**)&b->h_reported_lens, COQUI_REPORTED_CAP * 4, 0));
-  CUCHECK(cuMemAlloc(&p, slab_bytes));
-  b->d_reported_slab = (unsigned long long)p;
-  CUCHECK(cuMemAlloc(&p, COQUI_REPORTED_CAP * 4));
-  b->d_reported_tid  = (unsigned long long)p;
-  CUCHECK(cuMemAlloc(&p, COQUI_REPORTED_CAP * 4));
-  b->d_reported_lens = (unsigned long long)p;
-  b->h_reported_count = 0;
 
   b->stream = (void *)stream;
   CUevent ev;
@@ -232,15 +193,6 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->byte_budget = (unsigned int)budget64;
   ctx->map_size = 65536;
 
-  /* Runtime bitcode was compiled with -DMAX_INPUT_SIZE=4096. Host-side
-   * max_length must not exceed this or kernel .local scratch will
-   * truncate mutated inputs. */
-  if (ctx->max_input_size > 4096) {
-    FATAL("coqui_mode: afl->max_length (%u) > MAX_INPUT_SIZE (4096). "
-          "Rebuild target cubin with -DMAX_INPUT_SIZE=%u.",
-          ctx->max_input_size, ctx->max_input_size);
-  }
-
   /* 7. Create streams */
   CUstream sa, sb;
   CUCHECK(cuStreamCreate(&sa, CU_STREAM_NON_BLOCKING));
@@ -248,133 +200,9 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->stream_a = (void *)sa;
   ctx->stream_b = (void *)sb;
 
-  CUstream sp;
-  CUCHECK(cuStreamCreate(&sp, CU_STREAM_NON_BLOCKING));
-  ctx->stream_pool = (void *)sp;
-
   /* 8. Allocate ping-pong pair */
   alloc_batch_half_cuda(&ctx->ping, ctx, sa);
   alloc_batch_half_cuda(&ctx->pong, ctx, sb);
-
-  /* Seed pool: 1 MB per side, capacity 256 slots. Packed (variable-length). */
-  ctx->seed_pool_cap_bytes = 1024u * 1024u;
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_bytes_a,   ctx->seed_pool_cap_bytes, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_bytes_b,   ctx->seed_pool_cap_bytes, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_offsets_a, 256 * 4, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_offsets_b, 256 * 4, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_lens_a,    256 * 4, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_lens_b,    256 * 4, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_cumw_a,    256 * 4, 0));
-  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_cumw_b,    256 * 4, 0));
-
-  {
-    CUdeviceptr dp;
-    CUCHECK(cuMemAlloc(&dp, ctx->seed_pool_cap_bytes));
-    ctx->d_seed_pool_bytes_a = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, ctx->seed_pool_cap_bytes));
-    ctx->d_seed_pool_bytes_b = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_offsets_a = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_offsets_b = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_lens_a    = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_lens_b    = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_cumw_a    = (unsigned long long)dp;
-    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_cumw_b    = (unsigned long long)dp;
-  }
-
-  ctx->seed_pool_active = 0;
-
-  /* Resolve the 21 module-level globals that the GPU havoc runtime reads.
-   * All live as extern declarations in coqui_mode/runtime/coqui_runtime.h
-   * and are populated either here (once at init) or by coqui_refresh_seed_pool
-   * (per queue_cur) or coqui_launch_batch (per batch). */
-  #define BIND_SYM(field, name, expected_sz) do {                               \
-    CUdeviceptr _sp; size_t _sz;                                                \
-    CUCHECK(cuModuleGetGlobal(&_sp, &_sz, mod, name));                          \
-    if (_sz != (expected_sz)) FATAL(name " size %zu != %zu", _sz, (size_t)(expected_sz));\
-    ctx->field = (unsigned long long)_sp;                                       \
-  } while(0)
-
-  BIND_SYM(sym_seed_pool_base,       "__coqui_seed_pool_base",       sizeof(void*));
-  BIND_SYM(sym_seed_pool_offsets,    "__coqui_seed_pool_offsets",    sizeof(void*));
-  BIND_SYM(sym_seed_pool_lens,       "__coqui_seed_pool_lens",       sizeof(void*));
-  BIND_SYM(sym_seed_pool_cumw,       "__coqui_seed_pool_cumw",       sizeof(void*));
-  BIND_SYM(sym_seed_pool_count,      "__coqui_seed_pool_count",      4);
-  BIND_SYM(sym_seed_pool_cumw_total, "__coqui_seed_pool_cumw_total", 4);
-  BIND_SYM(sym_prng_base,            "__coqui_prng_base",            8);
-  BIND_SYM(sym_reported_count,       "__coqui_reported_count",       4);
-  BIND_SYM(sym_reported_tid,         "__coqui_reported_tid",         sizeof(void*));
-  BIND_SYM(sym_reported_lens,        "__coqui_reported_lens",        sizeof(void*));
-  BIND_SYM(sym_mutation_array,       "__coqui_mutation_array",       256 * 4);
-  BIND_SYM(sym_mutation_array_size,  "__coqui_mutation_array_size",  4);
-  BIND_SYM(sym_havoc_stack_pow2,     "__coqui_havoc_stack_pow2",     4);
-  BIND_SYM(sym_queue_cycle,          "__coqui_queue_cycle",          4);
-  BIND_SYM(sym_run_over10m,          "__coqui_run_over10m",          4);
-  BIND_SYM(sym_extras_base,          "__coqui_extras_base",          sizeof(void*));
-  BIND_SYM(sym_extras_offsets,       "__coqui_extras_offsets",       sizeof(void*));
-  BIND_SYM(sym_extras_lens,          "__coqui_extras_lens",          sizeof(void*));
-  BIND_SYM(sym_extras_cnt,           "__coqui_extras_cnt",           4);
-  BIND_SYM(sym_a_extras_base,        "__coqui_a_extras_base",        sizeof(void*));
-  BIND_SYM(sym_a_extras_offsets,     "__coqui_a_extras_offsets",     sizeof(void*));
-  BIND_SYM(sym_a_extras_lens,        "__coqui_a_extras_lens",        sizeof(void*));
-  BIND_SYM(sym_a_extras_cnt,         "__coqui_a_extras_cnt",         4);
-  #undef BIND_SYM
-
-  /* Initialize uploaded-version counters so first refresh detects the change. */
-  ctx->extras_cnt_uploaded = 0;
-  ctx->a_extras_cnt_uploaded = 0;
-  ctx->mut_array_uploaded = 0;
-
-  if (afl->extras_cnt > 0) {
-    /* Compute packed byte total */
-    size_t total = 0;
-    for (u32 i = 0; i < afl->extras_cnt; ++i) total += afl->extras[i].len;
-    CUdeviceptr p_ex; CUCHECK(cuMemAlloc(&p_ex, total ? total : 1));
-    ctx->d_extras_base = (unsigned long long)p_ex;
-
-    u32 *off_h = ck_alloc(afl->extras_cnt * 4);
-    u32 *len_h = ck_alloc(afl->extras_cnt * 4);
-    u8  *pak   = ck_alloc(total ? total : 1);
-    size_t cur = 0;
-    for (u32 i = 0; i < afl->extras_cnt; ++i) {
-      off_h[i] = (u32)cur;
-      len_h[i] = (u32)afl->extras[i].len;
-      if (afl->extras[i].len > 0) {
-        memcpy(pak + cur, afl->extras[i].data, afl->extras[i].len);
-      }
-      cur += afl->extras[i].len;
-    }
-    if (total > 0) {
-      CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->d_extras_base, pak, total));
-    }
-
-    CUdeviceptr p_off; CUCHECK(cuMemAlloc(&p_off, afl->extras_cnt * 4));
-    CUCHECK(cuMemcpyHtoD(p_off, off_h, afl->extras_cnt * 4));
-    ctx->d_extras_offsets = (unsigned long long)p_off;
-
-    CUdeviceptr p_len; CUCHECK(cuMemAlloc(&p_len, afl->extras_cnt * 4));
-    CUCHECK(cuMemcpyHtoD(p_len, len_h, afl->extras_cnt * 4));
-    ctx->d_extras_lens = (unsigned long long)p_len;
-
-    /* Bind pointer symbols */
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_base,    &ctx->d_extras_base,    8));
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_offsets, &ctx->d_extras_offsets, 8));
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_lens,    &ctx->d_extras_lens,    8));
-    u32 cnt = afl->extras_cnt;
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_cnt, &cnt, 4));
-    ctx->extras_cnt_uploaded = cnt;
-
-    ck_free(off_h); ck_free(len_h); ck_free(pak);
-  } else {
-    u32 zero = 0;
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_cnt, &zero, 4));
-  }
-
-  /* a_extras starts empty; host writes 0 to sym so kernel sees safe state. */
-  {
-    u32 zero = 0;
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_a_extras_cnt, &zero, 4));
-  }
-
   ctx->pending   = &ctx->ping;
   ctx->executing = &ctx->pong;
 
@@ -564,175 +392,6 @@ static void coqui_push_healthy_latency(coqui_ctx_t *ctx,
   ctx->batch_timeout_us = target;
 }
 
-void coqui_refresh_seed_pool(afl_state_t *afl) {
-  coqui_ctx_t *ctx = afl->coqui;
-  if (!ctx) return;
-  /* Flush any pending batch under the OLD seed pool before we flip the
-   * pointer symbols. Otherwise pending flag=1 slots (seed_idx=0) would
-   * reference the NEW queue_cur's slot 0 when they finally launch. */
-  coqui_flush_batch(afl);
-  CUstream sp = (CUstream)ctx->stream_pool;
-  u8 next = 1 - ctx->seed_pool_active;
-
-  /* Pick destination buffers for the new side. */
-  u8  *dst_bytes   = (next == 0) ? ctx->h_seed_pool_bytes_a   : ctx->h_seed_pool_bytes_b;
-  u32 *dst_offsets = (next == 0) ? ctx->h_seed_pool_offsets_a : ctx->h_seed_pool_offsets_b;
-  u32 *dst_lens    = (next == 0) ? ctx->h_seed_pool_lens_a    : ctx->h_seed_pool_lens_b;
-  u32 *dst_cumw    = (next == 0) ? ctx->h_seed_pool_cumw_a    : ctx->h_seed_pool_cumw_b;
-
-  unsigned long long d_bytes   = (next == 0) ? ctx->d_seed_pool_bytes_a   : ctx->d_seed_pool_bytes_b;
-  unsigned long long d_offsets = (next == 0) ? ctx->d_seed_pool_offsets_a : ctx->d_seed_pool_offsets_b;
-  unsigned long long d_lens    = (next == 0) ? ctx->d_seed_pool_lens_a    : ctx->d_seed_pool_lens_b;
-  unsigned long long d_cumw    = (next == 0) ? ctx->d_seed_pool_cumw_a    : ctx->d_seed_pool_cumw_b;
-
-  /* Slot 0: queue_cur (always). Guard against missing/too-large input. */
-  u32 cursor = 0;
-  u32 count = 0;
-  u64 cumw_total = 0;
-
-  u8 *cur_buf = NULL;
-  if (afl->queue_cur && afl->queue_cur->len > 0 &&
-      afl->queue_cur->len <= ctx->seed_pool_cap_bytes) {
-    cur_buf = queue_testcase_get(afl, afl->queue_cur);
-  }
-  if (cur_buf) {
-    memcpy(dst_bytes + cursor, cur_buf, afl->queue_cur->len);
-    dst_offsets[0] = cursor;
-    dst_lens[0]    = afl->queue_cur->len;
-    cursor += afl->queue_cur->len;
-    cumw_total += (u64)(afl->queue_cur->weight * 1000.0);
-    dst_cumw[0] = (u32)cumw_total;
-    count = 1;
-  } else {
-    /* No usable queue_cur --- produce empty pool; kernel will fall through splice
-     * rejection paths and no thread can splice. */
-    ctx->h_seed_pool_count_next = 0;
-    ctx->h_seed_pool_cumw_total_next = 0;
-    ctx->seed_pool_active = next;
-    u32 zero = 0;
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_count,      &zero, 4));
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_cumw_total, &zero, 4));
-    return;
-  }
-
-  /* Slots 1..255: weighted-random-with-replacement samples of queue_buf.
-   * Build a cumulative weight array (over all enabled queue entries) once,
-   * then sample N-1 times. O(Q) build + O(log Q * N) sample. */
-  u32 Q = afl->queued_items;
-  if (Q > 1 && count < 256) {
-    u64 *cdf = ck_alloc(Q * sizeof(u64));
-    u64 total = 0;
-    for (u32 i = 0; i < Q; ++i) {
-      struct queue_entry *q = afl->queue_buf[i];
-      u64 w = (q && !q->disabled) ? (u64)(q->weight * 1000.0) : 0;
-      total += w;
-      cdf[i] = total;
-    }
-    if (total > 0) {
-      for (u32 slot = count; slot < 256; ++slot) {
-        u64 r = (u64)rand_below(afl, (u32)(total > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)total));
-        u32 lo = 0, hi = Q;
-        while (lo < hi) {
-          u32 m = (lo + hi) >> 1;
-          if (cdf[m] <= r) lo = m + 1; else hi = m;
-        }
-        if (lo >= Q) lo = Q - 1;
-        struct queue_entry *q = afl->queue_buf[lo];
-        if (!q || q->len == 0) continue;
-        if (cursor + q->len > ctx->seed_pool_cap_bytes) break;
-        u8 *q_buf = queue_testcase_get(afl, q);
-        if (!q_buf) continue;
-        memcpy(dst_bytes + cursor, q_buf, q->len);
-        dst_offsets[slot] = cursor;
-        dst_lens[slot]    = q->len;
-        cursor += q->len;
-        cumw_total += (u64)(q->weight * 1000.0);
-        dst_cumw[slot] = (u32)cumw_total;
-        count++;
-      }
-    }
-    ck_free(cdf);
-  }
-
-  /* HtoD on stream_pool --- overlaps in-flight kernel on stream_a/b. */
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_bytes,   dst_bytes,   cursor,       sp));
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_offsets, dst_offsets, count * 4,    sp));
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_lens,    dst_lens,    count * 4,    sp));
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)d_cumw,    dst_cumw,    count * 4,    sp));
-
-  /* Fence: subsequent kernel launches on stream_a/b must wait for this upload. */
-  CUevent ev;
-  CUCHECK(cuEventCreate(&ev, CU_EVENT_DISABLE_TIMING));
-  CUCHECK(cuEventRecord(ev, sp));
-  CUCHECK(cuStreamWaitEvent((CUstream)ctx->stream_a, ev, 0));
-  CUCHECK(cuStreamWaitEvent((CUstream)ctx->stream_b, ev, 0));
-  CUCHECK(cuEventDestroy(ev));
-
-  /* Flip pointer symbols + scalar count/cumw_total. */
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_base,    &d_bytes,   8));
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_offsets, &d_offsets, 8));
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_lens,    &d_lens,    8));
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_cumw,    &d_cumw,    8));
-  u32 cnt_u32 = count;
-  u32 cumw_u32 = (u32)(cumw_total & 0xFFFFFFFFu);
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_count,      &cnt_u32,  4));
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_seed_pool_cumw_total, &cumw_u32, 4));
-
-  ctx->h_seed_pool_count_next = count;
-  ctx->h_seed_pool_cumw_total_next = cumw_u32;
-  ctx->seed_pool_active = next;
-
-  /* Upload mutation_array if (input_mode, fuzz_mode) changed. */
-  if (!ctx->mut_array_uploaded ||
-      ctx->mut_array_input_mode != afl->input_mode ||
-      ctx->mut_array_fuzz_mode  != afl->fuzz_mode) {
-    /* Mutation-array selection matches src/afl-fuzz-one.c:2180-2233. */
-    u32 *active;
-    u32  size;
-    if (afl->input_mode == 1 /* TEXT */) {
-      if (afl->fuzz_mode == 0) { active = binary_array; size = COQUI_MUT_BIN_ARRAY_SIZE; }
-      else                     { active = text_array;   size = COQUI_MUT_TXT_ARRAY_SIZE; }
-    } else if (afl->input_mode == 2 /* BINARY */) {
-      if (afl->fuzz_mode == 0) { active = mutation_strategy_exploration_binary;
-                                  size   = COQUI_MUT_STRATEGY_ARRAY_SIZE; }
-      else                     { active = mutation_strategy_exploitation_binary;
-                                  size   = COQUI_MUT_STRATEGY_ARRAY_SIZE; }
-    } else {
-      /* DEFAULT / generic */
-      if (afl->fuzz_mode == 0) { active = binary_array; size = COQUI_MUT_BIN_ARRAY_SIZE; }
-      else                     { active = text_array;   size = COQUI_MUT_TXT_ARRAY_SIZE; }
-    }
-    /* Zero the device-side array first so unused slots (beyond `size`) don't
-     * carry stale data if a later mode switch has a smaller array. */
-    u32 zero256[256] = {0};
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array, zero256, 256 * 4));
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array, active,  size * 4));
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array_size, &size, 4));
-    ctx->mut_array_input_mode = afl->input_mode;
-    ctx->mut_array_fuzz_mode  = afl->fuzz_mode;
-    ctx->mut_array_uploaded = 1;
-  }
-
-  /* Always update havoc_stack_pow2 + queue_cycle + run_over10m (cheap scalars). */
-  u32 pow2 = afl->havoc_stack_pow2;
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_havoc_stack_pow2, &pow2, 4));
-  u32 qc = afl->queue_cycle;
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_queue_cycle, &qc, 4));
-  u32 over10m = afl->run_over10m ? 1u : 0u;
-  CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_run_over10m, &over10m, 4));
-
-  /* Opportunistic a_extras re-upload if cnt changed. */
-  if (afl->a_extras_cnt != ctx->a_extras_cnt_uploaded) {
-    /* For v1 we update the count but skip the actual bytes upload. a_extras
-     * slots remain empty so EXTRA_AUTO_* ops fall through retry. This avoids
-     * having to free-and-realloc device buffers every time cmplog finds a
-     * new extra; can be tightened in a follow-up if bench shows it matters. */
-    ctx->a_extras_cnt_uploaded = afl->a_extras_cnt;
-    u32 zero = 0;
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_a_extras_cnt, &zero, 4));
-  }
-}
-
 static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   coqui_ctx_t *ctx = afl->coqui;
   CUstream s = (CUstream)b->stream;
@@ -766,37 +425,13 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
 
-  /* HtoD slot_info — one u32 per thread encoding (flag, seed_idx). */
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_slot_info,
-                             b->h_slot_info, ctx->batch_size * 4, s));
-
-  /* Zero reported_count so compact-write starts fresh. __coqui_reported_count
-   * is a u32 counter (kernel atomicAdds on the module global directly), not
-   * a pointer slot — so we zero the module global directly, no HtoD rebind. */
-  CUCHECK(cuMemsetD32Async((CUdeviceptr)ctx->sym_reported_count, 0, 1, s));
-
-  /* Bind this batch's reported_tid/lens pointers into the module globals so
-   * the kernel's compact-report block writes to the correct side. */
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_tid,
-                             &b->d_reported_tid, 8, s));
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_lens,
-                             &b->d_reported_lens, 8, s));
-
-  /* Pick a fresh per-batch PRNG base. AFL's rand_below gives u32; combine
-   * two into u64. Thread-local PRNG state = splitmix64(prng_base ^ tid). */
-  u64 prng_base = (u64)rand_below(afl, 0xFFFFFFFFu)
-                | ((u64)rand_below(afl, 0xFFFFFFFFu) << 32);
-  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_prng_base, &prng_base, 8, s));
-
   /* Launch */
   void *args[] = {
     (void *)&b->d_input_bytes,
     (void *)&b->d_offsets,
     (void *)&b->d_input_lens,
-    (void *)&b->d_slot_info,    /* NEW */
     (void *)&b->d_novelty,
     (void *)&b->d_status,
-    (void *)&b->d_reported_slab, /* NEW */
   };
   unsigned grid = ctx->batch_size / 128;
   CUCHECK(cuLaunchKernel((CUfunction)ctx->cu_kernel,
@@ -809,20 +444,6 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                              ctx->batch_size / 8, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
                              ctx->batch_size * sizeof(coqui_status_t), s));
-
-  /* DtoH reported_count + full slab (we'll only read the populated prefix
-   * on the host). Overhead: ~2 MB per batch, acceptable. */
-  CUCHECK(cuMemcpyDtoHAsync(&b->h_reported_count,
-                             (CUdeviceptr)ctx->sym_reported_count, 4, s));
-  CUCHECK(cuMemcpyDtoHAsync(b->h_reported_slab,
-                             (CUdeviceptr)b->d_reported_slab,
-                             (size_t)COQUI_REPORTED_CAP * ctx->max_input_size, s));
-  CUCHECK(cuMemcpyDtoHAsync(b->h_reported_tid,
-                             (CUdeviceptr)b->d_reported_tid,
-                             COQUI_REPORTED_CAP * 4, s));
-  CUCHECK(cuMemcpyDtoHAsync(b->h_reported_lens,
-                             (CUdeviceptr)b->d_reported_lens,
-                             COQUI_REPORTED_CAP * 4, s));
 
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
@@ -1041,35 +662,6 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
-  /* Build tid → reported-slot map for flag=1 inputs.
-   * reported_count is the authoritative count after DtoH completed;
-   * cap at COQUI_REPORTED_CAP in case kernel over-reported (shouldn't). */
-  u32 rcount = b->h_reported_count;
-  if (rcount > COQUI_REPORTED_CAP) {
-    WARNF("coqui reported_count %u > CAP %u — some novel slots will be "
-          "unverified this batch", rcount, COQUI_REPORTED_CAP);
-    rcount = COQUI_REPORTED_CAP;
-  }
-  /* Small hash: 1024 buckets linear-probe over up to CAP (512) entries.
-   * Load factor ≤ 50% → fast probe. */
-  u32 tid2slot_keys[1024];
-  u32 tid2slot_vals[1024];
-  u8  tid2slot_used[1024];
-  memset(tid2slot_used, 0, sizeof(tid2slot_used));
-  for (u32 r = 0; r < rcount; ++r) {
-    u32 t = b->h_reported_tid[r];
-    u32 h = (t * 0x9E3779B1u) & 1023u;
-    for (u32 p = 0; p < 1024; ++p) {
-      u32 k = (h + p) & 1023u;
-      if (!tid2slot_used[k]) {
-        tid2slot_keys[k] = t;
-        tid2slot_vals[k] = r;
-        tid2slot_used[k] = 1;
-        break;
-      }
-    }
-  }
-
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
     u32 bits = ((u32 *)b->h_novelty)[word_i];
@@ -1077,30 +669,10 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       u32 bit_pos = __builtin_ctz(bits);
       bits &= bits - 1;
       u32 i = word_i * 32 + bit_pos;
+      if (b->h_input_lens[i] == 0) continue;
 
-      /* Dispatch on slot_info flag to find where the input bytes live. */
-      u32 slot_info = b->h_slot_info[i];
-      u8  flag      = (u8)(slot_info >> 24);
-      u8 *input;
-      u32 len;
-      if (flag == COQUI_FLAG_HAVOC) {
-        /* Look up reported slot for this tid. */
-        u32 h = (i * 0x9E3779B1u) & 1023u;
-        u32 slot = (u32)-1;
-        for (u32 p = 0; p < 1024; ++p) {
-          u32 k = (h + p) & 1023u;
-          if (!tid2slot_used[k]) break;        /* not present */
-          if (tid2slot_keys[k] == i) { slot = tid2slot_vals[k]; break; }
-        }
-        if (slot == (u32)-1) continue;         /* overflowed slab; skip */
-        input = b->h_reported_slab + slot * ctx->max_input_size;
-        len   = b->h_reported_lens[slot];
-      } else {
-        if (b->h_input_lens[i] == 0) continue;
-        input = b->h_input_bytes + b->h_offsets[i];
-        len   = b->h_input_lens[i];
-      }
-
+      u8 *input = b->h_input_bytes + b->h_offsets[i];
+      u32 len = b->h_input_lens[i];
       process_input_via_cpu_fsrv(afl, input, len);
     }
   }
@@ -1131,27 +703,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   memset(dedup_used,  0, sizeof(dedup_used));
 
   for (u32 i = 0; i < ctx->batch_size; i++) {
-    /* Dispatch on slot_info flag to find where the input bytes live. */
-    u32 slot_info = b->h_slot_info[i];
-    u8  flag = (u8)(slot_info >> 24);
-    u8 *input;
-    u32 len;
-    if (flag == COQUI_FLAG_HAVOC) {
-      u32 h = (i * 0x9E3779B1u) & 1023u;
-      u32 slot = (u32)-1;
-      for (u32 p = 0; p < 1024; ++p) {
-        u32 k = (h + p) & 1023u;
-        if (!tid2slot_used[k]) break;
-        if (tid2slot_keys[k] == i) { slot = tid2slot_vals[k]; break; }
-      }
-      if (slot == (u32)-1) continue;
-      input = b->h_reported_slab + slot * ctx->max_input_size;
-      len   = b->h_reported_lens[slot];
-    } else {
-      if (b->h_input_lens[i] == 0) continue;
-      input = b->h_input_bytes + b->h_offsets[i];
-      len   = b->h_input_lens[i];
-    }
+    if (b->h_input_lens[i] == 0) continue;
     u8 nov = (b->h_novelty[i / 8] >> (i % 8)) & 1;
     if (nov) continue;   /* already processed above */
 
@@ -1186,6 +738,8 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
 
     ctx->crash_verify_calls++;
+    u8 *input = b->h_input_bytes + b->h_offsets[i];
+    u32 len = b->h_input_lens[i];
     process_input_via_cpu_fsrv(afl, input, len);
   }
   #undef COQUI_CRASH_DEDUP_SLOTS
@@ -1257,37 +811,6 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
   return 0;
 }
 
-u8 coqui_submit_havoc_slot(afl_state_t *afl, u32 seed_idx, u8 flag) {
-  coqui_ctx_t  *ctx = afl->coqui;
-  coqui_batch_t *b  = ctx->pending;
-
-  ctx->total_submits++;
-  /* Count each submission as one exec, matching coqui_submit_input's convention. */
-  afl->fsrv.total_execs++;
-
-  if (b->n_inputs == ctx->batch_size) {
-    /* Batch full — launch + flip ping-pong. Same mechanics as coqui_submit_input. */
-    coqui_launch_batch(afl, b);
-    coqui_batch_t *tmp = ctx->pending;
-    ctx->pending = ctx->executing;
-    ctx->executing = tmp;
-    b = ctx->pending;
-    if (b->n_inputs > 0) {
-      if (coqui_await_and_process(afl, b) == 1) return 0;   /* force-reset path */
-      b->n_inputs = 0;
-      b->bytes_used = 0;
-    }
-  }
-
-  b->h_slot_info[b->n_inputs] = ((u32)flag << 24) | (seed_idx & 0xFFFFFFu);
-  /* offsets/lens default to 0 for flag=1 slots; kernel ignores them when
-   * flag != COQUI_FLAG_PREMUT. */
-  b->h_offsets[b->n_inputs] = 0;
-  b->h_input_lens[b->n_inputs] = 0;
-  b->n_inputs++;
-  return 0;
-}
-
 void coqui_flush_batch(afl_state_t *afl) {
   coqui_ctx_t *ctx = afl->coqui;
 
@@ -1340,15 +863,6 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (ctx->pong.h_novelty)     cuMemFreeHost(ctx->pong.h_novelty);
   if (ctx->pong.h_status)      cuMemFreeHost(ctx->pong.h_status);
 
-  if (ctx->ping.h_slot_info)     cuMemFreeHost(ctx->ping.h_slot_info);
-  if (ctx->ping.h_reported_slab) cuMemFreeHost(ctx->ping.h_reported_slab);
-  if (ctx->ping.h_reported_tid)  cuMemFreeHost(ctx->ping.h_reported_tid);
-  if (ctx->ping.h_reported_lens) cuMemFreeHost(ctx->ping.h_reported_lens);
-  if (ctx->pong.h_slot_info)     cuMemFreeHost(ctx->pong.h_slot_info);
-  if (ctx->pong.h_reported_slab) cuMemFreeHost(ctx->pong.h_reported_slab);
-  if (ctx->pong.h_reported_tid)  cuMemFreeHost(ctx->pong.h_reported_tid);
-  if (ctx->pong.h_reported_lens) cuMemFreeHost(ctx->pong.h_reported_lens);
-
   ck_free(ctx);
   afl->coqui = NULL;
 
@@ -1367,16 +881,6 @@ static void free_batch_half_cuda(coqui_batch_t *b) {
   if (b->d_input_lens)  cuMemFree((CUdeviceptr)b->d_input_lens);
   if (b->d_novelty)     cuMemFree((CUdeviceptr)b->d_novelty);
   if (b->d_status)      cuMemFree((CUdeviceptr)b->d_status);
-
-  if (b->h_slot_info)     cuMemFreeHost(b->h_slot_info);
-  if (b->h_reported_slab) cuMemFreeHost(b->h_reported_slab);
-  if (b->h_reported_tid)  cuMemFreeHost(b->h_reported_tid);
-  if (b->h_reported_lens) cuMemFreeHost(b->h_reported_lens);
-
-  if (b->d_slot_info)      cuMemFree((CUdeviceptr)b->d_slot_info);
-  if (b->d_reported_slab)  cuMemFree((CUdeviceptr)b->d_reported_slab);
-  if (b->d_reported_tid)   cuMemFree((CUdeviceptr)b->d_reported_tid);
-  if (b->d_reported_lens)  cuMemFree((CUdeviceptr)b->d_reported_lens);
 
   if (b->completion_event) cuEventDestroy((CUevent)b->completion_event);
 
