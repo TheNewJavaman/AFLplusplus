@@ -1039,6 +1039,35 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
+  /* Build tid → reported-slot map for flag=1 inputs.
+   * reported_count is the authoritative count after DtoH completed;
+   * cap at COQUI_REPORTED_CAP in case kernel over-reported (shouldn't). */
+  u32 rcount = b->h_reported_count;
+  if (rcount > COQUI_REPORTED_CAP) {
+    WARNF("coqui reported_count %u > CAP %u — some novel slots will be "
+          "unverified this batch", rcount, COQUI_REPORTED_CAP);
+    rcount = COQUI_REPORTED_CAP;
+  }
+  /* Small hash: 1024 buckets linear-probe over up to CAP (512) entries.
+   * Load factor ≤ 50% → fast probe. */
+  u32 tid2slot_keys[1024];
+  u32 tid2slot_vals[1024];
+  u8  tid2slot_used[1024];
+  memset(tid2slot_used, 0, sizeof(tid2slot_used));
+  for (u32 r = 0; r < rcount; ++r) {
+    u32 t = b->h_reported_tid[r];
+    u32 h = (t * 0x9E3779B1u) & 1023u;
+    for (u32 p = 0; p < 1024; ++p) {
+      u32 k = (h + p) & 1023u;
+      if (!tid2slot_used[k]) {
+        tid2slot_keys[k] = t;
+        tid2slot_vals[k] = r;
+        tid2slot_used[k] = 1;
+        break;
+      }
+    }
+  }
+
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
     u32 bits = ((u32 *)b->h_novelty)[word_i];
@@ -1046,10 +1075,30 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       u32 bit_pos = __builtin_ctz(bits);
       bits &= bits - 1;
       u32 i = word_i * 32 + bit_pos;
-      if (b->h_input_lens[i] == 0) continue;
 
-      u8 *input = b->h_input_bytes + b->h_offsets[i];
-      u32 len = b->h_input_lens[i];
+      /* Dispatch on slot_info flag to find where the input bytes live. */
+      u32 slot_info = b->h_slot_info[i];
+      u8  flag      = (u8)(slot_info >> 24);
+      u8 *input;
+      u32 len;
+      if (flag == COQUI_FLAG_HAVOC) {
+        /* Look up reported slot for this tid. */
+        u32 h = (i * 0x9E3779B1u) & 1023u;
+        u32 slot = (u32)-1;
+        for (u32 p = 0; p < 1024; ++p) {
+          u32 k = (h + p) & 1023u;
+          if (!tid2slot_used[k]) break;        /* not present */
+          if (tid2slot_keys[k] == i) { slot = tid2slot_vals[k]; break; }
+        }
+        if (slot == (u32)-1) continue;         /* overflowed slab; skip */
+        input = b->h_reported_slab + slot * ctx->max_input_size;
+        len   = b->h_reported_lens[slot];
+      } else {
+        if (b->h_input_lens[i] == 0) continue;
+        input = b->h_input_bytes + b->h_offsets[i];
+        len   = b->h_input_lens[i];
+      }
+
       process_input_via_cpu_fsrv(afl, input, len);
     }
   }
@@ -1080,7 +1129,27 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   memset(dedup_used,  0, sizeof(dedup_used));
 
   for (u32 i = 0; i < ctx->batch_size; i++) {
-    if (b->h_input_lens[i] == 0) continue;
+    /* Dispatch on slot_info flag to find where the input bytes live. */
+    u32 slot_info = b->h_slot_info[i];
+    u8  flag = (u8)(slot_info >> 24);
+    u8 *input;
+    u32 len;
+    if (flag == COQUI_FLAG_HAVOC) {
+      u32 h = (i * 0x9E3779B1u) & 1023u;
+      u32 slot = (u32)-1;
+      for (u32 p = 0; p < 1024; ++p) {
+        u32 k = (h + p) & 1023u;
+        if (!tid2slot_used[k]) break;
+        if (tid2slot_keys[k] == i) { slot = tid2slot_vals[k]; break; }
+      }
+      if (slot == (u32)-1) continue;
+      input = b->h_reported_slab + slot * ctx->max_input_size;
+      len   = b->h_reported_lens[slot];
+    } else {
+      if (b->h_input_lens[i] == 0) continue;
+      input = b->h_input_bytes + b->h_offsets[i];
+      len   = b->h_input_lens[i];
+    }
     u8 nov = (b->h_novelty[i / 8] >> (i % 8)) & 1;
     if (nov) continue;   /* already processed above */
 
@@ -1115,8 +1184,6 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
 
     ctx->crash_verify_calls++;
-    u8 *input = b->h_input_bytes + b->h_offsets[i];
-    u32 len = b->h_input_lens[i];
     process_input_via_cpu_fsrv(afl, input, len);
   }
   #undef COQUI_CRASH_DEDUP_SLOTS
