@@ -9,6 +9,13 @@
 #include "afl-fuzz.h"
 #include "afl-fuzz-coqui.h"
 #include "forkserver.h"
+/* Intentionally NOT including "afl-mutations.h": that header emits non-static
+ * array/function definitions (interesting_8/16/32, text_array, binary_array,
+ * afl_mutate, ...) into every translation unit that includes it. afl-fuzz-one.c
+ * already includes it; including it here too produces multiple-definition
+ * link errors under LTO. Task 2.4 (coqui_refresh_seed_pool) uses local
+ * `extern u32 binary_array[];` declarations at the point of use, per plan
+ * line 1613-1616. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -214,6 +221,15 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->byte_budget = (unsigned int)budget64;
   ctx->map_size = 65536;
 
+  /* Runtime bitcode was compiled with -DMAX_INPUT_SIZE=4096. Host-side
+   * max_length must not exceed this or kernel .local scratch will
+   * truncate mutated inputs. */
+  if (ctx->max_input_size > 4096) {
+    FATAL("coqui_mode: afl->max_length (%u) > MAX_INPUT_SIZE (4096). "
+          "Rebuild target cubin with -DMAX_INPUT_SIZE=%u.",
+          ctx->max_input_size, ctx->max_input_size);
+  }
+
   /* 7. Create streams */
   CUstream sa, sb;
   CUCHECK(cuStreamCreate(&sa, CU_STREAM_NON_BLOCKING));
@@ -221,9 +237,133 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->stream_a = (void *)sa;
   ctx->stream_b = (void *)sb;
 
+  CUstream sp;
+  CUCHECK(cuStreamCreate(&sp, CU_STREAM_NON_BLOCKING));
+  ctx->stream_pool = (void *)sp;
+
   /* 8. Allocate ping-pong pair */
   alloc_batch_half_cuda(&ctx->ping, ctx, sa);
   alloc_batch_half_cuda(&ctx->pong, ctx, sb);
+
+  /* Seed pool: 1 MB per side, capacity 256 slots. Packed (variable-length). */
+  ctx->seed_pool_cap_bytes = 1024u * 1024u;
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_bytes_a,   ctx->seed_pool_cap_bytes, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_bytes_b,   ctx->seed_pool_cap_bytes, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_offsets_a, 256 * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_offsets_b, 256 * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_lens_a,    256 * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_lens_b,    256 * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_cumw_a,    256 * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&ctx->h_seed_pool_cumw_b,    256 * 4, 0));
+
+  {
+    CUdeviceptr dp;
+    CUCHECK(cuMemAlloc(&dp, ctx->seed_pool_cap_bytes));
+    ctx->d_seed_pool_bytes_a = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, ctx->seed_pool_cap_bytes));
+    ctx->d_seed_pool_bytes_b = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_offsets_a = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_offsets_b = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_lens_a    = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_lens_b    = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_cumw_a    = (unsigned long long)dp;
+    CUCHECK(cuMemAlloc(&dp, 256 * 4)); ctx->d_seed_pool_cumw_b    = (unsigned long long)dp;
+  }
+
+  ctx->seed_pool_active = 0;
+
+  /* Resolve the 21 module-level globals that the GPU havoc runtime reads.
+   * All live as extern declarations in coqui_mode/runtime/coqui_runtime.h
+   * and are populated either here (once at init) or by coqui_refresh_seed_pool
+   * (per queue_cur) or coqui_launch_batch (per batch). */
+  #define BIND_SYM(field, name, expected_sz) do {                               \
+    CUdeviceptr _sp; size_t _sz;                                                \
+    CUCHECK(cuModuleGetGlobal(&_sp, &_sz, mod, name));                          \
+    if (_sz != (expected_sz)) FATAL(name " size %zu != %zu", _sz, (size_t)(expected_sz));\
+    ctx->field = (unsigned long long)_sp;                                       \
+  } while(0)
+
+  BIND_SYM(sym_seed_pool_base,       "__coqui_seed_pool_base",       sizeof(void*));
+  BIND_SYM(sym_seed_pool_offsets,    "__coqui_seed_pool_offsets",    sizeof(void*));
+  BIND_SYM(sym_seed_pool_lens,       "__coqui_seed_pool_lens",       sizeof(void*));
+  BIND_SYM(sym_seed_pool_cumw,       "__coqui_seed_pool_cumw",       sizeof(void*));
+  BIND_SYM(sym_seed_pool_count,      "__coqui_seed_pool_count",      4);
+  BIND_SYM(sym_seed_pool_cumw_total, "__coqui_seed_pool_cumw_total", 4);
+  BIND_SYM(sym_prng_base,            "__coqui_prng_base",            8);
+  BIND_SYM(sym_reported_count,       "__coqui_reported_count",       4);
+  BIND_SYM(sym_reported_tid,         "__coqui_reported_tid",         sizeof(void*));
+  BIND_SYM(sym_reported_lens,        "__coqui_reported_lens",        sizeof(void*));
+  BIND_SYM(sym_mutation_array,       "__coqui_mutation_array",       256 * 4);
+  BIND_SYM(sym_mutation_array_size,  "__coqui_mutation_array_size",  4);
+  BIND_SYM(sym_havoc_stack_pow2,     "__coqui_havoc_stack_pow2",     4);
+  BIND_SYM(sym_queue_cycle,          "__coqui_queue_cycle",          4);
+  BIND_SYM(sym_run_over10m,          "__coqui_run_over10m",          4);
+  BIND_SYM(sym_extras_base,          "__coqui_extras_base",          sizeof(void*));
+  BIND_SYM(sym_extras_offsets,       "__coqui_extras_offsets",       sizeof(void*));
+  BIND_SYM(sym_extras_lens,          "__coqui_extras_lens",          sizeof(void*));
+  BIND_SYM(sym_extras_cnt,           "__coqui_extras_cnt",           4);
+  BIND_SYM(sym_a_extras_base,        "__coqui_a_extras_base",        sizeof(void*));
+  BIND_SYM(sym_a_extras_offsets,     "__coqui_a_extras_offsets",     sizeof(void*));
+  BIND_SYM(sym_a_extras_lens,        "__coqui_a_extras_lens",        sizeof(void*));
+  BIND_SYM(sym_a_extras_cnt,         "__coqui_a_extras_cnt",         4);
+  #undef BIND_SYM
+
+  /* Initialize uploaded-version counters so first refresh detects the change. */
+  ctx->extras_cnt_uploaded = 0;
+  ctx->a_extras_cnt_uploaded = 0;
+  ctx->mut_array_uploaded = 0;
+
+  if (afl->extras_cnt > 0) {
+    /* Compute packed byte total */
+    size_t total = 0;
+    for (u32 i = 0; i < afl->extras_cnt; ++i) total += afl->extras[i].len;
+    CUdeviceptr p_ex; CUCHECK(cuMemAlloc(&p_ex, total ? total : 1));
+    ctx->d_extras_base = (unsigned long long)p_ex;
+
+    u32 *off_h = ck_alloc(afl->extras_cnt * 4);
+    u32 *len_h = ck_alloc(afl->extras_cnt * 4);
+    u8  *pak   = ck_alloc(total ? total : 1);
+    size_t cur = 0;
+    for (u32 i = 0; i < afl->extras_cnt; ++i) {
+      off_h[i] = (u32)cur;
+      len_h[i] = (u32)afl->extras[i].len;
+      if (afl->extras[i].len > 0) {
+        memcpy(pak + cur, afl->extras[i].data, afl->extras[i].len);
+      }
+      cur += afl->extras[i].len;
+    }
+    if (total > 0) {
+      CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->d_extras_base, pak, total));
+    }
+
+    CUdeviceptr p_off; CUCHECK(cuMemAlloc(&p_off, afl->extras_cnt * 4));
+    CUCHECK(cuMemcpyHtoD(p_off, off_h, afl->extras_cnt * 4));
+    ctx->d_extras_offsets = (unsigned long long)p_off;
+
+    CUdeviceptr p_len; CUCHECK(cuMemAlloc(&p_len, afl->extras_cnt * 4));
+    CUCHECK(cuMemcpyHtoD(p_len, len_h, afl->extras_cnt * 4));
+    ctx->d_extras_lens = (unsigned long long)p_len;
+
+    /* Bind pointer symbols */
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_base,    &ctx->d_extras_base,    8));
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_offsets, &ctx->d_extras_offsets, 8));
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_lens,    &ctx->d_extras_lens,    8));
+    u32 cnt = afl->extras_cnt;
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_cnt, &cnt, 4));
+    ctx->extras_cnt_uploaded = cnt;
+
+    ck_free(off_h); ck_free(len_h); ck_free(pak);
+  } else {
+    u32 zero = 0;
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_extras_cnt, &zero, 4));
+  }
+
+  /* a_extras starts empty; host writes 0 to sym so kernel sees safe state. */
+  {
+    u32 zero = 0;
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_a_extras_cnt, &zero, 4));
+  }
+
   ctx->pending   = &ctx->ping;
   ctx->executing = &ctx->pong;
 
