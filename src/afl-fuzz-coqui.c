@@ -764,13 +764,37 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
 
+  /* HtoD slot_info — one u32 per thread encoding (flag, seed_idx). */
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_slot_info,
+                             b->h_slot_info, ctx->batch_size * 4, s));
+
+  /* Zero reported_count so compact-write starts fresh. */
+  CUCHECK(cuMemsetD32Async((CUdeviceptr)b->d_reported_count, 0, 1, s));
+
+  /* Bind this batch's reported_tid/lens pointers into the module globals so
+   * the kernel's compact-report block writes to the correct side. */
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_count,
+                             &b->d_reported_count, 8, s));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_tid,
+                             &b->d_reported_tid, 8, s));
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_reported_lens,
+                             &b->d_reported_lens, 8, s));
+
+  /* Pick a fresh per-batch PRNG base. AFL's rand_below gives u32; combine
+   * two into u64. Thread-local PRNG state = splitmix64(prng_base ^ tid). */
+  u64 prng_base = (u64)rand_below(afl, 0xFFFFFFFFu)
+                | ((u64)rand_below(afl, 0xFFFFFFFFu) << 32);
+  CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->sym_prng_base, &prng_base, 8, s));
+
   /* Launch */
   void *args[] = {
     (void *)&b->d_input_bytes,
     (void *)&b->d_offsets,
     (void *)&b->d_input_lens,
+    (void *)&b->d_slot_info,    /* NEW */
     (void *)&b->d_novelty,
     (void *)&b->d_status,
+    (void *)&b->d_reported_slab, /* NEW */
   };
   unsigned grid = ctx->batch_size / 128;
   CUCHECK(cuLaunchKernel((CUfunction)ctx->cu_kernel,
@@ -783,6 +807,20 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                              ctx->batch_size / 8, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
                              ctx->batch_size * sizeof(coqui_status_t), s));
+
+  /* DtoH reported_count + full slab (we'll only read the populated prefix
+   * on the host). Overhead: ~2 MB per batch, acceptable. */
+  CUCHECK(cuMemcpyDtoHAsync(&b->h_reported_count,
+                             (CUdeviceptr)b->d_reported_count, 4, s));
+  CUCHECK(cuMemcpyDtoHAsync(b->h_reported_slab,
+                             (CUdeviceptr)b->d_reported_slab,
+                             (size_t)COQUI_REPORTED_CAP * ctx->max_input_size, s));
+  CUCHECK(cuMemcpyDtoHAsync(b->h_reported_tid,
+                             (CUdeviceptr)b->d_reported_tid,
+                             COQUI_REPORTED_CAP * 4, s));
+  CUCHECK(cuMemcpyDtoHAsync(b->h_reported_lens,
+                             (CUdeviceptr)b->d_reported_lens,
+                             COQUI_REPORTED_CAP * 4, s));
 
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
@@ -1147,6 +1185,37 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
   b->h_input_lens[b->n_inputs] = len;
   b->n_inputs++;
   b->bytes_used = off + len;
+  return 0;
+}
+
+u8 coqui_submit_havoc_slot(afl_state_t *afl, u32 seed_idx, u8 flag) {
+  coqui_ctx_t  *ctx = afl->coqui;
+  coqui_batch_t *b  = ctx->pending;
+
+  ctx->total_submits++;
+  /* Count each submission as one exec, matching coqui_submit_input's convention. */
+  afl->fsrv.total_execs++;
+
+  if (b->n_inputs == ctx->batch_size) {
+    /* Batch full — launch + flip ping-pong. Same mechanics as coqui_submit_input. */
+    coqui_launch_batch(afl, b);
+    coqui_batch_t *tmp = ctx->pending;
+    ctx->pending = ctx->executing;
+    ctx->executing = tmp;
+    b = ctx->pending;
+    if (b->n_inputs > 0) {
+      if (coqui_await_and_process(afl, b) == 1) return 0;   /* force-reset path */
+      b->n_inputs = 0;
+      b->bytes_used = 0;
+    }
+  }
+
+  b->h_slot_info[b->n_inputs] = ((u32)flag << 24) | (seed_idx & 0xFFFFFFu);
+  /* offsets/lens default to 0 for flag=1 slots; kernel ignores them when
+   * flag != COQUI_FLAG_PREMUT. */
+  b->h_offsets[b->n_inputs] = 0;
+  b->h_input_lens[b->n_inputs] = 0;
+  b->n_inputs++;
   return 0;
 }
 
