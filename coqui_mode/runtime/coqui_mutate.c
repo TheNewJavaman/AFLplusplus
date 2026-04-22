@@ -602,7 +602,7 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         {
           u64 absval;
           int is_neg = 0;
-          if (val < 0) { is_neg = 1; absval = (u64)(-val); }
+          if (val < 0) { is_neg = 1; absval = (u64)0 - (u64)val; }
           else          { absval = (u64)val; }
           u8 rev[20];
           u32 nrev = 0;
