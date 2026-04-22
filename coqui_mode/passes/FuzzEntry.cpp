@@ -57,7 +57,6 @@ bool runFuzzEntry(Module &M) {
   Value *noveltyArg      = &*argIt++; noveltyArg->setName("novelty");
   Value *statusArg       = &*argIt++; statusArg->setName("status");
   Value *reportedSlabArg = &*argIt++; reportedSlabArg->setName("reported_slab");
-  (void)reportedSlabArg;  /* used by compact-report block in Task 2.8 */
 
   /* 3. Declare / look up helpers */
   FunctionType *VoidNoArg = FunctionType::get(voidT, false);
@@ -134,6 +133,29 @@ bool runFuzzEntry(Module &M) {
     PrngBaseG = new GlobalVariable(
       M, i64, /*isConstant*/false, GlobalValue::ExternalLinkage,
       nullptr, "__coqui_prng_base");
+  }
+
+  /* Compact-report externs: __coqui_reported_count is a u32 counter, and
+   * __coqui_reported_tid / __coqui_reported_lens are pointers to u32 arrays
+   * (indexed by slot). Written by the kernel, read by the host after the
+   * batch completes. */
+  GlobalVariable *ReportedCountG = M.getGlobalVariable("__coqui_reported_count", true);
+  if (!ReportedCountG) {
+    ReportedCountG = new GlobalVariable(
+      M, i32, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_reported_count");
+  }
+  GlobalVariable *ReportedTidPtrG = M.getGlobalVariable("__coqui_reported_tid", true);
+  if (!ReportedTidPtrG) {
+    ReportedTidPtrG = new GlobalVariable(
+      M, i32p, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_reported_tid");
+  }
+  GlobalVariable *ReportedLensPtrG = M.getGlobalVariable("__coqui_reported_lens", true);
+  if (!ReportedLensPtrG) {
+    ReportedLensPtrG = new GlobalVariable(
+      M, i32p, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_reported_lens");
   }
 
   /* __coqui_havoc_mutate: u32(u8*, u32, u32, u32, u64*) */
@@ -350,6 +372,93 @@ bool runFuzzEntry(Module &M) {
   /* PHASE_COMPLETE = 6 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 6)});
 
+  /* Compact-report block: if thread set novelty OR recorded a crash, atomically
+   * allocate a slot in the reporting slab and write scratch/tid/mutated_len. */
+
+  BasicBlock *CheckReportBB = BasicBlock::Create(C, "check_report", Kernel);
+  BasicBlock *ReportBB      = BasicBlock::Create(C, "report", Kernel);
+  BasicBlock *DoWriteBB     = BasicBlock::Create(C, "do_write", Kernel);
+  BasicBlock *PostReportBB  = BasicBlock::Create(C, "post_report", Kernel);
+
+  Builder.CreateBr(CheckReportBB);
+  Builder.SetInsertPoint(CheckReportBB);
+
+  /* Novelty bit: 1 bit per thread, byte index = tid/8, bit = tid%8. */
+  Value *novWordIdx   = Builder.CreateLShr(tid, ConstantInt::get(i32, 3), "nov_word_idx");
+  Value *novWordIdx64 = Builder.CreateZExt(novWordIdx, i64, "nov_word_idx64");
+  Value *novBytePtr   = Builder.CreateGEP(i8, noveltyArg, {novWordIdx64}, "nov_byte_ptr");
+  Value *novByte      = Builder.CreateLoad(i8, novBytePtr, "nov_byte");
+  Value *bitPos       = Builder.CreateTrunc(
+                           Builder.CreateAnd(tid, ConstantInt::get(i32, 7)),
+                           i8, "bit_pos");
+  Value *novMask = Builder.CreateShl(ConstantInt::get(i8, 1), bitPos, "nov_mask");
+  Value *novSet  = Builder.CreateICmpNE(
+                      Builder.CreateAnd(novByte, novMask),
+                      ConstantInt::get(i8, 0), "nov_is_set");
+
+  /* Crash: status[tid].signal | .asan_error | .ubsan_fatal. The status struct
+   * is 16 bytes; field layout (matching coqui_status_t):
+   *   byte 0: phase
+   *   byte 1: signal
+   *   byte 2: asan_error
+   *   byte 3: ubsan_fatal
+   *   bytes 4-7: crash_sig
+   *   bytes 8-15: _reserved1
+   * Compute slot base = status + tid*16, then read bytes 1, 2, 3. */
+  Value *statusTid64_r = Builder.CreateZExt(tid, i64, "stat_tid64_r");
+  Value *statusSlotR = Builder.CreateGEP(i8, statusArg,
+                          {Builder.CreateMul(statusTid64_r, ConstantInt::get(i64, 16))},
+                          "status_slot_r");
+  Value *sigByte = Builder.CreateLoad(i8,
+                     Builder.CreateGEP(i8, statusSlotR, {ConstantInt::get(i64, 1)}),
+                     "sig_byte");
+  Value *asanByte = Builder.CreateLoad(i8,
+                     Builder.CreateGEP(i8, statusSlotR, {ConstantInt::get(i64, 2)}),
+                     "asan_byte");
+  Value *ubsanByte = Builder.CreateLoad(i8,
+                     Builder.CreateGEP(i8, statusSlotR, {ConstantInt::get(i64, 3)}),
+                     "ubsan_byte");
+  Value *crashAny = Builder.CreateOr(
+                     Builder.CreateOr(sigByte, asanByte), ubsanByte, "crash_any");
+  Value *crashSet = Builder.CreateICmpNE(crashAny, ConstantInt::get(i8, 0), "crash_is_set");
+
+  Value *shouldReport = Builder.CreateOr(novSet, crashSet, "should_report");
+  Builder.CreateCondBr(shouldReport, ReportBB, PostReportBB);
+
+  /* ReportBB: atomicAdd(&__coqui_reported_count, 1); check slot < 512. */
+  Builder.SetInsertPoint(ReportBB);
+  Value *reportSlot = Builder.CreateAtomicRMW(
+    AtomicRMWInst::Add, ReportedCountG, ConstantInt::get(i32, 1),
+    MaybeAlign(4), AtomicOrdering::Monotonic);
+
+  Value *cap    = ConstantInt::get(i32, 512);
+  Value *slotOk = Builder.CreateICmpULT(reportSlot, cap, "slot_ok");
+  Builder.CreateCondBr(slotOk, DoWriteBB, PostReportBB);
+
+  /* DoWriteBB: write tid, len, and scratch bytes. */
+  Builder.SetInsertPoint(DoWriteBB);
+
+  /* reported_tid[slot] = tid */
+  Value *reportedTidBase = Builder.CreateLoad(i32p, ReportedTidPtrG, "rep_tid_base");
+  Value *tidSlot = Builder.CreateGEP(i32, reportedTidBase, {reportSlot}, "rep_tid_slot");
+  Builder.CreateStore(tid, tidSlot);
+
+  /* reported_lens[slot] = (u32)lenPhi */
+  Value *reportedLensBase = Builder.CreateLoad(i32p, ReportedLensPtrG, "rep_lens_base");
+  Value *lensSlot = Builder.CreateGEP(i32, reportedLensBase, {reportSlot}, "rep_lens_slot");
+  Value *lenI32 = Builder.CreateTrunc(lenPhi, i32, "len_i32");
+  Builder.CreateStore(lenI32, lensSlot);
+
+  /* memcpy(reported_slab + slot * 4096, inputPtrPhi, lenPhi) */
+  Value *slot64     = Builder.CreateZExt(reportSlot, i64, "slot64");
+  Value *slabOffset = Builder.CreateMul(slot64, ConstantInt::get(i64, 4096), "slab_off");
+  Value *slabDstPtr = Builder.CreateGEP(i8, reportedSlabArg, {slabOffset}, "slab_dst");
+  Builder.CreateCall(MemcpyFn,
+                      {slabDstPtr, inputPtrPhi, lenPhi, ConstantInt::getFalse(C)});
+
+  Builder.CreateBr(PostReportBB);
+
+  Builder.SetInsertPoint(PostReportBB);
   Builder.CreateBr(ExitBB);
 
   Builder.SetInsertPoint(ExitBB);
