@@ -74,24 +74,26 @@ static inline u32 gpu_rand_below(u64 *prng, u32 n) {
 }
 
 /* ------------------------------------------------------------------------
- * Weighted splice partner selection.
+ * Splice partner selection.
  *
- * CPU precomputes prefix-sum weights into __coqui_seed_pool_cumw[].
- * We binary-search for the slot with cumw[slot] first exceeding the draw.
- * On lo == self_idx, return SELF_SAME; caller retries the op.
+ * Host pre-selects the 256-entry seed pool by weight, so uniform picking
+ * within the pool yields the same statistical "weighted subset" AFL gets
+ * from weighted queue scheduling. AFL's havoc splice (afl-fuzz-one.c:3371)
+ * rejects (tid == current_entry) and (target->len < 4); we mirror that by
+ * rejecting self_idx and pool entries shorter than 4 bytes. Bounded retry
+ * (32 tries) avoids infinite loops when no valid partner exists.
  * ------------------------------------------------------------------------*/
 
 static inline u32 weighted_splice_pick(u64 *prng, u32 self_idx) {
   u32 n = __coqui_seed_pool_count;
-  if (n == 0) return COQUI_SPLICE_SELF_SAME;
-  u32 r = gpu_rand_below(prng, __coqui_seed_pool_cumw_total);
-  u32 lo = 0, hi = n;
-  while (lo < hi) {
-    u32 m = (lo + hi) >> 1;
-    if (__coqui_seed_pool_cumw[m] <= r) lo = m + 1; else hi = m;
+  if (n <= 1) return COQUI_SPLICE_SELF_SAME;
+  for (u32 tries = 0; tries < 32; ++tries) {
+    u32 p = gpu_rand_below(prng, n);
+    if (p == self_idx) continue;
+    if (__coqui_seed_pool_lens[p] < 4) continue;
+    return p;
   }
-  if (lo >= n) lo = n - 1;   /* defensive: should not happen with correct CDF */
-  return (lo == self_idx) ? COQUI_SPLICE_SELF_SAME : lo;
+  return COQUI_SPLICE_SELF_SAME;
 }
 
 /* ------------------------------------------------------------------------
@@ -677,11 +679,119 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         break;
       }
 
-      /* Bucket 3 ops — filled in by task 1.8 */
-      case MUT_EXTRA_OVERWRITE: case MUT_EXTRA_INSERT:
-      case MUT_AUTO_EXTRA_OVERWRITE: case MUT_AUTO_EXTRA_INSERT:
-      case MUT_SPLICE_OVERWRITE: case MUT_SPLICE_INSERT:
-        goto retry_havoc_step;  /* placeholder; fill in task 1.8 */
+      /* ---------- Bucket 3: port of src/afl-fuzz-one.c:3231-3499 ---------- */
+
+      case MUT_EXTRA_OVERWRITE: {
+        /* AFL line 3231. */
+        if (__coqui_extras_cnt == 0) goto retry_havoc_step;
+        u32 use_extra = gpu_rand_below(prng, __coqui_extras_cnt);
+        u32 extra_len = __coqui_extras_lens[use_extra];
+        if (extra_len > len) goto retry_havoc_step;
+        u32 insert_at = gpu_rand_below(prng, len - extra_len + 1);
+        u32 e_off = __coqui_extras_offsets[use_extra];
+        for (u32 i = 0; i < extra_len; ++i) {
+          buf[insert_at + i] = __coqui_extras_base[e_off + i];
+        }
+        break;
+      }
+
+      case MUT_EXTRA_INSERT: {
+        /* AFL line 3254. Adapt MAX_FILE guard to max_len; clip extra_len
+         * if it would overflow max_len (conservative: retry if full extra
+         * doesn't fit). */
+        if (__coqui_extras_cnt == 0) goto retry_havoc_step;
+        u32 use_extra = gpu_rand_below(prng, __coqui_extras_cnt);
+        u32 extra_len = __coqui_extras_lens[use_extra];
+        if (len + extra_len >= max_len) goto retry_havoc_step;
+        u32 insert_at = gpu_rand_below(prng, len + 1);
+        u32 e_off = __coqui_extras_offsets[use_extra];
+        /* Shift tail right by extra_len to make room. */
+        for (u32 i = len; i > insert_at; --i) buf[i - 1 + extra_len] = buf[i - 1];
+        /* Insert extras bytes. */
+        for (u32 i = 0; i < extra_len; ++i) {
+          buf[insert_at + i] = __coqui_extras_base[e_off + i];
+        }
+        len += extra_len;
+        break;
+      }
+
+      case MUT_AUTO_EXTRA_OVERWRITE: {
+        /* AFL line 3300. */
+        if (__coqui_a_extras_cnt == 0) goto retry_havoc_step;
+        u32 use_extra = gpu_rand_below(prng, __coqui_a_extras_cnt);
+        u32 extra_len = __coqui_a_extras_lens[use_extra];
+        if (extra_len > len) goto retry_havoc_step;
+        u32 insert_at = gpu_rand_below(prng, len - extra_len + 1);
+        u32 e_off = __coqui_a_extras_offsets[use_extra];
+        for (u32 i = 0; i < extra_len; ++i) {
+          buf[insert_at + i] = __coqui_a_extras_base[e_off + i];
+        }
+        break;
+      }
+
+      case MUT_AUTO_EXTRA_INSERT: {
+        /* AFL line 3323. Same shape as EXTRA_INSERT but uses a_extras. */
+        if (__coqui_a_extras_cnt == 0) goto retry_havoc_step;
+        u32 use_extra = gpu_rand_below(prng, __coqui_a_extras_cnt);
+        u32 extra_len = __coqui_a_extras_lens[use_extra];
+        if (len + extra_len >= max_len) goto retry_havoc_step;
+        u32 insert_at = gpu_rand_below(prng, len + 1);
+        u32 e_off = __coqui_a_extras_offsets[use_extra];
+        for (u32 i = len; i > insert_at; --i) buf[i - 1 + extra_len] = buf[i - 1];
+        for (u32 i = 0; i < extra_len; ++i) {
+          buf[insert_at + i] = __coqui_a_extras_base[e_off + i];
+        }
+        len += extra_len;
+        break;
+      }
+
+      case MUT_SPLICE_OVERWRITE: {
+        /* AFL line 3369. Pick a partner (uniform within pool, reject self
+         * and len < 4). copy_len = choose_block_len(new_len - 1), clipped to
+         * local len. memmove-style copy — but source is seed_pool (separate
+         * region), destination is scratch — no aliasing. */
+        u32 partner = weighted_splice_pick(prng, self_idx);
+        if (partner == COQUI_SPLICE_SELF_SAME) goto retry_havoc_step;
+        u32 new_len = __coqui_seed_pool_lens[partner];
+        u32 p_off   = __coqui_seed_pool_offsets[partner];
+        /* new_len >= 4 guaranteed by partner selection guard. */
+        u32 copy_len = choose_block_len(prng, new_len - 1);
+        if (copy_len > len) copy_len = len;
+        u32 copy_from = gpu_rand_below(prng, new_len - copy_len + 1);
+        u32 copy_to   = gpu_rand_below(prng, len - copy_len + 1);
+        for (u32 i = 0; i < copy_len; ++i) {
+          buf[copy_to + i] = __coqui_seed_pool_base[p_off + copy_from + i];
+        }
+        break;
+      }
+
+      case MUT_SPLICE_INSERT: {
+        /* AFL line 3415. Pick partner, clone_len = choose_block_len(new_len),
+         * clone_from random in partner, clone_to random in local, grow local.
+         * AFL's `temp_len + HAVOC_BLK_XL >= MAX_FILE` guard adapts to GPU:
+         * since max_len is small (~4KB), simplify to "can we grow at all?" */
+        u32 partner = weighted_splice_pick(prng, self_idx);
+        if (partner == COQUI_SPLICE_SELF_SAME) goto retry_havoc_step;
+        if (len + 1 >= max_len) goto retry_havoc_step;
+        u32 new_len = __coqui_seed_pool_lens[partner];
+        u32 p_off   = __coqui_seed_pool_offsets[partner];
+        /* new_len >= 4 guaranteed. */
+        u32 clone_len = choose_block_len(prng, new_len);
+        /* Clip to fit within max_len. */
+        if (clone_len > max_len - len - 1) clone_len = max_len - len - 1;
+        if (clone_len == 0) goto retry_havoc_step;
+        u32 clone_from = gpu_rand_below(prng, new_len - clone_len + 1);
+        u32 clone_to   = gpu_rand_below(prng, len + 1);
+        /* Shift local tail right. */
+        for (u32 i = len; i > clone_to; --i) buf[i - 1 + clone_len] = buf[i - 1];
+        /* Insert from partner. Partner is in seed_pool (separate memory),
+         * so no aliasing with our scratch buffer. */
+        for (u32 i = 0; i < clone_len; ++i) {
+          buf[clone_to + i] = __coqui_seed_pool_base[p_off + clone_from + i];
+        }
+        len += clone_len;
+        break;
+      }
 
       default:
         goto retry_havoc_step;  /* unknown op code — retry */
