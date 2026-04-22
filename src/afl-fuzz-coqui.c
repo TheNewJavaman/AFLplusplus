@@ -66,6 +66,27 @@ static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
   CUCHECK(cuMemAlloc(&p, ctx->batch_size * sizeof(coqui_status_t)));
   b->d_status = (unsigned long long)p;
 
+  /* slot_info — host pinned + device mirror. u32 per thread. */
+  CUCHECK(cuMemHostAlloc((void**)&b->h_slot_info, ctx->batch_size * 4, 0));
+  CUCHECK(cuMemAlloc(&p, ctx->batch_size * 4));
+  b->d_slot_info = (unsigned long long)p;
+
+  /* reported_slab + metadata — compact output for novel/crash threads.
+   * REPORTED_CAP * max_input_size bytes on host pinned and device. */
+  size_t slab_bytes = (size_t)COQUI_REPORTED_CAP * ctx->max_input_size;
+  CUCHECK(cuMemHostAlloc((void**)&b->h_reported_slab, slab_bytes, 0));
+  CUCHECK(cuMemHostAlloc((void**)&b->h_reported_tid,  COQUI_REPORTED_CAP * 4, 0));
+  CUCHECK(cuMemHostAlloc((void**)&b->h_reported_lens, COQUI_REPORTED_CAP * 4, 0));
+  CUCHECK(cuMemAlloc(&p, slab_bytes));
+  b->d_reported_slab = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, COQUI_REPORTED_CAP * 4));
+  b->d_reported_tid  = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, COQUI_REPORTED_CAP * 4));
+  b->d_reported_lens = (unsigned long long)p;
+  CUCHECK(cuMemAlloc(&p, 4));
+  b->d_reported_count = (unsigned long long)p;
+  b->h_reported_count = 0;
+
   b->stream = (void *)stream;
   CUevent ev;
   CUCHECK(cuEventCreate(&ev, CU_EVENT_DEFAULT));
@@ -863,6 +884,15 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (ctx->pong.h_novelty)     cuMemFreeHost(ctx->pong.h_novelty);
   if (ctx->pong.h_status)      cuMemFreeHost(ctx->pong.h_status);
 
+  if (ctx->ping.h_slot_info)     cuMemFreeHost(ctx->ping.h_slot_info);
+  if (ctx->ping.h_reported_slab) cuMemFreeHost(ctx->ping.h_reported_slab);
+  if (ctx->ping.h_reported_tid)  cuMemFreeHost(ctx->ping.h_reported_tid);
+  if (ctx->ping.h_reported_lens) cuMemFreeHost(ctx->ping.h_reported_lens);
+  if (ctx->pong.h_slot_info)     cuMemFreeHost(ctx->pong.h_slot_info);
+  if (ctx->pong.h_reported_slab) cuMemFreeHost(ctx->pong.h_reported_slab);
+  if (ctx->pong.h_reported_tid)  cuMemFreeHost(ctx->pong.h_reported_tid);
+  if (ctx->pong.h_reported_lens) cuMemFreeHost(ctx->pong.h_reported_lens);
+
   ck_free(ctx);
   afl->coqui = NULL;
 
@@ -881,6 +911,17 @@ static void free_batch_half_cuda(coqui_batch_t *b) {
   if (b->d_input_lens)  cuMemFree((CUdeviceptr)b->d_input_lens);
   if (b->d_novelty)     cuMemFree((CUdeviceptr)b->d_novelty);
   if (b->d_status)      cuMemFree((CUdeviceptr)b->d_status);
+
+  if (b->h_slot_info)     cuMemFreeHost(b->h_slot_info);
+  if (b->h_reported_slab) cuMemFreeHost(b->h_reported_slab);
+  if (b->h_reported_tid)  cuMemFreeHost(b->h_reported_tid);
+  if (b->h_reported_lens) cuMemFreeHost(b->h_reported_lens);
+
+  if (b->d_slot_info)      cuMemFree((CUdeviceptr)b->d_slot_info);
+  if (b->d_reported_slab)  cuMemFree((CUdeviceptr)b->d_reported_slab);
+  if (b->d_reported_tid)   cuMemFree((CUdeviceptr)b->d_reported_tid);
+  if (b->d_reported_lens)  cuMemFree((CUdeviceptr)b->d_reported_lens);
+  if (b->d_reported_count) cuMemFree((CUdeviceptr)b->d_reported_count);
 
   if (b->completion_event) cuEventDestroy((CUevent)b->completion_event);
 
