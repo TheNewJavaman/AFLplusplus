@@ -598,7 +598,7 @@ void coqui_refresh_seed_pool(afl_state_t *afl) {
     dst_offsets[0] = cursor;
     dst_lens[0]    = afl->queue_cur->len;
     cursor += afl->queue_cur->len;
-    cumw_total += (u64)afl->queue_cur->weight;
+    cumw_total += (u64)(afl->queue_cur->weight * 1000.0);
     dst_cumw[0] = (u32)cumw_total;
     count = 1;
   } else {
@@ -622,7 +622,7 @@ void coqui_refresh_seed_pool(afl_state_t *afl) {
     u64 total = 0;
     for (u32 i = 0; i < Q; ++i) {
       struct queue_entry *q = afl->queue_buf[i];
-      u64 w = (q && !q->disabled) ? (u64)q->weight : 0;
+      u64 w = (q && !q->disabled) ? (u64)(q->weight * 1000.0) : 0;
       total += w;
       cdf[i] = total;
     }
@@ -644,7 +644,7 @@ void coqui_refresh_seed_pool(afl_state_t *afl) {
         dst_offsets[slot] = cursor;
         dst_lens[slot]    = q->len;
         cursor += q->len;
-        cumw_total += (u64)q->weight;
+        cumw_total += (u64)(q->weight * 1000.0);
         dst_cumw[slot] = (u32)cumw_total;
         count++;
       }
@@ -684,8 +684,9 @@ void coqui_refresh_seed_pool(afl_state_t *afl) {
   if (!ctx->mut_array_uploaded ||
       ctx->mut_array_input_mode != afl->input_mode ||
       ctx->mut_array_fuzz_mode  != afl->fuzz_mode) {
-    u32 *active = binary_array;   /* default/generic exploration */
-    u32  size   = COQUI_MUT_BIN_ARRAY_SIZE;
+    /* Mutation-array selection matches src/afl-fuzz-one.c:2180-2233. */
+    u32 *active;
+    u32  size;
     if (afl->input_mode == 1 /* TEXT */) {
       if (afl->fuzz_mode == 0) { active = binary_array; size = COQUI_MUT_BIN_ARRAY_SIZE; }
       else                     { active = text_array;   size = COQUI_MUT_TXT_ARRAY_SIZE; }
@@ -694,8 +695,16 @@ void coqui_refresh_seed_pool(afl_state_t *afl) {
                                   size   = COQUI_MUT_STRATEGY_ARRAY_SIZE; }
       else                     { active = mutation_strategy_exploitation_binary;
                                   size   = COQUI_MUT_STRATEGY_ARRAY_SIZE; }
+    } else {
+      /* DEFAULT / generic */
+      if (afl->fuzz_mode == 0) { active = binary_array; size = COQUI_MUT_BIN_ARRAY_SIZE; }
+      else                     { active = text_array;   size = COQUI_MUT_TXT_ARRAY_SIZE; }
     }
-    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array,      active, 256 * 4));
+    /* Zero the device-side array first so unused slots (beyond `size`) don't
+     * carry stale data if a later mode switch has a smaller array. */
+    u32 zero256[256] = {0};
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array, zero256, 256 * 4));
+    CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array, active,  size * 4));
     CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->sym_mutation_array_size, &size, 4));
     ctx->mut_array_input_mode = afl->input_mode;
     ctx->mut_array_fuzz_mode  = afl->fuzz_mode;
