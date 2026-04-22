@@ -122,7 +122,13 @@ enum {
 
 static inline u32 choose_block_len(u64 *prng, u32 limit) {
   u32 min_value, max_value;
-  u32 r = gpu_rand_below(prng, 3);
+  /* Port of include/afl-mutations.h:1760-1793.
+   * rlim = MIN(queue_cycle, 3); if (!run_over10m) rlim = 1 — early in the
+   * run we only pick the small-block tier, same as AFL. */
+  u32 rlim = __coqui_queue_cycle < 3u ? __coqui_queue_cycle : 3u;
+  if (!__coqui_run_over10m) rlim = 1;
+  if (rlim == 0) rlim = 1;  /* defensive against queue_cycle=0 early boot */
+  u32 r = gpu_rand_below(prng, rlim);
   if (r == 0) { min_value = 1;            max_value = HAVOC_BLK_SMALL;   }
   else if (r == 1) { min_value = HAVOC_BLK_SMALL; max_value = HAVOC_BLK_MEDIUM; }
   else {

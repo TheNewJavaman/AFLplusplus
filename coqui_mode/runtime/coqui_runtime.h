@@ -183,6 +183,12 @@ extern __attribute__((address_space(4))) u32 __coqui_havoc_stack_pow2;
 /* Per-batch randomness base. Thread-local PRNG is splitmix64(base ^ tid). */
 extern u64 __coqui_prng_base;
 
+/* AFL state fields mirrored to device for fidelity of choose_block_len.
+ * queue_cycle: afl->queue_cycle (u32). run_over10m: afl->run_over10m (u8-as-u32).
+ * Re-uploaded by host in coqui_refresh_seed_pool (cheap; both are 4B). */
+extern u32 __coqui_queue_cycle;
+extern u32 __coqui_run_over10m;
+
 /* Compact-report counter (atomically bumped by kernel novelty/crash path). */
 extern u32 __coqui_reported_count;
 extern u32 *__coqui_reported_tid;    /* length COQUI_REPORTED_CAP */
