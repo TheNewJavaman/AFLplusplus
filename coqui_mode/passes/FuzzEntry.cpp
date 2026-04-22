@@ -105,6 +105,47 @@ bool runFuzzEntry(Module &M) {
       "llvm.nvvm.read.ptx.sreg.clock64",
       FunctionType::get(i64, false));
 
+  /* 4c. Havoc-path runtime externs: seed pool pointers, PRNG base, mutate fn.
+   * These are defined in coqui_mutate.c and bound to the kernel module by the
+   * host via cuModuleGetGlobal at module-load time. */
+  PointerType *i32p = PointerType::get(C, 0);   /* opaque i32 pointer */
+  PointerType *i64p = PointerType::get(C, 0);   /* opaque i64 pointer (prng state) */
+
+  GlobalVariable *SeedPoolBase = M.getGlobalVariable("__coqui_seed_pool_base", true);
+  if (!SeedPoolBase) {
+    SeedPoolBase = new GlobalVariable(
+      M, i8p, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_seed_pool_base");
+  }
+  GlobalVariable *SeedPoolOffsets = M.getGlobalVariable("__coqui_seed_pool_offsets", true);
+  if (!SeedPoolOffsets) {
+    SeedPoolOffsets = new GlobalVariable(
+      M, i32p, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_seed_pool_offsets");
+  }
+  GlobalVariable *SeedPoolLens = M.getGlobalVariable("__coqui_seed_pool_lens", true);
+  if (!SeedPoolLens) {
+    SeedPoolLens = new GlobalVariable(
+      M, i32p, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_seed_pool_lens");
+  }
+  GlobalVariable *PrngBaseG = M.getGlobalVariable("__coqui_prng_base", true);
+  if (!PrngBaseG) {
+    PrngBaseG = new GlobalVariable(
+      M, i64, /*isConstant*/false, GlobalValue::ExternalLinkage,
+      nullptr, "__coqui_prng_base");
+  }
+
+  /* __coqui_havoc_mutate: u32(u8*, u32, u32, u32, u64*) */
+  FunctionType *MutateTy = FunctionType::get(
+      i32, {i8p, i32, i32, i32, i64p}, false);
+  FunctionCallee MutateFn = M.getOrInsertFunction("__coqui_havoc_mutate", MutateTy);
+
+  /* llvm.memcpy intrinsic --- p0.p0.i64 variant */
+  FunctionType *MemcpyTy = FunctionType::get(
+      voidT, {i8p, i8p, i64, Type::getInt1Ty(C)}, false);
+  FunctionCallee MemcpyFn = M.getOrInsertFunction("llvm.memcpy.p0.p0.i64", MemcpyTy);
+
   /* 5. __coqui_status_array pointer global (runtime will read this) */
   GlobalVariable *StatusArrayPtr = M.getGlobalVariable("__coqui_status_array", true);
   if (!StatusArrayPtr) {
@@ -131,7 +172,6 @@ bool runFuzzEntry(Module &M) {
   Value *slot    = Builder.CreateLoad(i32, slotPtr, "slot");
   Value *flagV   = Builder.CreateLShr(slot, ConstantInt::get(i32, 24), "flag");
   Value *idxV    = Builder.CreateAnd(slot, ConstantInt::get(i32, 0xFFFFFF), "seed_idx");
-  (void)idxV;  /* seed_idx consumed by havoc path in Task 2.7 */
 
   /* Create flag-dispatch blocks. */
   BasicBlock *PremutBB        = BasicBlock::Create(C, "premut", Kernel);
@@ -163,19 +203,75 @@ bool runFuzzEntry(Module &M) {
   Value *pm_len64    = Builder.CreateZExt(pm_len, i64, "pm_len64");
   Builder.CreateBr(RunBB);
 
-  /* HAVOC path — empty body for this task. Task 2.7 fills it. For now just
-   * jump to exit so the kernel still runs (flag=1 slots become no-ops). */
+  /* HAVOC path --- look up seed in pool, copy to .local scratch, call
+   * __coqui_havoc_mutate, join RunBB with (scratch, mutated_len). */
   Builder.SetInsertPoint(HavocBB);
-  Builder.CreateBr(ExitBB);
+
+  /* base_len = __coqui_seed_pool_lens[seed_idx] */
+  Value *poolLensBase = Builder.CreateLoad(i32p, SeedPoolLens, "pool_lens_base");
+  Value *baseLenPtr   = Builder.CreateGEP(i32, poolLensBase, {idxV}, "base_len_ptr");
+  Value *baseLen      = Builder.CreateLoad(i32, baseLenPtr, "base_len");
+  Value *baseLenIsZero = Builder.CreateICmpEQ(baseLen, ConstantInt::get(i32, 0));
+
+  BasicBlock *HavocContBB = BasicBlock::Create(C, "havoc_cont", Kernel);
+  Builder.CreateCondBr(baseLenIsZero, ExitBB, HavocContBB);
+
+  Builder.SetInsertPoint(HavocContBB);
+
+  /* scratch: alloca [4096 x i8] --- compile-time-sized .local stack array. */
+  ArrayType *ScratchTy = ArrayType::get(i8, 4096);
+  AllocaInst *Scratch = Builder.CreateAlloca(ScratchTy, nullptr, "scratch");
+  Value *scratchPtr = Builder.CreateGEP(
+      ScratchTy, Scratch,
+      {ConstantInt::get(i32, 0), ConstantInt::get(i32, 0)},
+      "scratch_ptr");
+
+  /* src = seed_pool_base + seed_pool_offsets[seed_idx] */
+  Value *poolOffsetsBase = Builder.CreateLoad(i32p, SeedPoolOffsets, "pool_off_base");
+  Value *seedOffPtr = Builder.CreateGEP(i32, poolOffsetsBase, {idxV}, "seed_off_ptr");
+  Value *seedOff    = Builder.CreateLoad(i32, seedOffPtr, "seed_off");
+  Value *seedOff64  = Builder.CreateZExt(seedOff, i64, "seed_off64");
+  Value *poolBasePtr = Builder.CreateLoad(i8p, SeedPoolBase, "pool_base_ptr");
+  Value *srcPtr = Builder.CreateGEP(i8, poolBasePtr, {seedOff64}, "seed_src");
+
+  /* memcpy(scratch, src, base_len, isVolatile=false) */
+  Value *baseLen64 = Builder.CreateZExt(baseLen, i64, "base_len64");
+  Builder.CreateCall(MemcpyFn,
+                      {scratchPtr, srcPtr, baseLen64, ConstantInt::getFalse(C)});
+
+  /* prng state: alloca u64 on stack; init to (prng_base XOR tid) */
+  AllocaInst *PrngSlot = Builder.CreateAlloca(i64, nullptr, "prng_state");
+  Value *prngBaseV = Builder.CreateLoad(i64, PrngBaseG, "prng_base_v");
+  Value *tid64 = Builder.CreateZExt(tid, i64, "tid64_prng");
+  Value *prngInit = Builder.CreateXor(prngBaseV, tid64, "prng_init");
+  Builder.CreateStore(prngInit, PrngSlot);
+
+  /* mutated_len = __coqui_havoc_mutate(scratch, base_len, 4096, seed_idx, &prng) */
+  Value *maxLen = ConstantInt::get(i32, 4096);
+  Value *mutLen = Builder.CreateCall(MutateFn,
+      {scratchPtr, baseLen, maxLen, idxV, PrngSlot}, "mut_len");
+
+  Value *mutLen64 = Builder.CreateZExt(mutLen, i64, "mut_len64");
 
   /* RunBB: existing body, but with PHIs at the top merging the two paths.
-   * Capacity hint is 2 (premut + havoc) but only 1 incoming today since
-   * HavocBB branches to ExitBB; Task 2.7 will add the havoc incoming. */
+   * Two incomings: PremutContBB (flag=0 path) and HavocContBB (flag=1 path
+   * after seed lookup, memcpy to .local scratch, and havoc mutate). */
   Builder.SetInsertPoint(RunBB);
   PHINode *inputPtrPhi = Builder.CreatePHI(i8p, 2, "input_ptr");
   PHINode *lenPhi      = Builder.CreatePHI(i64, 2, "len");
   inputPtrPhi->addIncoming(pm_inputPtr, PremutContBB);
   lenPhi->addIncoming(pm_len64, PremutContBB);
+  inputPtrPhi->addIncoming(scratchPtr, HavocContBB);
+  lenPhi->addIncoming(mutLen64, HavocContBB);
+
+  /* Terminate HavocContBB by branching to RunBB (PHIs above merge both
+   * predecessors). Insert at end of HavocContBB --- the builder was previously
+   * pointing there while we emitted the havoc body. */
+  Builder.SetInsertPoint(HavocContBB);
+  Builder.CreateBr(RunBB);
+
+  /* Return builder to RunBB for the remaining instrumented body. */
+  Builder.SetInsertPoint(RunBB);
 
   /* PHASE_START = 1 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 1)});
