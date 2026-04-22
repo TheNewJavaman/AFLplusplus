@@ -216,7 +216,18 @@ u32 __coqui_havoc_mutate(u8 *buf, u32 len, u32 max_len,
         buf[pos + 3] = (u8)(v & 0xFF);
         break;
       }
-      case MUT_ARITH8_: case MUT_ARITH8:
+      case MUT_ARITH8_: {
+        u32 off = gpu_rand_below(prng, len);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        buf[off] = (u8)(buf[off] - item);
+        break;
+      }
+      case MUT_ARITH8: {
+        u32 off = gpu_rand_below(prng, len);
+        u32 item = 1 + gpu_rand_below(prng, ARITH_MAX);
+        buf[off] = (u8)(buf[off] + item);
+        break;
+      }
       case MUT_ARITH16_: case MUT_ARITH16BE_:
       case MUT_ARITH16: case MUT_ARITH16BE:
       case MUT_ARITH32_: case MUT_ARITH32BE_:
