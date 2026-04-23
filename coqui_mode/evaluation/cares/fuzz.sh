@@ -1,64 +1,64 @@
 #!/usr/bin/env bash
-#
-# Launch coqui mode (coqui_mode) on the c-ares DNS parser fuzz target.
-#
-# Pass-through: any args to this script are forwarded to afl-fuzz, so you can
-# append the usual flags, e.g.:
-#
-#   ./fuzz.sh               # fuzz forever
-#   ./fuzz.sh -V 120        # stop after 120s (useful for benchmarks)
-#   ./fuzz.sh -x ./dict/dns.dict
-#
-# Requires: ./build.sh has been run successfully.
+# fuzz.sh — prep the coqui mode cares fuzz workspace + print suggested
+# launch commands. Does NOT exec afl-fuzz; user picks Main/Secondary/Coqui.
 
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$HERE"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-HARNESS="cares_parse_reply_fuzzer"
-CUBIN="$HERE/$HARNESS.cubin"
-CPU_BIN="$HERE/${HARNESS}_cpu"
-SEEDS="$HERE/seeds"
-OUT="$HERE/out"
+AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
+CUBIN="${SCRIPT_DIR}/cares_parse_reply_fuzzer.cubin"
+CPU_BIN="${SCRIPT_DIR}/cares_parse_reply_fuzzer_cpu"
+SEEDS="${SCRIPT_DIR}/seeds"
+OUTDIR="${SCRIPT_DIR}/out"
+AFL_DEVICE="${AFL_COQUI_DEVICE:-0}"
 
-AFL_FUZZ="${AFL_FUZZ:-$HERE/../../../afl-fuzz}"
-
-# --- Sanity checks -----------------------------------------------------------
-
-[ -x "$AFL_FUZZ" ]   || { echo "error: $AFL_FUZZ not found or not executable" >&2; exit 1; }
-[ -f "$CUBIN" ]      || { echo "error: missing $CUBIN (run ./build.sh first)" >&2; exit 1; }
-[ -x "$CPU_BIN" ]    || { echo "error: missing $CPU_BIN (run ./build.sh first)" >&2; exit 1; }
-[ -d "$SEEDS" ]      || { echo "error: missing $SEEDS (run ./build.sh first)" >&2; exit 1; }
-
-# --- AFL++ env vars ----------------------------------------------------------
-
-export AFL_COQUI_CUBIN="$CUBIN"
-export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
-export AFL_SKIP_CPUFREQ=1
-export AFL_SKIP_BIN_CHECK=1
-export AFL_NO_UI="${AFL_NO_UI:-1}"
-
-# Auto-select a dict only if the user didn't already pass -x.
-extra_args=()
-for a in "$@"; do
-  if [ "$a" = "-x" ]; then
-    has_x=1
-    break
+# Pre-flight
+for f in "$CUBIN" "$CPU_BIN" "$SEEDS"; do
+  if [ ! -e "$f" ]; then
+    echo "ERROR: missing $f -- run ./build.sh first." >&2
+    exit 1
   fi
 done
-if [ -z "${has_x:-}" ] && [ -f "$HERE/dict/dns.dict" ]; then
-  extra_args+=(-x "$HERE/dict/dns.dict")
+
+# Output dir
+if [ "${AFL_RESUME:-0}" = "1" ] && [ -d "$OUTDIR" ]; then
+  echo "[fuzz] will reuse existing $OUTDIR (AFL_RESUME=1)"
+else
+  rm -rf "$OUTDIR"
+  mkdir -p "$OUTDIR"
 fi
 
-echo "[cares/fuzz] AFL_COQUI_CUBIN=$AFL_COQUI_CUBIN"
-echo "[cares/fuzz] launching: $AFL_FUZZ --coqui gpu0 -i $SEEDS -o $OUT ${extra_args[*]:-} $* -- $CPU_BIN"
-echo ""
 
-exec "$AFL_FUZZ" \
-  --coqui gpu0 \
-  -i "$SEEDS" \
-  -o "$OUT" \
-  "${extra_args[@]}" \
-  "$@" \
-  -- "$CPU_BIN"
+echo "==============================================================="
+echo "  coqui mode cares fuzz workspace ready"
+echo "  cubin:  $CUBIN"
+echo "  cpu:    $CPU_BIN"
+echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) files)"
+echo "  out:    $OUTDIR"
+
+echo "==============================================================="
+
+cat <<INNEREOF
+
+# 1. Set environment once (or prefix each command):
+export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\
+       AFL_SKIP_CPUFREQ=1 \\
+       AFL_SKIP_BIN_CHECK=1 \\
+       AFL_NO_UI=1 \\
+       AFL_COQUI_CUBIN=$CUBIN \\
+       AFL_COQUI_DEVICE=$AFL_DEVICE
+
+# 2. Pick ONE instance to launch:
+
+# Main (CPU master):
+$AFL_FUZZ -M main -i $SEEDS -o $OUTDIR -- $CPU_BIN
+
+# Secondary (CPU parallel fuzzer; repeat with sec2/sec3/... for more):
+$AFL_FUZZ -S sec1 -i $SEEDS -o $OUTDIR -- $CPU_BIN
+
+# Coqui (GPU-backed fuzzer, device $AFL_DEVICE):
+$AFL_FUZZ --coqui gpu$AFL_DEVICE -i $SEEDS -o $OUTDIR -- $CPU_BIN
+
+INNEREOF

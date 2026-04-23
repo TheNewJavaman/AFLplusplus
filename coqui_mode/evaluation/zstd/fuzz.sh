@@ -1,41 +1,64 @@
 #!/usr/bin/env bash
-# fuzz.sh — launch coqui mode afl-fuzz --coqui on the zstd target.
-#
-# Prereq: run ./build.sh first (produces zstd_simple_decompress_fuzzer.{cubin,conf},
-# _cpu, seeds/).
-#
-# Extra args are passed through to afl-fuzz, e.g.:
-#   ./fuzz.sh -V 60        # stop after 60 seconds
-#   ./fuzz.sh -M main      # run as main sync node
+# fuzz.sh — prep the coqui mode zstd fuzz workspace + print suggested
+# launch commands. Does NOT exec afl-fuzz; user picks Main/Secondary/Coqui.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
-HARNESS_NAME="zstd_simple_decompress_fuzzer"
+CUBIN="${SCRIPT_DIR}/zstd_simple_decompress_fuzzer.cubin"
+CPU_BIN="${SCRIPT_DIR}/zstd_simple_decompress_fuzzer_cpu"
+SEEDS="${SCRIPT_DIR}/seeds"
+OUTDIR="${SCRIPT_DIR}/out"
+AFL_DEVICE="${AFL_COQUI_DEVICE:-0}"
 
-for f in "${HARNESS_NAME}.cubin" "${HARNESS_NAME}.conf" "${HARNESS_NAME}_cpu" seeds; do
-  if [[ ! -e "${f}" ]]; then
-    echo "ERROR: ${f} not found; run ./build.sh first" >&2
+# Pre-flight
+for f in "$CUBIN" "$CPU_BIN" "$SEEDS"; do
+  if [ ! -e "$f" ]; then
+    echo "ERROR: missing $f -- run ./build.sh first." >&2
     exit 1
   fi
 done
 
-# coqui mode env:
-#   AFL_COQUI_CUBIN              — absolute path to the sm_75 cubin
-#   AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 — suppress core-dump warning
-#   AFL_SKIP_CPUFREQ=1           — don't gate on CPU freq governor
-#   AFL_SKIP_BIN_CHECK=1         — don't re-check the instrumented binary
-#   AFL_NO_UI=1                  — line-oriented status for logs / tmux-safe
-export AFL_COQUI_CUBIN="${SCRIPT_DIR}/${HARNESS_NAME}.cubin"
-export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
-export AFL_SKIP_CPUFREQ=1
-export AFL_SKIP_BIN_CHECK=1
-export AFL_NO_UI=1
+# Output dir
+if [ "${AFL_RESUME:-0}" = "1" ] && [ -d "$OUTDIR" ]; then
+  echo "[fuzz] will reuse existing $OUTDIR (AFL_RESUME=1)"
+else
+  rm -rf "$OUTDIR"
+  mkdir -p "$OUTDIR"
+fi
 
-exec "${AFL_FUZZ}" --coqui gpu0 \
-  -i ./seeds \
-  -o ./out \
-  "$@" \
-  -- "./${HARNESS_NAME}_cpu"
+
+echo "==============================================================="
+echo "  coqui mode zstd fuzz workspace ready"
+echo "  cubin:  $CUBIN"
+echo "  cpu:    $CPU_BIN"
+echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) files)"
+echo "  out:    $OUTDIR"
+
+echo "==============================================================="
+
+cat <<INNEREOF
+
+# 1. Set environment once (or prefix each command):
+export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\
+       AFL_SKIP_CPUFREQ=1 \\
+       AFL_SKIP_BIN_CHECK=1 \\
+       AFL_NO_UI=1 \\
+       AFL_COQUI_CUBIN=$CUBIN \\
+       AFL_COQUI_DEVICE=$AFL_DEVICE
+
+# 2. Pick ONE instance to launch:
+
+# Main (CPU master):
+$AFL_FUZZ -M main -i $SEEDS -o $OUTDIR -- $CPU_BIN
+
+# Secondary (CPU parallel fuzzer; repeat with sec2/sec3/... for more):
+$AFL_FUZZ -S sec1 -i $SEEDS -o $OUTDIR -- $CPU_BIN
+
+# Coqui (GPU-backed fuzzer, device $AFL_DEVICE):
+$AFL_FUZZ --coqui gpu$AFL_DEVICE -i $SEEDS -o $OUTDIR -- $CPU_BIN
+
+INNEREOF
