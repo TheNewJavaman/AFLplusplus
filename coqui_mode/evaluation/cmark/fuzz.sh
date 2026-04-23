@@ -15,7 +15,7 @@ CPU_BIN="$SCRIPT_DIR/${HARNESS}_cpu"
 SEEDS="$SCRIPT_DIR/seeds"
 OUT="$SCRIPT_DIR/out"
 
-AFL_FUZZ="/home/gpizarro/cuAFL/afl-fuzz"
+AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
 
 # Sanity.
 for f in "$CUBIN" "$CPU_BIN" "$SEEDS"; do
