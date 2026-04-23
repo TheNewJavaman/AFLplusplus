@@ -163,7 +163,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
    *    Layout (per spec §4.2):
    *      [coverage 64 KB][heap H][shadow H/8][real stack S]
    *      where H = (total - 64K - S) * 8/9 and shadow = H/8 */
-  unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 32768);
+  unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 65536);
   unsigned int cov = 65536;
   if (stack_size + cov >= total_budget) {
     FATAL("--stack-size %u + 64KB coverage >= total_budget %u",

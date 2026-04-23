@@ -1,0 +1,19 @@
+# Build artifacts
+cjson_fuzzer
+cjson_fuzzer.cubin
+cjson_fuzzer.conf
+cjson_fuzzer.ptx
+.cjson_fuzzer.build/
+
+# Symlinks pointing into /tmp/cuafl-cjson-cpu or /nix/store
+cjson_fuzzer_cpu
+seeds
+dict
+
+# afl-fuzz runtime output
+out/
+out-*/
+
+# Editor/OS junk
+*.swp
+.DS_Store

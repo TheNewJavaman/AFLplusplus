@@ -1,0 +1,25 @@
+# Build artifacts emitted by coqui-cc
+libjpeg_turbo_decompress_fuzzer
+libjpeg_turbo_decompress_fuzzer.cubin
+libjpeg_turbo_decompress_fuzzer.conf
+libjpeg_turbo_decompress_fuzzer.ptx
+.libjpeg_turbo_decompress_fuzzer.build/
+
+# Patched jpeg source tree staged for coqui-cc
+jpeg_include/
+
+# Symlinks into /tmp/cuafl-libjpeg-turbo-cpu or /nix/store
+libjpeg_turbo_decompress_fuzzer_cpu
+seeds
+dict
+
+# afl-fuzz runtime output
+out/
+out-*/
+
+# Build logs (e.g. ./build.sh 2>&1 | tee build.log)
+build.log
+
+# Editor/OS junk
+*.swp
+.DS_Store

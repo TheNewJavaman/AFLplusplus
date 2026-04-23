@@ -1,0 +1,26 @@
+# Build outputs
+bzip2_fuzzer
+bzip2_fuzzer.cubin
+bzip2_fuzzer.conf
+bzip2_fuzzer_cpu
+bzip2_fuzzer.ptx
+bzip2_fuzzer.bc
+
+# Build-output seed copies + symlinks into /nix/store
+seeds/
+dict
+
+# Fuzzer outputs
+out/
+
+# coqui-cc intermediate dir
+.bzip2_fuzzer.build/
+.build/
+.cache/
+
+# Generic
+*.cubin
+*.conf
+*.ptx
+*.bc
+*_cpu

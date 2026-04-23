@@ -1,0 +1,11 @@
+# Build outputs
+*.cubin
+*.conf
+stb_image_read_fuzzer_cpu
+
+# Symlinks to nix store
+/seeds
+/dict
+
+# afl-fuzz output
+/out/

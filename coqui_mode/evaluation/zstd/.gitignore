@@ -1,0 +1,27 @@
+# Build artifacts
+zstd_simple_decompress_fuzzer
+zstd_simple_decompress_fuzzer.cubin
+zstd_simple_decompress_fuzzer.conf
+zstd_simple_decompress_fuzzer.ptx
+zstd_simple_decompress_fuzzer.bc
+.zstd_simple_decompress_fuzzer.build/
+
+# Symlinks pointing into /tmp/cuafl-zstd-cpu or /nix/store
+zstd_simple_decompress_fuzzer_cpu
+seeds
+dict
+
+# afl-fuzz runtime output
+out/
+out-*/
+
+# Generic
+*.cubin
+*.conf
+*.ptx
+*.bc
+*_cpu
+
+# Editor/OS junk
+*.swp
+.DS_Store

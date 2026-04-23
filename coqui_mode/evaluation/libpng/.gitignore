@@ -1,0 +1,28 @@
+# Build outputs
+libpng_read_fuzzer
+libpng_read_fuzzer.cubin
+libpng_read_fuzzer.conf
+libpng_read_fuzzer.ptx
+libpng_read_fuzzer.bc
+
+# Symlinks into /tmp/cuafl-libpng-cpu or /nix/store
+libpng_read_fuzzer_cpu
+seeds
+dict
+
+# Staged headers (generated from /nix/store/*-source at build time)
+libpng_include/
+
+# afl-fuzz runtime output
+out/
+out-*/
+
+# Build caches + logs
+.build/
+.cache/
+.libpng_read_fuzzer.build/
+build.log
+
+# Editor/OS junk
+*.swp
+.DS_Store
