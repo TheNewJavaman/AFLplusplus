@@ -30,7 +30,7 @@ cd "$HERE"
 # --- Fixed paths --------------------------------------------------------
 COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC=/usr/local/bin/coqui-cc
-ARCH=sm_75
+ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768
 SLAB_POOL_SIZE=0          # cjson.nix does not set a slab pool
 

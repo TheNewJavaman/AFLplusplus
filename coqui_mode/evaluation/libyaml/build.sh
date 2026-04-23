@@ -40,7 +40,7 @@ COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libyaml-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
-ARCH="sm_75"
+ARCH="${ARCH:-sm_75}"
 
 echo "=== [1/5] Build AFL++ CPU binary via nix ==="
 # Idempotent: `nix build` is a no-op if the derivation is already realised.

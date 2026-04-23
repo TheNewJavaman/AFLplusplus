@@ -18,7 +18,7 @@ cd "$SCRIPT_DIR"
 COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 HARNESS="cmark_fuzzer"
-ARCH="sm_75"
+ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768      # coqui-cc default; cmark's nix spec doesn't override
 SLAB_POOL_SIZE=0      # cmark's nix spec doesn't set --slab-pool-size
 

@@ -23,6 +23,7 @@ HARNESS="cares_parse_reply_fuzzer"
 COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
 COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 CPU_OUT_LINK="${CPU_OUT_LINK:-/tmp/coqui-cares-cpu}"
+ARCH="${ARCH:-sm_75}"
 
 command -v "$COQUI_CC" >/dev/null || {
   echo "error: coqui-cc not found at $COQUI_CC" >&2
@@ -187,7 +188,7 @@ echo "[cares/build] compiling $HARNESS.cubin with coqui-cc..."
 S="$CARES_SRC/src/lib"
 
 "$COQUI_CC" \
-  -arch sm_75 \
+  -arch "${ARCH}" \
   --slab-pool-size 10737418240 \
   -I "$CARES_SRC/include" \
   -I "$CARES_SRC/src/lib" \

@@ -42,7 +42,7 @@ COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libjpeg-turbo-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
-ARCH="sm_75"
+ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768            # coqui-cc default; matches nix spec (no override)
 SLAB_POOL_SIZE=0            # libjpeg-turbo.nix does not set a slab pool
 

@@ -35,7 +35,7 @@ COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libpng-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
-ARCH="sm_75"
+ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768          # libpng+zlib call chains exceed 8KB hardware stack
 SLAB_POOL_SIZE=2147483648 # 2 GiB — matches libpng.nix
 
