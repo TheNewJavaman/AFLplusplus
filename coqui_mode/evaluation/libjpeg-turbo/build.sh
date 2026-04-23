@@ -9,7 +9,7 @@
 #   seeds/                                 — seed corpus (symlink to nix store)
 #   dict/                                  — jpeg marker dictionary (nix store)
 #
-# Mirrors /home/gpizarro/coqui/nix/targets/libjpeg-turbo.nix exactly:
+# Mirrors the `libjpeg-turbo` target in the legacy coqui codebase exactly:
 #   - libjpeg-turbo 3.0.4, 20 baseline-only .c files (no arithmetic coding,
 #     no progressive, no block smoothing, no IDCT scaling, no color quant,
 #     no upsample merging, no save markers, no input smoothing, no 12/16-bit)
@@ -38,7 +38,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libjpeg-turbo-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"

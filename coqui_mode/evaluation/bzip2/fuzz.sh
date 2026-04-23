@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-AFL_FUZZ="/home/gpizarro/cuAFL/afl-fuzz"
+AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
 
 for f in bzip2_fuzzer.cubin bzip2_fuzzer.conf bzip2_fuzzer_cpu seeds; do
   if [[ ! -e "${f}" ]]; then

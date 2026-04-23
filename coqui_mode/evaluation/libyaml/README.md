@@ -4,7 +4,7 @@ Fuzz target adapting coqui's **libyaml 0.2.5** (parser-only) benchmark for the
 coqui mode `--coqui` mode runner.
 
 Mirrors the nix spec at
-`/home/gpizarro/coqui/nix/targets/libyaml.nix`, producing a self-contained
+the `libyaml` target in the legacy coqui codebase, producing a self-contained
 build+fuzz workflow that does not require the coqui nix wrapper at fuzz time.
 
 ## Layout
@@ -53,7 +53,7 @@ Steps (mirrors `nix/targets/libyaml.nix` + `nix/cpu-target-specs.nix::libyaml`):
 ./fuzz.sh -M main        # main sync node
 ```
 
-Sets these env vars before exec'ing `/home/gpizarro/cuAFL/afl-fuzz --coqui gpu0`:
+Sets these env vars before exec'ing `./afl-fuzz --coqui gpu0`:
 - `AFL_COQUI_CUBIN=$(pwd)/libyaml_parser_fuzzer.cubin`
 - `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`
 - `AFL_SKIP_CPUFREQ=1`
@@ -124,8 +124,8 @@ no contention; longer when multiple evaluation builds run in parallel).
 
 ## Provenance
 
-- GPU build flags: `/home/gpizarro/coqui/nix/targets/libyaml.nix`
-- CPU build flags: `/home/gpizarro/coqui/nix/cpu-target-specs.nix::libyaml`
-- Upstream harness: `/home/gpizarro/coqui/harness/targets/libyaml_parser_fuzzer.c`
+- GPU build flags: the `libyaml` target in the legacy coqui codebase
+- CPU build flags: the `libyaml` entry in legacy coqui's cpu-target-specs
+- Upstream harness: the `libyaml_parser_fuzzer` harness from the legacy coqui codebase
 - coqui mode coqui-cc driver: `/usr/local/bin/coqui-cc`
-- coqui mode afl-fuzz binary: `/home/gpizarro/cuAFL/afl-fuzz`
+- coqui mode afl-fuzz binary: `./afl-fuzz`

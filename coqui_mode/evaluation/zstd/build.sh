@@ -17,7 +17,7 @@
 #   dict/                               — symlink to the upstream zstd
 #                                         dictionary.
 #
-# Mirrors /home/gpizarro/coqui/nix/targets/zstd.nix exactly for the GPU sources,
+# Mirrors the `zstd` target in the legacy coqui codebase exactly for the GPU sources,
 # -I, -D. The CPU binary is supplied by the `target-zstd-aflplusplus` package
 # from the coqui flake.
 #
@@ -32,7 +32,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${HERE}"
 
 # --- Fixed paths --------------------------------------------------------
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 ARCH="sm_75"
 STACK_SIZE=32768        # coqui-cc default (zstd.nix does not override)
@@ -88,7 +88,7 @@ if [[ ! -f "${ABORT_STUB}" ]]; then
 fi
 
 # --- Step 4: compile the GPU cubin via coqui-cc -------------------------
-# Flags mirror /home/gpizarro/coqui/nix/targets/zstd.nix:
+# Flags mirror the `zstd` target in the legacy coqui codebase:
 #   -I <zstd src>/lib                   — zstd.h, zstd_errors.h
 #   -I <zstd src>/lib/common            — error_private.h, mem.h, etc.
 #   -I <zstd src>/lib/decompress        — zstd_decompress_internal.h

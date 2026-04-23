@@ -9,7 +9,7 @@
 #   seeds/                        — initial seed corpus (symlink)
 #   dict/                         — fuzzing dictionary (symlink)
 #
-# Mirrors /home/gpizarro/coqui/nix/targets/libpng.nix — specifically:
+# Mirrors the `libpng` target in the legacy coqui codebase — specifically:
 #   * Patched pnglibconf.h (strip PNG_SETJMP_SUPPORTED + PNG_SIMPLIFIED_*,
 #     add PNG_DISABLE_ADLER32_CHECK_SUPPORTED) via sed + echo.
 #   * Symlink libpng's *.h into libpng_include/ so -I picks them up next to
@@ -31,7 +31,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 # --- Fixed paths --------------------------------------------------------
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libpng-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
@@ -145,7 +145,7 @@ for h in "${LIBPNG_SRC}"/*.h; do
 done
 
 echo "=== [4/5] Build GPU cubin via coqui-cc ==="
-# Flags mirror /home/gpizarro/coqui/nix/targets/libpng.nix:
+# Flags mirror the `libpng` target in the legacy coqui codebase:
 #   -D PNG_NO_STDIO  — disable stdio-based PNG I/O (we use callbacks)
 #   -D PNG_NO_SETJMP — route libpng errors through PNG_ABORT()->abort()->__coqui_abort
 #   -I libpng_include -I ${zlib_src}

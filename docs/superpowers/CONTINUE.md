@@ -1,6 +1,6 @@
 # coqui mode — Resume Prompt
 
-Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/cuAFL` on branch `coqui-dev`. Working tree should be clean.
+Drop the prompt below into a new Claude Code session, run from this repo on branch `coqui-dev`. Working tree should be clean.
 
 ---
 
@@ -8,7 +8,7 @@ Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/c
 
 > I'm continuing work on **coqui mode** — a fork of AFL++ that adds a GPU-backed
 > executor mode (`coqui_mode`) selected via `--coqui <sync_id>`. This is on
-> branch `coqui-dev` of `/home/gpizarro/cuAFL`. End-to-end pipeline works:
+> branch `coqui-dev` of this repo. End-to-end pipeline works:
 > `coqui-cc` compiles a target to a cubin, `afl-fuzz --coqui gpu0 -- target.elf`
 > launches batched GPU fuzzing alongside a standard CPU forkserver, and per-batch
 > flagged inputs go through the CPU forkserver to populate `trace_bits` before
@@ -24,8 +24,9 @@ Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/c
 > - **Plan (coqui internals):** `docs/superpowers/plans/2026-04-18-coqui-internals.md`
 > - **Port log:** `docs/coqui_port_log.md` (running list of port-on-demand decisions)
 >
-> Commit history is the source of truth — `git log --oneline coqui mode` shows ~40
-> commits, every one with a clear `coqui mode:` prefix.
+> Commit history is the source of truth — `git log --oneline coqui-dev` shows ~40
+> commits, every one with a clear `coqui:` prefix (or the legacy `cuAFL:` prefix on
+> older commits before the rename sweep).
 >
 > ### Current debugging task
 >
@@ -135,7 +136,7 @@ Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/c
 ## Quick start commands
 
 ```bash
-cd /home/gpizarro/cuAFL
+cd "$(git rev-parse --show-toplevel)"     # cd to repo root
 git status                                # check working tree
 git log --oneline -15                     # recent work
 

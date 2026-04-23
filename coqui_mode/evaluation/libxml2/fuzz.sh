@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-AFL_FUZZ="/home/gpizarro/cuAFL/afl-fuzz"
+AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
 
 for f in libxml2_xml_read_fuzzer.cubin libxml2_xml_read_fuzzer.conf \
          libxml2_xml_read_fuzzer_cpu seeds; do

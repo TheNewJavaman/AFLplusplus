@@ -9,7 +9,7 @@
 #   dict/                       — fuzzing dictionary (symlink to nix store)
 #   libyaml_src/                — patched libyaml sources (needed at compile time)
 #
-# Mirrors coqui's nix spec: /home/gpizarro/coqui/nix/targets/libyaml.nix
+# Mirrors coqui's nix spec: the `libyaml` target in the legacy coqui codebase
 #
 # Notes:
 #   - libyaml.nix patches yaml_private.h to shrink INPUT_RAW_BUFFER_SIZE 16384 -> 512
@@ -36,7 +36,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libyaml-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
@@ -76,7 +76,7 @@ echo "=== [3/5] Patch libyaml sources (yaml_private.h buffer shrink) ==="
 #   INITIAL_STACK_SIZE:        16 -> 4
 #   INITIAL_QUEUE_SIZE:        16 -> 4
 #   INITIAL_STRING_SIZE:       16 -> 4
-# Matches /home/gpizarro/coqui/nix/targets/libyaml.nix buildPhase exactly.
+# Matches the `libyaml` target in the legacy coqui codebase buildPhase exactly.
 rm -rf libyaml_src
 mkdir -p libyaml_src
 for f in api.c reader.c scanner.c parser.c loader.c yaml_private.h; do
@@ -91,7 +91,7 @@ sed -i \
   libyaml_src/yaml_private.h
 
 echo "=== [4/5] Build GPU cubin via coqui-cc ==="
-# Flags mirror /home/gpizarro/coqui/nix/targets/libyaml.nix buildPhase:
+# Flags mirror the `libyaml` target in the legacy coqui codebase buildPhase:
 #   -I ${src}/include           — yaml.h
 #   -I libyaml_src              — yaml_private.h + api.c friends
 #   -D YAML_DECLARE_STATIC      — internal linkage

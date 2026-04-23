@@ -2,7 +2,7 @@
  * libjpeg_turbo_libc_stubs.c --- device-side libc stubs for libjpeg-turbo.
  *
  * coqui mode's CoquiPassPlugin does NOT port libc formatted-print functions
- * (see /home/gpizarro/cuAFL/coqui_mode/passes/Libc.cpp: only strlen,
+ * (see coqui_mode/passes/Libc.cpp: only strlen,
  * strcmp, strncmp, memcmp, strchr, strtod are rewritten to __coqui_*
  * equivalents — no snprintf/fprintf/vsnprintf/printf). Upstream coqui
  * provides __coqui_snprintf via musl+LibcTransform, but coqui mode's trimmed

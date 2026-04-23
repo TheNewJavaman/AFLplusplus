@@ -13,7 +13,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-AFL_FUZZ=/home/gpizarro/cuAFL/afl-fuzz
+AFL_FUZZ="${AFL_FUZZ:-$HERE/../../../afl-fuzz}"
 CUBIN="$HERE/cjson_fuzzer.cubin"
 CONF="$HERE/cjson_fuzzer.conf"
 CPU_BIN="$HERE/cjson_fuzzer_cpu"

@@ -8,7 +8,7 @@
 #   seeds/             — initial seed corpus (symlink to nix store)
 #   dict/              — fuzzing dictionary (symlink to nix store)
 #
-# Mirrors coqui's nix spec: /home/gpizarro/coqui/nix/targets/bzip2.nix
+# Mirrors coqui's nix spec: the `bzip2` target in the legacy coqui codebase
 #
 # Note: the nix spec passes `--heap-size 524288` and `--batch-size 32768` to
 # coqui; coqui mode's coqui-cc does NOT accept those flags. The coqui mode runtime
@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-bzip2-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
@@ -48,7 +48,7 @@ fi
 echo "  libbzip2 source: ${BZ2_SRC}"
 
 echo "=== [3/4] Build GPU cubin via coqui-cc ==="
-# Flags mirror /home/gpizarro/coqui/nix/targets/bzip2.nix:
+# Flags mirror the `bzip2` target in the legacy coqui codebase:
 #   -D BZ_NO_STDIO           — disable bzlib's stdio reliance
 #   -I <libbzip2 source>     — bzlib.h + bzlib_private.h
 #   --slab-pool-size 2 GiB   — bzip2 DState + allocations exceed 64KB heap

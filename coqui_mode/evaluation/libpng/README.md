@@ -1,7 +1,7 @@
 # coqui mode evaluation target: libpng
 
 libpng fuzz target (reads PNG via libpng's low-level API), adapted from
-coqui's nix spec (`/home/gpizarro/coqui/nix/targets/libpng.nix`) for
+coqui's nix spec (the `libpng` target in the legacy coqui codebase) for
 coqui mode's `coqui-cc` compiler and `afl-fuzz --coqui` runtime.
 
 libpng depends on zlib; both libraries are compiled into a single cubin.

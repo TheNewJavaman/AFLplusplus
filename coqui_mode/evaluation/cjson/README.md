@@ -4,7 +4,7 @@ A self-contained fuzz setup that builds the cJSON library + oss-fuzz-style
 harness for coqui mode (`afl-fuzz --coqui`) and the matching AFL++-instrumented
 CPU binary for host verification.
 
-Mirrors `/home/gpizarro/coqui/nix/targets/cjson.nix` exactly: same cJSON
+Mirrors the `cjson` target in the legacy coqui codebase exactly: same cJSON
 v1.7.18 sources, same `-I`, same `-D CJSON_HIDE_SYMBOLS`, same
 `--stack-size 32768`, same harness (`harness/targets/cjson_read_fuzzer.c`
 in the coqui repo).
@@ -31,7 +31,7 @@ local dir. The symlinks (and `out/`) are in `.gitignore`.
 ## Quickstart
 
 ```
-cd /home/gpizarro/cuAFL/coqui_mode/evaluation/cjson
+cd coqui_mode/evaluation/cjson
 ./build.sh   # builds cubin + conf + CPU binary + seeds/dict
 ./fuzz.sh    # launches coqui mode afl-fuzz --coqui on GPU 0
 ```
@@ -45,9 +45,9 @@ AFL_RESUME=1 ./fuzz.sh
 
 ## Dependencies
 
-- coqui mode development build: `/home/gpizarro/cuAFL/afl-fuzz`
+- coqui mode development build: `./afl-fuzz`
 - `coqui-cc`: `/usr/local/bin/coqui-cc` (coqui mode compiler driver)
-- nix (2.34+), with `/home/gpizarro/coqui` checkout providing the flake
+- nix (2.34+), with the legacy coqui checkout checkout providing the flake
 - NVIDIA driver + CUDA on the host (for `libcuda.so.1`)
 - GPU index 0 is an RTX Titan (sm_75) per `CLAUDE.local.md`
 
@@ -79,7 +79,7 @@ being resolved at load time by the coqui mode driver — also expected.
   `cJSON.c`. Do not copy the source out of the store — the path is
   read-only and re-derives cleanly.
 - **Harness path.** The libFuzzer-style harness lives at
-  `/home/gpizarro/coqui/harness/targets/cjson_read_fuzzer.c`. `build.sh`
+  the `cjson_read_fuzzer` harness from the legacy coqui codebase. `build.sh`
   references it via an absolute path; it is not copied into this dir.
 - **Orphan-safe.** `afl-fuzz` installs `PR_SET_PDEATHSIG` on the forkserver
   (fixed in `aadd355b`), so killing this shell cleanly tears down the

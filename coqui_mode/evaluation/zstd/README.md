@@ -3,7 +3,7 @@
 Adapts the `zstd` decompression fuzz target (from coqui) for coqui mode, so
 `afl-fuzz --coqui` can fuzz the Facebook `zstd` library on the GPU.
 
-Source of truth: `/home/gpizarro/coqui/nix/targets/zstd.nix`
+Source of truth: the `zstd` target in the legacy coqui codebase
 (facebook/zstd v1.5.6, decompression-only, custom GPU-adapted harness).
 
 ## Layout
@@ -25,13 +25,13 @@ out/                                 afl-fuzz output (created on first run)
 ## Build
 
 ```
-cd /home/gpizarro/cuAFL/coqui_mode/evaluation/zstd
+cd coqui_mode/evaluation/zstd
 ./build.sh
 ```
 
 The script is idempotent. It:
 
-1. Runs `nix build .#target-zstd-aflplusplus` in `/home/gpizarro/coqui`
+1. Runs `nix build .#target-zstd-aflplusplus` in the legacy coqui checkout
    to produce the AFL++-instrumented CPU harness, its seeds, and the zstd
    dictionary, and symlinks the result under `/tmp/coqui-zstd-cpu`.
 2. Resolves the `facebook/zstd v1.5.6` source path from the nix closure

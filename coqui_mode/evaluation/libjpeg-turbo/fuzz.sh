@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-AFL_FUZZ="/home/gpizarro/cuAFL/afl-fuzz"
+AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
 HARNESS_NAME="libjpeg_turbo_decompress_fuzzer"
 CUBIN="${SCRIPT_DIR}/${HARNESS_NAME}.cubin"
 CONF="${SCRIPT_DIR}/${HARNESS_NAME}.conf"

@@ -9,7 +9,7 @@
 #   seeds/                          - 74 DNS wire-format seed corpus (symlink to nix store)
 #   dict/dns.dict                   - DNS wire dictionary (symlink to nix store)
 #
-# Sources and flags mirror /home/gpizarro/coqui/nix/targets/cares.nix.
+# Sources and flags mirror the `cares` target in the legacy coqui codebase.
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ HARNESS="cares_parse_reply_fuzzer"
 # --- Prerequisites -----------------------------------------------------------
 
 COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
-COQUI_REPO="${COQUI_REPO:-/home/gpizarro/coqui}"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 CPU_OUT_LINK="${CPU_OUT_LINK:-/tmp/coqui-cares-cpu}"
 
 command -v "$COQUI_CC" >/dev/null || {

@@ -8,7 +8,7 @@
 #   seeds/                        — seed corpus symlink into nix store
 #   dict/                         — dictionary symlink into nix store
 #
-# Mirrors coqui's nix spec: /home/gpizarro/coqui/nix/targets/libxml2.nix
+# Mirrors coqui's nix spec: the `libxml2` target in the legacy coqui codebase
 #
 # libxml2 needs generated config headers (config.h, xmlversion.h) and two
 # source patches (error.c, xmlstring.c) before compilation. The nix spec
@@ -24,7 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-libxml2-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
@@ -177,7 +177,7 @@ awk '
 mv "${BUILD_DIR}/xmlstring_patched.c" "${BUILD_DIR}/xmlstring.c"
 
 echo "=== [4/5] Build GPU cubin via coqui-cc ==="
-# Flags / includes / source list mirror /home/gpizarro/coqui/nix/targets/libxml2.nix.
+# Flags / includes / source list mirror the `libxml2` target in the legacy coqui codebase.
 # Build dir comes first in the -I list so build/include/libxml/xmlversion.h
 # wins over the template in the source tree.
 "${COQUI_CC}" \

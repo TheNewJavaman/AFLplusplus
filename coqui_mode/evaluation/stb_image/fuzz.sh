@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-AFL_FUZZ="/home/gpizarro/cuAFL/afl-fuzz"
+AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
 HARNESS_BASENAME="stb_image_read_fuzzer"
 
 for f in "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${HARNESS_BASENAME}_cpu" seeds; do

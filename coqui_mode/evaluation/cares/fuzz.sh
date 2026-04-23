@@ -22,7 +22,7 @@ CPU_BIN="$HERE/${HARNESS}_cpu"
 SEEDS="$HERE/seeds"
 OUT="$HERE/out"
 
-AFL_FUZZ="${AFL_FUZZ:-/home/gpizarro/cuAFL/afl-fuzz}"
+AFL_FUZZ="${AFL_FUZZ:-$HERE/../../../afl-fuzz}"
 
 # --- Sanity checks -----------------------------------------------------------
 

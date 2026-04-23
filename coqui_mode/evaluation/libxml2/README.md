@@ -1,6 +1,6 @@
 # libxml2 — coqui mode evaluation target
 
-Port of `/home/gpizarro/coqui/nix/targets/libxml2.nix` to a self-contained
+Port of the `libxml2` target in the legacy coqui codebase to a self-contained
 evaluation directory for `coqui mode --coqui`.
 
 ## Build
@@ -63,7 +63,7 @@ libxml2 is deeply variadic:
   also uses `llvm.va_start`.
 
 Upstream coqui handles this via a `VariadicTransform`/`PrintfTransform` IR
-pass (see `/home/gpizarro/coqui/transforms/`). coqui mode's coqui-cc has
+pass (see legacy coqui's transforms/). coqui mode's coqui-cc has
 `IntrinsicReject` — which explicitly hard-fails on `llvm.va_start` — but
 the corresponding transform has not been ported. `coqui_mode/passes/`
 contains the lowering transforms currently enabled, and the variadic one

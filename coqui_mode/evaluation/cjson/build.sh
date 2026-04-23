@@ -12,7 +12,7 @@
 #                              corpus that the aflplusplus target ships
 #   dict/                   — symlink to the upstream cJSON dictionary
 #
-# Mirrors /home/gpizarro/coqui/nix/targets/cjson.nix exactly for the GPU
+# Mirrors the `cjson` target in the legacy coqui codebase exactly for the GPU
 # sources, -I, -D and --stack-size. The CPU binary is supplied by the
 # `target-cjson-aflplusplus` package from the coqui flake.
 #
@@ -28,7 +28,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 # --- Fixed paths --------------------------------------------------------
-COQUI_REPO=/home/gpizarro/coqui
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC=/usr/local/bin/coqui-cc
 ARCH=sm_75
 STACK_SIZE=32768

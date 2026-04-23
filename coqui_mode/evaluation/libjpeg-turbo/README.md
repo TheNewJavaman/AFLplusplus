@@ -4,7 +4,7 @@ A self-contained fuzz setup that builds libjpeg-turbo 3.0.4 (baseline JPEG
 decode only) + oss-fuzz-style harness for coqui mode (`afl-fuzz --coqui`) and
 the matching AFL++ instrumented CPU binary for host verification.
 
-Mirrors `/home/gpizarro/coqui/nix/targets/libjpeg-turbo.nix` exactly: same
+Mirrors the `libjpeg-turbo` target in the legacy coqui codebase exactly: same
 20 source files, same patched `jmorecfg.h`, same custom `jconfig.h` /
 `jconfigint.h` / `jversion.h`, same `-I` paths, same `-D NO_GETENV`, same
 `--stack-size 32768` (coqui-cc default). The CPU binary and seed/dict
@@ -33,7 +33,7 @@ dir. All symlinks and `jpeg_include/` are in `.gitignore`.
 ## Quickstart
 
 ```
-cd /home/gpizarro/cuAFL/coqui_mode/evaluation/libjpeg-turbo
+cd coqui_mode/evaluation/libjpeg-turbo
 ./build.sh   # builds cubin + conf + CPU binary + seeds/dict
 ./fuzz.sh    # launches coqui mode afl-fuzz --coqui on GPU 0
 ```
@@ -47,9 +47,9 @@ AFL_RESUME=1 ./fuzz.sh
 
 ## Dependencies
 
-- coqui mode development build: `/home/gpizarro/cuAFL/afl-fuzz`
+- coqui mode development build: `./afl-fuzz`
 - `coqui-cc`: `/usr/local/bin/coqui-cc` (coqui mode compiler driver)
-- nix 2.34+, with `/home/gpizarro/coqui` checkout providing the flake
+- nix 2.34+, with the legacy coqui checkout checkout providing the flake
 - NVIDIA driver + CUDA on the host (for `libcuda.so.1`)
 - GPU index 0 is an RTX Titan (sm_75) per `CLAUDE.local.md`
 
@@ -159,7 +159,7 @@ DRI/SOS markers + JFIF/EXIF signatures + common SOF sampling factors.
   `jversion.h.in`. Do not copy the source out of the store — the path
   is read-only and re-derives cleanly.
 - **Harness paths.** The libFuzzer-style harness and SIMD stubs live at
-  `/home/gpizarro/coqui/harness/targets/libjpeg_turbo_decompress_fuzzer.c`
+  the `libjpeg_turbo_decompress_fuzzer` harness from the legacy coqui codebase
   and `libjpeg_turbo_stubs.c`. `build.sh` references them via absolute
   paths.
 - **Orphan-safe.** coqui mode's `afl-fuzz` installs `PR_SET_PDEATHSIG` on the

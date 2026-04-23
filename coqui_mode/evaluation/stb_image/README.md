@@ -2,7 +2,7 @@
 
 stb_image multi-format image decoder fuzzer (PNG/BMP/GIF/JPEG/TGA/PSD/PIC/PNM),
 adapted from coqui's nix target
-(`/home/gpizarro/coqui/nix/targets/stb_image.nix`) for coqui mode's `coqui-cc`
+(the `stb_image` target in the legacy coqui codebase) for coqui mode's `coqui-cc`
 compiler and `afl-fuzz --coqui` runtime.
 
 stb is a header-only library (nothings/stb, commit `28d546d5eb77`), so only the

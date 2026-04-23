@@ -8,7 +8,7 @@
 #   seeds/                      — initial seed corpus (symlink to nix store)
 #   dict/                       — fuzzing dictionary (symlink to nix store)
 #
-# Mirrors coqui's nix spec: /home/gpizarro/coqui/nix/targets/stb_image.nix
+# Mirrors coqui's nix spec: the `stb_image` target in the legacy coqui codebase
 #
 # stb_image notes:
 #   - stb is a header-only library, so only the harness .c is compiled
@@ -35,7 +35,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 CPU_OUT_LINK="/tmp/coqui-stb_image-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
@@ -77,7 +77,7 @@ if [[ ! -f "${HARNESS}" ]]; then
 fi
 
 echo "=== [3/4] Build GPU cubin via coqui-cc ==="
-# Flags mirror /home/gpizarro/coqui/nix/targets/stb_image.nix plus one coqui mode-only
+# Flags mirror the `stb_image` target in the legacy coqui codebase plus one coqui mode-only
 # fix:
 #   -arch sm_75                 — required for coqui mode runtime (RTX Titan)
 #   --stack-size 65536          — nix spec overrides the 32768 default

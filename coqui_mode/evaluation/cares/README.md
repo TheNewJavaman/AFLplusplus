@@ -4,7 +4,7 @@ Fuzzes the [c-ares](https://c-ares.org/) DNS parser (v1.34.4) via the
 oss-fuzz-adapted `ares_dns_parse` harness, running the hot parsing code
 on the GPU under coqui mode's `coqui_mode`.
 
-Mirrors `/home/gpizarro/coqui/nix/targets/cares.nix` — same source
+Mirrors the `cares` target in the legacy coqui codebase — same source
 whitelist, same config-header generation, same `--slab-pool-size 10G`.
 
 ## Build
@@ -15,7 +15,7 @@ whitelist, same config-header generation, same `--slab-pool-size 10G`.
 
 Steps performed:
 
-1. `nix build '.#target-cares-aflplusplus'` from `/home/gpizarro/coqui`
+1. `nix build '.#target-cares-aflplusplus'` from the legacy coqui checkout
    to produce the CPU AFL++-instrumented binary (used as the forkserver
    target for classified exit paths + crash verification).
 2. Walks the resulting store closure to find the c-ares source and the
@@ -34,7 +34,7 @@ but keep the cached nix build.
 ### Build environment overrides
 
 - `COQUI_CC` — path to `coqui-cc` (default `/usr/local/bin/coqui-cc`)
-- `COQUI_REPO` — path to coqui flake repo (default `/home/gpizarro/coqui`)
+- `COQUI_REPO` — path to coqui flake repo (default the legacy coqui checkout)
 - `CPU_OUT_LINK` — nix out-link path for the CPU binary
   (default `/tmp/coqui-cares-cpu`)
 
@@ -49,7 +49,7 @@ but keep the cached nix build.
 Launches:
 
 ```
-/home/gpizarro/cuAFL/afl-fuzz --coqui gpu0 \
+./afl-fuzz --coqui gpu0 \
     -i ./seeds -o ./out \
     -x ./dict/dns.dict \
     -- ./cares_parse_reply_fuzzer_cpu
@@ -67,7 +67,7 @@ Additional arguments are passed through to `afl-fuzz`.
 
 ### Fuzz environment overrides
 
-- `AFL_FUZZ` — path to `afl-fuzz` binary (default `/home/gpizarro/cuAFL/afl-fuzz`)
+- `AFL_FUZZ` — path to `afl-fuzz` binary (default `./afl-fuzz`)
 
 ## Target-specific quirks
 

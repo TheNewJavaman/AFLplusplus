@@ -1,7 +1,7 @@
 # coqui mode evaluation target: bzip2
 
 libbzip2 1.0.8 decompression fuzzer, adapted from coqui's nix target
-(`/home/gpizarro/coqui/nix/targets/bzip2.nix`) for coqui mode's coqui-cc
+(the `bzip2` target in the legacy coqui codebase) for coqui mode's coqui-cc
 compiler and `afl-fuzz --coqui` runtime.
 
 ## Quick start

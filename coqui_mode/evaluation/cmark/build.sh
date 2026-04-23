@@ -8,14 +8,14 @@
 #   seeds/               - initial corpus (symlink into nix store)
 #   dict/                - fuzzer dictionary (symlink into nix store)
 #
-# This script is idempotent.  Reference: /home/gpizarro/coqui/nix/targets/cmark.nix.
+# This script is idempotent.  Reference: the `cmark` target in the legacy coqui codebase.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-COQUI_REPO="/home/gpizarro/coqui"
+COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
 COQUI_CC="/usr/local/bin/coqui-cc"
 HARNESS="cmark_fuzzer"
 ARCH="sm_75"
