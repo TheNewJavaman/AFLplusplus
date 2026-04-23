@@ -1,4 +1,4 @@
-# coqui mode bench runs
+# cuAFL bench runs
 
 Log of fuzz runs against evaluation targets, capturing coverage + exec-rate + configuration.
 Each entry records results from a CLEAN-CORPUS start with a minimal domain-specific seed.
@@ -8,7 +8,7 @@ Each entry records results from a CLEAN-CORPUS start with a minimal domain-speci
 | Column | Meaning |
 |---|---|
 | date     | UTC timestamp of run start |
-| commit   | coqui mode git HEAD at run time |
+| commit   | cuAFL git HEAD at run time |
 | target   | evaluation target name |
 | duration | wall-clock run time (`-V` value) |
 | clients  | `<main> + <coqui> + <afl-plain>` instance counts |
@@ -187,6 +187,6 @@ corpus.
 
 ### Known issues blocking wider bench runs
 
-- **`--coqui` + persistent-mode CPU binary**: coqui mode's `--coqui` forkserver path times out during AFL's dry-run calibration when the target binary uses AFL's persistent-mode features (either shm-fuzz via `__AFL_FUZZ_TESTCASE_BUF` or the stdin-fed `__AFL_LOOP` form). Pure AFL CPU mode works fine with persistent binaries; only the `--coqui` path is affected. Until this is debugged, `--coqui` benches have to use fork-per-exec (non-persistent) drivers. **This violates the project's persistent-mode constraint.** See `include/afl-fuzz-coqui.h` / `src/afl-fuzz-coqui.c` for coqui-mode state and investigate why the CPU forkserver calibration path behaves differently under `--coqui`.
+- **`--coqui` + persistent-mode CPU binary**: cuAFL's `--coqui` forkserver path times out during AFL's dry-run calibration when the target binary uses AFL's persistent-mode features (either shm-fuzz via `__AFL_FUZZ_TESTCASE_BUF` or the stdin-fed `__AFL_LOOP` form). Pure AFL CPU mode works fine with persistent binaries; only the `--coqui` path is affected. Until this is debugged, `--coqui` benches have to use fork-per-exec (non-persistent) drivers. **This violates the project's persistent-mode constraint.** See `include/afl-fuzz-coqui.h` / `src/afl-fuzz-coqui.c` for coqui-mode state and investigate why the CPU forkserver calibration path behaves differently under `--coqui`.
 - **Env-var propagation**: `AFL_COQUI_STACK_SIZE=N` set inline on a background command (`VAR=X nohup bin & disown`) is sometimes stripped by bash's background handling. Default bumped to 65536 in `afl-fuzz-coqui.c:166` as of this run so targets that need more stack (bzip2 especially) get it without relying on env propagation.
 - **Shell-tool flakiness**: compound bash commands using `( ... ) > log 2>&1 &` and heredoc file writes sometimes fail silently in Claude's Bash tool sandbox (scripts don't land, redirections don't flush). Workaround: use the `Write` tool for scripts, invoke them via simple `nohup /path/script &`.
