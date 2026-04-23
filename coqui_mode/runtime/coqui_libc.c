@@ -320,7 +320,20 @@ float __coqui_cosf(float x)     { (void)x; return 1.0f; }
 
 /* ----- file descriptor stubs ---------------------------------------------
  * No real file I/O on GPU. Targets that check_open/read a file get -1/EBADF
- * semantics. */
+ * semantics.
+ *
+ * NOTE on read/write return width: for the nvptx64 target, <sys/types.h>
+ * typedefs `ssize_t` to `int` (i.e. 32-bit), not `long` — this matters
+ * because the POSIX read/write prototypes in <unistd.h> then declare
+ * `ssize_t read(int, void *, size_t)` with an i32 return. Callers
+ * (e.g. libxml2's xmlIO.c via `#include <unistd.h>`) emit `i32 @read(...)`
+ * call sites. If this runtime defined `long read(...)` the bitcode-linked
+ * module would have a call/definition return-type mismatch; llc tolerates
+ * it but ptxas rejects the resulting `.param .b32 retval0` vs
+ * `.param .b64 func_retval0` mismatch with:
+ *   "Type of argument does not match formal parameter 'func_retval0'".
+ * Keep the return widths here aligned with the nvptx64 ssize_t/off_t
+ * typedefs: ssize_t = int, size_t = unsigned long, off_t = long. */
 
 int open(const char *p, int fl, ...)      { (void)p; (void)fl; return -1; }
 int open64(const char *p, int fl, ...)    { (void)p; (void)fl; return -1; }
@@ -328,8 +341,8 @@ void *stderr = 0;
 void *stdout = 0;
 void *stdin = 0;
 int close(int fd)                         { (void)fd; return -1; }
-long read(int fd, void *b, unsigned long n)  { (void)fd; (void)b; (void)n; return -1; }
-long write(int fd, const void *b, unsigned long n) { (void)fd; (void)b; (void)n; return -1; }
+int  read(int fd, void *b, unsigned long n)  { (void)fd; (void)b; (void)n; return -1; }
+int  write(int fd, const void *b, unsigned long n) { (void)fd; (void)b; (void)n; return -1; }
 long lseek(int fd, long o, int w)         { (void)fd; (void)o; (void)w; return -1; }
 int isatty(int fd)                        { (void)fd; return 0; }
 int access(const char *p, int m)          { (void)p; (void)m; return -1; }
