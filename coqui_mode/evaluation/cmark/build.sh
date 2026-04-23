@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the cuAFL cmark fuzz target.
+# Build the coqui mode cmark fuzz target.
 #
 # Produces, in this directory:
-#   cmark_fuzzer.cubin   - GPU kernel built by cuAFL's coqui-cc
+#   cmark_fuzzer.cubin   - GPU kernel built by coqui mode's coqui-cc
 #   cmark_fuzzer.conf    - sidecar written by coqui-cc (stack/slab/arch)
 #   cmark_fuzzer_cpu     - AFL++-instrumented CPU binary (symlink into nix store)
 #   seeds/               - initial corpus (symlink into nix store)
@@ -22,7 +22,7 @@ ARCH="sm_75"
 STACK_SIZE=32768      # coqui-cc default; cmark's nix spec doesn't override
 SLAB_POOL_SIZE=0      # cmark's nix spec doesn't set --slab-pool-size
 
-CPU_LINK="/tmp/cuafl-cmark-cpu"
+CPU_LINK="/tmp/coqui-cmark-cpu"
 
 echo "=== [1/4] Building CPU (AFL++) target via nix ==="
 # Produces $CPU_LINK -> /nix/store/...-aflplusplus-cmark-0.31.1
@@ -118,4 +118,4 @@ echo "=== Artifacts ==="
 ls -la "$SCRIPT_DIR/${HARNESS}.cubin" "$SCRIPT_DIR/${HARNESS}.conf" \
        "$SCRIPT_DIR/${HARNESS}_cpu" "$SCRIPT_DIR/seeds" "$SCRIPT_DIR/dict"
 echo
-echo "=== Build OK.  Run ./fuzz.sh to launch cuAFL. ==="
+echo "=== Build OK.  Run ./fuzz.sh to launch coqui mode. ==="

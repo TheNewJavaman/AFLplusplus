@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fuzz.sh — launch cuAFL afl-fuzz --coqui on the libpng target (GPU device 0).
+# fuzz.sh — launch coqui mode afl-fuzz --coqui on the libpng target (GPU device 0).
 #
 # Prerequisite: run ./build.sh first to produce
 #   libpng_read_fuzzer.{cubin,conf}, libpng_read_fuzzer_cpu, seeds/, dict/.
@@ -22,7 +22,7 @@ SEEDS="${HERE}/seeds"
 OUTDIR="${HERE}/out"
 
 # --- Pre-flight ---------------------------------------------------------
-test -x "${AFL_FUZZ}" || { echo "[fuzz] missing ${AFL_FUZZ} — build cuAFL first" >&2; exit 1; }
+test -x "${AFL_FUZZ}" || { echo "[fuzz] missing ${AFL_FUZZ} — build coqui mode first" >&2; exit 1; }
 test -f "${CUBIN}"    || { echo "[fuzz] missing ${CUBIN} — run ./build.sh"      >&2; exit 1; }
 test -f "${CONF}"     || { echo "[fuzz] missing ${CONF} — run ./build.sh"       >&2; exit 1; }
 test -x "${CPU_BIN}"  || { echo "[fuzz] missing ${CPU_BIN} — run ./build.sh"    >&2; exit 1; }
@@ -60,7 +60,7 @@ if [[ -d "${HERE}/dict" ]]; then
 fi
 
 echo "==============================================================="
-echo "  cuAFL libpng fuzz launch"
+echo "  coqui mode libpng fuzz launch"
 echo "  GPU:    device ${AFL_COQUI_DEVICE} (expect RTX Titan sm_75)"
 echo "  cubin:  ${CUBIN}"
 echo "  cpu:    ${CPU_BIN}"

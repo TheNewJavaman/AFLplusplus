@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — build stb_image cuAFL evaluation target.
+# build.sh — build stb_image coqui mode evaluation target.
 #
 # Produces in the current directory:
 #   stb_image_read_fuzzer.cubin — GPU kernel (sm_75)
@@ -21,15 +21,15 @@
 #     accept those flags, so we omit them here (they only matter for the CPU
 #     binary, which nix builds separately).
 #   - stb_image.h calls assert() which expands to __assert_fail on NVPTX.
-#     cuAFL's runtime has no __assert_fail stub, and its ExternalSymbolGatekeeper
+#     coqui mode's runtime has no __assert_fail stub, and its ExternalSymbolGatekeeper
 #     hard-fails. stb_image documents an override: define STBI_ASSERT(x) before
 #     the header. We pass `-D STBI_ASSERT(x)=` so asserts become no-ops on GPU.
 #     (Nix/coqui doesn't need this because the coqui wrapper provides a stub.)
-#   - STBI_NO_HDR: the Radiance HDR decoder calls strtol(), which cuAFL's runtime
+#   - STBI_NO_HDR: the Radiance HDR decoder calls strtol(), which coqui mode's runtime
 #     does not stub. Disabling HDR on GPU is a GPU-only restriction; the CPU
 #     AFL++ binary built by nix still enables HDR. Consequence: GPU-driven
 #     coverage won't steer toward HDR code paths. Add a runtime strtol stub
-#     (ideally in cuAFL runtime.bc) to lift this limitation.
+#     (ideally in coqui mode runtime.bc) to lift this limitation.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +37,7 @@ cd "${SCRIPT_DIR}"
 
 COQUI_REPO="/home/gpizarro/coqui"
 COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/cuafl-stb_image-cpu"
+CPU_OUT_LINK="/tmp/coqui-stb_image-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
 ARCH="sm_75"
 STACK_SIZE=65536         # from stb_image.nix (--stack-size 65536)
@@ -77,14 +77,14 @@ if [[ ! -f "${HARNESS}" ]]; then
 fi
 
 echo "=== [3/4] Build GPU cubin via coqui-cc ==="
-# Flags mirror /home/gpizarro/coqui/nix/targets/stb_image.nix plus one cuAFL-only
+# Flags mirror /home/gpizarro/coqui/nix/targets/stb_image.nix plus one coqui mode-only
 # fix:
-#   -arch sm_75                 — required for cuAFL runtime (RTX Titan)
+#   -arch sm_75                 — required for coqui mode runtime (RTX Titan)
 #   --stack-size 65536          — nix spec overrides the 32768 default
 #   -I <stb source>             — stb_image.h lives there
-#   -D STBI_ASSERT(x)=          — disable stb_image's internal assert() (cuAFL-only;
+#   -D STBI_ASSERT(x)=          — disable stb_image's internal assert() (coqui mode-only;
 #                                 nix builds rely on a runtime __assert_fail stub
-#                                 that cuAFL doesn't ship)
+#                                 that coqui mode doesn't ship)
 # The harness .c defines STB_IMAGE_IMPLEMENTATION + STBI_NO_STDIO internally,
 # so no extra -D is needed (unlike bzip2/cjson).
 "${COQUI_CC}" \

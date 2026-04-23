@@ -1,7 +1,7 @@
-# cuAFL cjson evaluation target
+# coqui mode cjson evaluation target
 
 A self-contained fuzz setup that builds the cJSON library + oss-fuzz-style
-harness for cuAFL (`afl-fuzz --coqui`) and the matching AFL++-instrumented
+harness for coqui mode (`afl-fuzz --coqui`) and the matching AFL++-instrumented
 CPU binary for host verification.
 
 Mirrors `/home/gpizarro/coqui/nix/targets/cjson.nix` exactly: same cJSON
@@ -22,7 +22,7 @@ in the coqui repo).
 The CPU binary and seed/dict dirs come from:
 
 ```
-nix build '.#target-cjson-aflplusplus' --out-link /tmp/cuafl-cjson-cpu
+nix build '.#target-cjson-aflplusplus' --out-link /tmp/coqui-cjson-cpu
 ```
 
 `build.sh` runs that command for you and symlinks the artifacts into the
@@ -33,7 +33,7 @@ local dir. The symlinks (and `out/`) are in `.gitignore`.
 ```
 cd /home/gpizarro/cuAFL/coqui_mode/evaluation/cjson
 ./build.sh   # builds cubin + conf + CPU binary + seeds/dict
-./fuzz.sh    # launches cuAFL afl-fuzz --coqui on GPU 0
+./fuzz.sh    # launches coqui mode afl-fuzz --coqui on GPU 0
 ```
 
 Extra args to `fuzz.sh` are forwarded to `afl-fuzz` (after `-- <binary>`):
@@ -45,8 +45,8 @@ AFL_RESUME=1 ./fuzz.sh
 
 ## Dependencies
 
-- cuAFL development build: `/home/gpizarro/cuAFL/afl-fuzz`
-- `coqui-cc`: `/usr/local/bin/coqui-cc` (cuAFL compiler driver)
+- coqui mode development build: `/home/gpizarro/cuAFL/afl-fuzz`
+- `coqui-cc`: `/usr/local/bin/coqui-cc` (coqui mode compiler driver)
 - nix (2.34+), with `/home/gpizarro/coqui` checkout providing the flake
 - NVIDIA driver + CUDA on the host (for `libcuda.so.1`)
 - GPU index 0 is an RTX Titan (sm_75) per `CLAUDE.local.md`
@@ -61,12 +61,12 @@ the resulting `seeds/` directory contains 14 upstream fuzz inputs with
 `clang: warning: argument unused during compilation: '-fno-stack-protector'`
 (from coqui-cc's NVPTX pipeline — expected) and two benign `ptxas`
 warnings about `__coqui_virgin_map` / `__coqui_global_statics_pool_base`
-being resolved at load time by the cuAFL driver — also expected.
+being resolved at load time by the coqui mode driver — also expected.
 
 ## Gotchas
 
 - **Don't `git add` the symlinks.** `cjson_fuzzer_cpu`, `seeds/`, `dict/`
-  all point at `/tmp/cuafl-cjson-cpu/…` or the nix store. They are in
+  all point at `/tmp/coqui-cjson-cpu/…` or the nix store. They are in
   `.gitignore`.
 - **GPU device pinning.** Per user memory, everything here assumes device
   index 0 (RTX Titan, sm_75). Override with `AFL_COQUI_DEVICE=N`.

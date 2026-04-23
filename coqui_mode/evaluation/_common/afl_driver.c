@@ -4,7 +4,7 @@
  * CONSTRAINT VIOLATION (documented in coqui_mode/docs/runs.md):
  * This driver uses fork-per-exec (NOT persistent mode with __AFL_LOOP).
  * The project's persistent-mode constraint (>=1000 iterations per fork)
- * is NOT satisfied here because cuAFL's --coqui forkserver path times
+ * is NOT satisfied here because coqui mode's --coqui forkserver path times
  * out in dry-run calibration whenever the target uses __AFL_LOOP (tested
  * with both shm-fuzz via __AFL_FUZZ_TESTCASE_BUF and stdin-fed LOOP).
  * See the issues section in coqui_mode/docs/runs.md for details.
@@ -14,7 +14,7 @@
  *   - under afl-fuzz: read one seed from stdin (AFL pipes test case in),
  *                     call LLVMFuzzerTestOneInput, exit. AFL re-forks.
  *
- * Compile with cuAFL's afl-clang-fast.
+ * Compile with coqui mode's afl-clang-fast.
  */
 
 #include <stdint.h>

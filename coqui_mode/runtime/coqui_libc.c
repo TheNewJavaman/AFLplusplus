@@ -1,5 +1,5 @@
 /*
- * coqui_libc.c --- minimum libc replacements for cuAFL.
+ * coqui_libc.c --- minimum libc replacements for coqui mode.
  *
  * Only includes functions whose external symbols persist after clang
  * -O2 lowering (memcpy/memset family ARE lowered natively to LLVM
@@ -115,7 +115,7 @@ double __coqui_strtod(const char *nptr, char **endptr) {
 }
 
 /* ----- no-op stubs for stdout/stderr family -------------------------------
- * cuAFL doesn't plumb stdout/stderr back to the host (no captured output
+ * coqui mode doesn't plumb stdout/stderr back to the host (no captured output
  * during GPU fuzzing, by design). Any target that calls printf/fprintf/etc.
  * usually does so only in error-reporting paths; silently dropping those
  * messages is fine. These stubs satisfy ExternalSymbolGatekeeper without
@@ -156,7 +156,7 @@ __attribute__((noreturn)) void __assert_fail(const char *expr, const char *f, un
  * own copy). Callers that stash an error code here can still read it back
  * within the same call; we just never propagate it anywhere. */
 
-/* Non-thread-local on purpose: NVPTX doesn't support __thread, and cuAFL
+/* Non-thread-local on purpose: NVPTX doesn't support __thread, and coqui mode
  * never reads errno back meaningfully — cross-thread stomping is harmless. */
 static int __coqui_errno_slot;
 int *__errno_location(void)                           { return &__coqui_errno_slot; }
@@ -199,7 +199,7 @@ static const int __coqui_ctype_tolower[384];
 
 /* Return &array directly — callers index [0..255]. Without the -128 offset
  * trick, negative ctype args go OOB, but since tables are all-zero and
- * cuAFL doesn't rely on real classification, the corruption is moot. */
+ * coqui mode doesn't rely on real classification, the corruption is moot. */
 
 const unsigned short **__ctype_b_loc(void) {
     static const unsigned short *p;

@@ -1,7 +1,7 @@
-# cuAFL ↔ coqui deltas
+# coqui mode ↔ upstream coqui deltas
 
 Notes from auditing `~/coqui/` against this tree to identify why targets
-that build cleanly in coqui fail or run slow in cuAFL.
+that build cleanly in coqui fail or run slow in coqui mode.
 
 ## 1. Inlined vs. outlined ASan (root cause of ptxas-O1 pathology)
 
@@ -9,7 +9,7 @@ that build cleanly in coqui fail or run slow in cuAFL.
 50-100+ GB RSS on larger targets (cmark 55 min/53 GB, cares 77 min/13 GB,
 libpng / stb_image similar). Constraint forbids -O0.
 
-**Root cause:** cuAFL's `coqui_mode/passes/Asan.cpp` (283 lines)
+**Root cause:** coqui mode's `coqui_mode/passes/Asan.cpp` (283 lines)
 instruments each load/store with an **inline** check sequence —
 split basic block, shadow read, slow-path branch. Per-access cost is
 ~3× basic blocks and ~20 PTX instructions. On cmark this generated
@@ -48,7 +48,7 @@ first batch, even with 64 KiB stack.
 | stb_image | **65536** | default | default | default |
 | cjson | default | default | default | default |
 
-cuAFL's `coqui-cc` has `--stack-size` (with `AFL_COQUI_STACK_SIZE` runtime
+coqui mode's `coqui-cc` has `--stack-size` (with `AFL_COQUI_STACK_SIZE` runtime
 env override) and `--slab-pool-size`, but NO runtime env override for
 heap-size or batch-size. The runtime derives heap as
 `(total_budget - cov - stack) * 8/9` (so `512 - 64 - 64 = 384 KB`
@@ -99,7 +99,7 @@ rejects them):
 - cares: `--slab-pool-size 10737418240` (10 GiB)
 
 The `--max-batch-time` knob is for a libpng-specific 9-second batch
-timeout (pathological-input cull). cuAFL has `AFL_COQUI_TIMEOUT_US`
+timeout (pathological-input cull). coqui mode has `AFL_COQUI_TIMEOUT_US`
 env-var for similar.
 
 ## 5. --coqui + persistent-mode (`__AFL_LOOP`) deadlock

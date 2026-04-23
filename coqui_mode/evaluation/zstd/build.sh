@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — build the cuAFL zstd fuzz target.
+# build.sh — build the coqui mode zstd fuzz target.
 #
 # Produces in this directory:
 #   zstd_simple_decompress_fuzzer.cubin — GPU kernel (sm_75), compiled by
@@ -38,7 +38,7 @@ ARCH="sm_75"
 STACK_SIZE=32768        # coqui-cc default (zstd.nix does not override)
 SLAB_POOL_SIZE=0        # zstd.nix does not set a slab pool
 
-CPU_OUT_LINK="/tmp/cuafl-zstd-cpu"
+CPU_OUT_LINK="/tmp/coqui-zstd-cpu"
 CPU_BINARY_NAME="zstd_simple_decompress_fuzzer"  # harnessName in cpu-target-specs.nix
 HARNESS_NAME="zstd_simple_decompress_fuzzer"     # == CPU_BINARY_NAME for zstd
 
@@ -143,7 +143,7 @@ fi
 
 # --- Summary ------------------------------------------------------------
 echo
-echo "=== cuAFL zstd build complete ==="
+echo "=== coqui mode zstd build complete ==="
 ls -la "${HERE}/${HARNESS_NAME}.cubin" "${HERE}/${HARNESS_NAME}.conf" \
        "${HERE}/${HARNESS_NAME}_cpu"   "${HERE}/seeds" 2>/dev/null || true
 [[ -L "${HERE}/dict" ]] && ls -la "${HERE}/dict" || true

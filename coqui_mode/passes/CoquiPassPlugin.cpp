@@ -1,7 +1,7 @@
 /*
  * CoquiPassPlugin.cpp --- LLVM pass plugin entry + registration.
  *
- * Registers the `coqui` pass that runs all cuAFL transforms in order.
+ * Registers the `coqui` pass that runs all coqui mode transforms in order.
  */
 
 #include "Transforms.h"

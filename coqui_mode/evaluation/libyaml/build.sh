@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — build libyaml cuAFL evaluation target.
+# build.sh — build libyaml coqui mode evaluation target.
 #
 # Produces in the current directory:
 #   libyaml_parser_fuzzer.cubin — GPU kernel (sm_75)
@@ -19,13 +19,13 @@
 #     defaults (32768 stack; 0 slab pool).
 #   - libyaml's api.c/scanner.c use assert() (from <assert.h>), which expands to
 #     __assert_fail on NVPTX. coqui's compiler rewrites that via its LibcTransform
-#     pass, but cuAFL's coqui-cc driver only runs the coqui-link + always-inline
+#     pass, but coqui mode's coqui-cc driver only runs the coqui-link + always-inline
 #     passes (LibcTransform is not ported), so the ExternalSymbolGatekeeper
 #     rejects __assert_fail. We pass -D NDEBUG to make <assert.h> expand assert()
 #     to a no-op at preprocess time — matches the stb_image target's
 #     `-D STBI_ASSERT(x)=` workaround. GPU asserts become non-fatal;
 #     the CPU AFL++ binary still honors them for host-side verification.
-#   - Same story for strdup/memcpy/memmove/memset: cuAFL's coqui-cc runtime.bc
+#   - Same story for strdup/memcpy/memmove/memset: coqui mode's coqui-cc runtime.bc
 #     exports only __coqui_malloc/calloc/free/realloc/memcmp/strlen/strcmp/
 #     strncmp/strchr/strtod/trap — no strdup, no memcpy, no memset. libyaml
 #     needs all four, so we link a local libyaml_stubs.c that defines them
@@ -38,7 +38,7 @@ cd "${SCRIPT_DIR}"
 
 COQUI_REPO="/home/gpizarro/coqui"
 COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/cuafl-libyaml-cpu"
+CPU_OUT_LINK="/tmp/coqui-libyaml-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
 ARCH="sm_75"
 
@@ -98,7 +98,7 @@ echo "=== [4/5] Build GPU cubin via coqui-cc ==="
 #   -D YAML_VERSION_*           — version macros (normally provided by configure)
 # Source list matches the nix spec exactly (parser-only; no dumper/emitter/writer).
 # Sanitizer flags from nix/sanitizer-flags.nix:default are NOT replicated here —
-# coqui-cc (cuAFL build) does not accept -fsanitize; it instruments on its own.
+# coqui-cc (coqui mode build) does not accept -fsanitize; it instruments on its own.
 "${COQUI_CC}" \
   -arch "${ARCH}" \
   -I "${YAML_SRC}/include" \

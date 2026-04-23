@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fuzz.sh — launch cuAFL afl-fuzz --coqui on the libxml2 target.
+# fuzz.sh — launch coqui mode afl-fuzz --coqui on the libxml2 target.
 #
 # Prereq: run ./build.sh first (produces libxml2_xml_read_fuzzer.{cubin,conf},
 # libxml2_xml_read_fuzzer_cpu, seeds/).
@@ -22,7 +22,7 @@ for f in libxml2_xml_read_fuzzer.cubin libxml2_xml_read_fuzzer.conf \
   fi
 done
 
-# cuAFL env:
+# coqui mode env:
 #   AFL_COQUI_CUBIN                         — absolute path to the sm_75 cubin
 #   AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 — suppress core-dump warning
 #   AFL_SKIP_CPUFREQ=1                      — don't gate on CPU freq governor

@@ -1,7 +1,7 @@
-# cuAFL libjpeg-turbo evaluation target
+# coqui mode libjpeg-turbo evaluation target
 
 A self-contained fuzz setup that builds libjpeg-turbo 3.0.4 (baseline JPEG
-decode only) + oss-fuzz-style harness for cuAFL (`afl-fuzz --coqui`) and
+decode only) + oss-fuzz-style harness for coqui mode (`afl-fuzz --coqui`) and
 the matching AFL++ instrumented CPU binary for host verification.
 
 Mirrors `/home/gpizarro/coqui/nix/targets/libjpeg-turbo.nix` exactly: same
@@ -24,7 +24,7 @@ corpus come from the coqui `target-libjpeg-turbo-aflplusplus` nix package.
 The CPU binary and seed/dict dirs come from:
 
 ```
-nix build '.#target-libjpeg-turbo-aflplusplus' --out-link /tmp/cuafl-libjpeg-turbo-cpu
+nix build '.#target-libjpeg-turbo-aflplusplus' --out-link /tmp/coqui-libjpeg-turbo-cpu
 ```
 
 `build.sh` runs that command and symlinks the artifacts into the local
@@ -35,7 +35,7 @@ dir. All symlinks and `jpeg_include/` are in `.gitignore`.
 ```
 cd /home/gpizarro/cuAFL/coqui_mode/evaluation/libjpeg-turbo
 ./build.sh   # builds cubin + conf + CPU binary + seeds/dict
-./fuzz.sh    # launches cuAFL afl-fuzz --coqui on GPU 0
+./fuzz.sh    # launches coqui mode afl-fuzz --coqui on GPU 0
 ```
 
 Extra args to `fuzz.sh` are forwarded to `afl-fuzz` (after `-- <binary>`):
@@ -47,8 +47,8 @@ AFL_RESUME=1 ./fuzz.sh
 
 ## Dependencies
 
-- cuAFL development build: `/home/gpizarro/cuAFL/afl-fuzz`
-- `coqui-cc`: `/usr/local/bin/coqui-cc` (cuAFL compiler driver)
+- coqui mode development build: `/home/gpizarro/cuAFL/afl-fuzz`
+- `coqui-cc`: `/usr/local/bin/coqui-cc` (coqui mode compiler driver)
 - nix 2.34+, with `/home/gpizarro/coqui` checkout providing the flake
 - NVIDIA driver + CUDA on the host (for `libcuda.so.1`)
 - GPU index 0 is an RTX Titan (sm_75) per `CLAUDE.local.md`
@@ -61,9 +61,9 @@ AFL_RESUME=1 ./fuzz.sh
 === Build complete ===
 -rw-rw-r-- 1 gpizarro gpizarro       45 Apr 22 15:45 libjpeg_turbo_decompress_fuzzer.conf
 -rw-rw-r-- 1 gpizarro gpizarro 12194600 Apr 22 15:45 libjpeg_turbo_decompress_fuzzer.cubin
-lrwxrwxrwx 1 gpizarro gpizarro       60 Apr 22 15:45 libjpeg_turbo_decompress_fuzzer_cpu -> /tmp/cuafl-libjpeg-turbo-cpu/libjpeg_turbo_decompress_fuzzer
-lrwxrwxrwx 1 gpizarro gpizarro       34 Apr 22 15:45 seeds -> /tmp/cuafl-libjpeg-turbo-cpu/seeds
-lrwxrwxrwx 1 gpizarro gpizarro       33 Apr 22 15:45 dict  -> /tmp/cuafl-libjpeg-turbo-cpu/dict
+lrwxrwxrwx 1 gpizarro gpizarro       60 Apr 22 15:45 libjpeg_turbo_decompress_fuzzer_cpu -> /tmp/coqui-libjpeg-turbo-cpu/libjpeg_turbo_decompress_fuzzer
+lrwxrwxrwx 1 gpizarro gpizarro       34 Apr 22 15:45 seeds -> /tmp/coqui-libjpeg-turbo-cpu/seeds
+lrwxrwxrwx 1 gpizarro gpizarro       33 Apr 22 15:45 dict  -> /tmp/coqui-libjpeg-turbo-cpu/dict
   conf:
     stack_size=32768
     slab_pool_size=0
@@ -71,7 +71,7 @@ lrwxrwxrwx 1 gpizarro gpizarro       33 Apr 22 15:45 dict  -> /tmp/cuafl-libjpeg
 ```
 
 The GPU cubin is **12.2 MB** — substantially larger than the ~3.1 MB
-noted in the upstream harness comment. The extra is cuAFL's heap-ASan
+noted in the upstream harness comment. The extra is coqui mode's heap-ASan
 instrumentation: `[coqui-asan] Instrumented 8528 load(s) and 6904
 store(s)` adds runtime check wrappers at every memory op. No ptxas
 errors.
@@ -80,7 +80,7 @@ errors.
 
 ### libc stubs for jerror.c
 
-cuAFL's `CoquiPassPlugin` has a narrower libc port than upstream coqui.
+coqui mode's `CoquiPassPlugin` has a narrower libc port than upstream coqui.
 Its `Libc.cpp` only rewrites `strlen`, `strcmp`, `strncmp`, `memcmp`,
 `strchr`, and `strtod` to `__coqui_*` equivalents. The libjpeg-turbo
 harness reaches three additional libc symbols through `jerror.c`:
@@ -89,7 +89,7 @@ harness reaches three additional libc symbols through `jerror.c`:
 - `fprintf` + `stderr` (from `output_message`)
 - `exit` (from `error_exit`)
 
-All three land in cuAFL's `ExternalSymbolGatekeeper` and abort the
+All three land in coqui mode's `ExternalSymbolGatekeeper` and abort the
 build. The file `libjpeg_turbo_libc_stubs.c` provides device-side
 no-op implementations:
 
@@ -102,7 +102,7 @@ need to render human-readable strings — the thread terminates before
 anything reads the buffer or stderr. The **CPU build is unchanged**
 (links to the real libc from the nix aflplusplus target).
 
-If/when cuAFL's `Libc.cpp` ports `snprintf`, `fprintf`, and `exit`, this
+If/when coqui mode's `Libc.cpp` ports `snprintf`, `fprintf`, and `exit`, this
 stub can be deleted.
 
 ### setjmp/longjmp
@@ -128,7 +128,7 @@ is the same trick the upstream `libjpeg-turbo.nix` uses.
 ### coqui-cc does not accept sanitizer flags
 
 The nix spec passes `${sanitizers.default}` (a block of `-fsanitize=...`
-options) to the upstream coqui driver. cuAFL's `coqui-cc` does not
+options) to the upstream coqui driver. coqui mode's `coqui-cc` does not
 expose `-fsanitize` — sanitizers are baked into `CoquiPassPlugin.so`
 and applied unconditionally. `build.sh` therefore omits those flags.
 
@@ -144,7 +144,7 @@ DRI/SOS markers + JFIF/EXIF signatures + common SOF sampling factors.
 ## Gotchas
 
 - **Don't `git add` the symlinks or `jpeg_include/`.** The binary +
-  `seeds` + `dict` all point at `/tmp/cuafl-libjpeg-turbo-cpu/…` or
+  `seeds` + `dict` all point at `/tmp/coqui-libjpeg-turbo-cpu/…` or
   the nix store. The staged `jpeg_include/` tree is regenerated on
   every `build.sh` run. All are in `.gitignore`.
 - **GPU device pinning.** Everything here assumes device index 0 (RTX
@@ -162,7 +162,7 @@ DRI/SOS markers + JFIF/EXIF signatures + common SOF sampling factors.
   `/home/gpizarro/coqui/harness/targets/libjpeg_turbo_decompress_fuzzer.c`
   and `libjpeg_turbo_stubs.c`. `build.sh` references them via absolute
   paths.
-- **Orphan-safe.** cuAFL's `afl-fuzz` installs `PR_SET_PDEATHSIG` on the
+- **Orphan-safe.** coqui mode's `afl-fuzz` installs `PR_SET_PDEATHSIG` on the
   forkserver (fixed in `aadd355b`), so killing this shell cleanly tears
   down the fuzzer. Closing a tmux pane does NOT reach the fuzzer — use
   `pkill -u "$USER" -KILL -f "afl-fuzz --coqui"` before relaunching and

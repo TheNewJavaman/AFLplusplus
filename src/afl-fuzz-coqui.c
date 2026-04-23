@@ -1,9 +1,9 @@
 /*
- * afl-fuzz-coqui.c --- cuAFL coqui_mode real CUDA implementation.
+ * afl-fuzz-coqui.c --- coqui mode coqui_mode real CUDA implementation.
  *
  * Real CUDA driver API backend for coqui_mode per spec §8.4.
  *
- * Spec: docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md
+ * Spec: docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md
  */
 
 #include "afl-fuzz.h"
@@ -182,7 +182,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
           static_usage, total_budget);
   }
 
-  /* 6. Batch sizing (with u64 overflow protection from cuAFL T3.6 fixup) */
+  /* 6. Batch sizing (with u64 overflow protection from coqui mode T3.6 fixup) */
   ctx->batch_size = 8192;
   ctx->max_input_size = afl->max_length ? afl->max_length : 4096;
   unsigned long long budget64 = ((unsigned long long)ctx->batch_size

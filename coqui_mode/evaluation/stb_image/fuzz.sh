@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fuzz.sh — launch cuAFL afl-fuzz --coqui on the stb_image target.
+# fuzz.sh — launch coqui mode afl-fuzz --coqui on the stb_image target.
 #
 # Prereq: run ./build.sh first (produces stb_image_read_fuzzer.{cubin,conf},
 # stb_image_read_fuzzer_cpu, seeds/).
@@ -22,7 +22,7 @@ for f in "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${HARNESS_BASEN
   fi
 done
 
-# cuAFL env:
+# coqui mode env:
 #   AFL_COQUI_CUBIN              — absolute path to the sm_75 cubin
 #   AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 — suppress core-dump warning
 #   AFL_SKIP_CPUFREQ=1           — don't gate on CPU freq governor

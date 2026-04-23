@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build the c-ares (DNS parser) fuzz target for cuAFL.
+# Build the c-ares (DNS parser) fuzz target for coqui mode.
 #
 # Produces in this directory:
-#   cares_parse_reply_fuzzer.cubin  - GPU kernel (for cuAFL coqui_mode)
+#   cares_parse_reply_fuzzer.cubin  - GPU kernel (for coqui mode coqui_mode)
 #   cares_parse_reply_fuzzer.conf   - runtime config (emitted alongside cubin)
 #   cares_parse_reply_fuzzer_cpu    - AFL++-instrumented CPU binary (forkserver target)
 #   seeds/                          - 74 DNS wire-format seed corpus (symlink to nix store)
@@ -22,7 +22,7 @@ HARNESS="cares_parse_reply_fuzzer"
 
 COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
 COQUI_REPO="${COQUI_REPO:-/home/gpizarro/coqui}"
-CPU_OUT_LINK="${CPU_OUT_LINK:-/tmp/cuafl-cares-cpu}"
+CPU_OUT_LINK="${CPU_OUT_LINK:-/tmp/coqui-cares-cpu}"
 
 command -v "$COQUI_CC" >/dev/null || {
   echo "error: coqui-cc not found at $COQUI_CC" >&2
@@ -34,7 +34,7 @@ command -v "$COQUI_CC" >/dev/null || {
 }
 
 # --- Step 1: Build AFL++ CPU binary via nix ----------------------------------
-# The CPU fuzzer variant is used by cuAFL as the forkserver target (it provides
+# The CPU fuzzer variant is used by coqui mode as the forkserver target (it provides
 # the classified exit path for crash verification). We consume the nix-built
 # artifact directly so we inherit oss-fuzz-equivalent build flags + sanitizers.
 
@@ -232,7 +232,7 @@ S="$CARES_SRC/src/lib"
   -o "$HARNESS"
 
 [ -f "$HARNESS.cubin" ] || { echo "error: coqui-cc did not produce $HARNESS.cubin" >&2; exit 1; }
-[ -f "$HARNESS.conf" ]  || echo "warning: $HARNESS.conf was not emitted (cuAFL may use defaults)" >&2
+[ -f "$HARNESS.conf" ]  || echo "warning: $HARNESS.conf was not emitted (coqui mode may use defaults)" >&2
 
 # --- Step 5: Stage the CPU binary, seeds, and dict ---------------------------
 

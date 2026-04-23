@@ -5,7 +5,7 @@ libpng_read_fuzzer.conf
 libpng_read_fuzzer.ptx
 libpng_read_fuzzer.bc
 
-# Symlinks into /tmp/cuafl-libpng-cpu or /nix/store
+# Symlinks into /tmp/coqui-libpng-cpu or /nix/store
 libpng_read_fuzzer_cpu
 seeds
 dict

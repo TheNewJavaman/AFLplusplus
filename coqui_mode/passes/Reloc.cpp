@@ -1,7 +1,7 @@
 /*
  * Reloc.cpp --- break circular initializer dependencies between globals.
  *
- * Ported from /coqui/src/RelocTransform.cpp. Adapted for cuAFL's post-link
+ * Ported from /coqui/src/RelocTransform.cpp. Adapted for coqui mode's post-link
  * pipeline: runs after llvm-link + FuzzEntry, so __coqui_fuzz_kernel is
  * always present. For each back-edge in the global dependency graph, the
  * pass nulls the cyclic reference in the source's initializer and emits a

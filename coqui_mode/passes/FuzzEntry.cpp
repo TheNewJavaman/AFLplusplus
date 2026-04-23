@@ -31,7 +31,7 @@ bool runFuzzEntry(Module &M) {
   if (!User) {
     report_fatal_error(
       "[coqui-cc] FuzzEntry: LLVMFuzzerTestOneInput not found — "
-      "every cuAFL target must define it");
+      "every coqui mode target must define it");
   }
   User->setName("__coqui_fuzz_execute");
 

@@ -1,7 +1,7 @@
-# cuAFL cmark evaluation target
+# coqui mode cmark evaluation target
 
 Adapts the cmark (CommonMark Markdown parser) fuzz target from coqui so it can
-be driven with cuAFL's `afl-fuzz --coqui`.
+be driven with coqui mode's `afl-fuzz --coqui`.
 
 - Upstream: https://github.com/commonmark/cmark (pinned to `0.31.1`)
 - GPU ref spec: `/home/gpizarro/coqui/nix/targets/cmark.nix`
@@ -34,12 +34,12 @@ Used by: cmark_render_html
 
 - `cmark`'s renderers (`html.c`, `commonmark.c`, `xml.c`, `man.c`, `latex.c`)
   all call `snprintf` for integer-to-string conversion.
-- The cuAFL `coqui-cc` device runtime (`/usr/local/lib/coqui-cc/runtime.bc`)
+- The coqui mode `coqui-cc` device runtime (`/usr/local/lib/coqui-cc/runtime.bc`)
   exposes `__coqui_malloc`, `__coqui_strlen`, `__coqui_memcmp`, ... but
   **no `printf`/`snprintf` family**; the `ExternalSymbolGatekeeper` pass refuses
   any build that leaves these unresolved.
 - The upstream coqui flake solves this by linking `coqui-musl-bitcode` (a
-  port of musl libc to NVPTX); cuAFL's compressed `coqui-cc` distribution does
+  port of musl libc to NVPTX); coqui mode's compressed `coqui-cc` distribution does
   not ship a libc bitcode equivalent.
 - The harness itself uses `cmark_markdown_to_html` in mode 3, which pulls in
   `cmark_render_html` regardless of whether `html.c` is passed explicitly;
@@ -62,7 +62,7 @@ Used by: cmark_render_html
 
 ### Paths forward
 
-1. **Add an `snprintf`-family port to cuAFL's device runtime** (likely by
+1. **Add an `snprintf`-family port to coqui mode's device runtime** (likely by
    pulling the relevant translation units from `coqui-musl-bitcode` into
    `coqui_mode/runtime/`, or implementing a minimal integer-only `snprintf`
    under `__coqui_snprintf` plus a `Libc.cpp`-pass rewrite to route
@@ -87,15 +87,15 @@ Used by: cmark_render_html
 - After a successful build the following appear (symlinks into `/nix/store`
   where applicable):
   - `cmark_fuzzer.cubin`, `cmark_fuzzer.conf` (from coqui-cc)
-  - `cmark_fuzzer_cpu` -> `/tmp/cuafl-cmark-cpu/cmark_fuzzer`
-  - `seeds/` -> `/tmp/cuafl-cmark-cpu/seeds`
-  - `dict/` -> `/tmp/cuafl-cmark-cpu/dict`
+  - `cmark_fuzzer_cpu` -> `/tmp/coqui-cmark-cpu/cmark_fuzzer`
+  - `seeds/` -> `/tmp/coqui-cmark-cpu/seeds`
+  - `dict/` -> `/tmp/coqui-cmark-cpu/dict`
   - `out/` — created by `fuzz.sh`; AFL output dir
 
 ## Gotchas
 
 - Requires a working coqui flake at `/home/gpizarro/coqui` (for the AFL++
-  CPU build) and a local install of cuAFL's `coqui-cc` at
+  CPU build) and a local install of coqui mode's `coqui-cc` at
   `/usr/local/bin/coqui-cc` (for the GPU build).
 - `--arch sm_75` is hardcoded in `build.sh` (matches the RTX Titan test box
   per `CLAUDE.local.md`).

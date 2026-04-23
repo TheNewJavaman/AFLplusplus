@@ -1,12 +1,12 @@
 /*
- * libyaml_stubs.c — cuAFL-only glue for libyaml -> coqui-cc runtime.
+ * libyaml_stubs.c — coqui mode-only glue for libyaml -> coqui-cc runtime.
  *
  * coqui's main compiler runs a LibcTransform pass that rewrites libc call
  * sites (strdup, memcpy, memset, ...) to their __coqui_* runtime twins.
- * cuAFL's coqui-cc driver does NOT run that pass; its ExternalSymbolGatekeeper
+ * coqui mode's coqui-cc driver does NOT run that pass; its ExternalSymbolGatekeeper
  * then rejects any unresolved libc symbol it finds in the linked IR.
  *
- * The cuAFL coqui-cc runtime (nm /usr/local/lib/coqui-cc/runtime.bc) exposes:
+ * The coqui mode coqui-cc runtime (nm /usr/local/lib/coqui-cc/runtime.bc) exposes:
  *   __coqui_malloc, __coqui_calloc, __coqui_free, __coqui_realloc,
  *   __coqui_memcmp, __coqui_strlen, __coqui_strcmp, __coqui_strncmp,
  *   __coqui_strchr, __coqui_strtod, __coqui_trap

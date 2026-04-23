@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch cuAFL afl-fuzz on the cmark target.  Requires ./build.sh first.
+# Launch coqui mode afl-fuzz on the cmark target.  Requires ./build.sh first.
 #
 # Extra args ($@) are passed through to afl-fuzz (before the '--' separator
 # breaks that, append them as '-x dict/markdown.dict' etc.).

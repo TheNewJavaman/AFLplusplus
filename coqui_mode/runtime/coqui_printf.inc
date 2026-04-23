@@ -2,7 +2,7 @@
  * Ported from /coqui/runtime/coqui_printf.inc with printf/fprintf/stdout
  * paths removed.
  *
- * cuAFL does not support host-side stdio from the device: no
+ * coqui mode does not support host-side stdio from the device: no
  * __coqui_printf_core, no __coqui_fprintf_core, no stdout buffer, no
  * sancov/trace hook. Only the buffer-writing cores used by sprintf and
  * snprintf are provided.
@@ -353,7 +353,7 @@ static int __coqui_dtoa_g(double val, char *buf, int precision,
  *
  * Note: the upstream coqui engine also serviced printf/fprintf via an
  * alternate write callback (__coqui_write_stdout). That callback and
- * the stdout buffer it targeted are intentionally omitted in cuAFL.
+ * the stdout buffer it targeted are intentionally omitted in coqui mode.
  * ===----------------------------------------------------------------=== */
 
 /* Callback type for output: write n characters from s. */

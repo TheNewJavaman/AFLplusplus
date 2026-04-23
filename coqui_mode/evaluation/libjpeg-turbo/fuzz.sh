@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fuzz.sh — launch cuAFL afl-fuzz --coqui on the libjpeg-turbo target.
+# fuzz.sh — launch coqui mode afl-fuzz --coqui on the libjpeg-turbo target.
 #
 # Prereq: run ./build.sh first (produces the cubin + .conf sidecar + _cpu
 # binary + seeds/ + dict/).
@@ -21,7 +21,7 @@ CPU_BIN="${SCRIPT_DIR}/${HARNESS_NAME}_cpu"
 SEEDS="${SCRIPT_DIR}/seeds"
 OUTDIR="${SCRIPT_DIR}/out"
 
-test -x "${AFL_FUZZ}" || { echo "[fuzz] missing ${AFL_FUZZ} — build cuAFL first" >&2; exit 1; }
+test -x "${AFL_FUZZ}" || { echo "[fuzz] missing ${AFL_FUZZ} — build coqui mode first" >&2; exit 1; }
 test -f "${CUBIN}"    || { echo "[fuzz] missing ${CUBIN} — run ./build.sh"       >&2; exit 1; }
 test -f "${CONF}"     || { echo "[fuzz] missing ${CONF} — run ./build.sh"        >&2; exit 1; }
 test -x "${CPU_BIN}"  || { echo "[fuzz] missing ${CPU_BIN} — run ./build.sh"     >&2; exit 1; }
@@ -35,7 +35,7 @@ export AFL_COQUI_CUBIN="${CUBIN}"
 # GPU device index 0 is the RTX Titan (sm_75) per CLAUDE.local.md.
 export AFL_COQUI_DEVICE="${AFL_COQUI_DEVICE:-0}"
 
-# Pre-flight bypasses (cuAFL convention for bench/benchmark hosts):
+# Pre-flight bypasses (coqui mode convention for bench/benchmark hosts):
 #   MISSING_CRASHES — skip core_pattern warning
 #   SKIP_CPUFREQ    — skip cpu governor check
 #   SKIP_BIN_CHECK  — we're running an AFL-instrumented binary but afl-fuzz
@@ -63,7 +63,7 @@ if [ -d "${SCRIPT_DIR}/dict" ]; then
 fi
 
 echo "==============================================================="
-echo "  cuAFL libjpeg-turbo fuzz launch"
+echo "  coqui mode libjpeg-turbo fuzz launch"
 echo "  GPU:    device ${AFL_COQUI_DEVICE} (expect RTX Titan sm_75)"
 echo "  cubin:  ${CUBIN}"
 echo "  cpu:    ${CPU_BIN}"

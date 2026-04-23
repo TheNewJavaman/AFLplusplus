@@ -5,7 +5,7 @@
  * the actual decompressed size. That indicates a genuine bug in the
  * decompressor, so the kernel should treat it as an unrecoverable crash.
  *
- * cuAFL's `coqui-cc` driver does NOT run the upstream coqui LibcTransform
+ * coqui mode's `coqui-cc` driver does NOT run the upstream coqui LibcTransform
  * pass that rewrites `abort` → `__coqui_abort`, and the bundled runtime.bc
  * provides only `__coqui_trap` (PTX `trap;`) and `__coqui_exit` (PTX `exit;`).
  * Without a user-supplied definition, the CoquiPassPlugin's
@@ -16,7 +16,7 @@
  * Mirrors harness/targets/bz2_assert_stub.c (where `bz_internal_error` calls
  * `abort`): a tiny local stub compiled into the cubin alongside the harness.
  *
- * `__coqui_trap` emits a PTX `trap;` which cuAFL classifies as a signal-11
+ * `__coqui_trap` emits a PTX `trap;` which coqui mode classifies as a signal-11
  * crash — the desired behaviour for a decompression-bug abort.
  */
 

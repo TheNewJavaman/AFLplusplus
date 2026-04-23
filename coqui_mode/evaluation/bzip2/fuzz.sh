@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fuzz.sh — launch cuAFL afl-fuzz --coqui on the bzip2 target.
+# fuzz.sh — launch coqui mode afl-fuzz --coqui on the bzip2 target.
 #
 # Prereq: run ./build.sh first (produces bzip2_fuzzer.{cubin,conf}, _cpu, seeds/).
 #
@@ -20,7 +20,7 @@ for f in bzip2_fuzzer.cubin bzip2_fuzzer.conf bzip2_fuzzer_cpu seeds; do
   fi
 done
 
-# cuAFL env:
+# coqui mode env:
 #   AFL_COQUI_CUBIN              — absolute path to the sm_75 cubin
 #   AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 — suppress core-dump warning
 #   AFL_SKIP_CPUFREQ=1           — don't gate on CPU freq governor

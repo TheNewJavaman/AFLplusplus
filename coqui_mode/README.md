@@ -1,6 +1,6 @@
-# coqui_mode — GPU executor for cuAFL
+# coqui_mode — GPU executor for coqui mode
 
-`coqui_mode` is cuAFL's GPU-backed executor. Targets are compiled to
+`coqui_mode` is coqui mode's GPU-backed executor. Targets are compiled to
 NVIDIA cubins via `coqui-cc`, and AFL++ drives them via the `--coqui`
 CLI flag.
 
@@ -27,7 +27,7 @@ Requires LLVM 18 (matching clang version), CUDA toolkit 13+, and Python 3.
 # Compile target
 coqui-cc -arch sm_75 harness.c lib/*.c -o target.cubin
 
-# Run under cuAFL
+# Run under coqui mode
 afl-clang-fast harness.c lib/*.c -o target
 afl-fuzz --coqui gpu0 -i seeds/ -o out/ -- ./target
 ```

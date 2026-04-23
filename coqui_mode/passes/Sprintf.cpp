@@ -11,7 +11,7 @@
  * coqui_printf.c / coqui_printf.inc.
  *
  * sscanf is handled identically by coqui's original transform but is
- * dropped here: cuAFL's narrowed runtime scope covers buffer writers
+ * dropped here: coqui mode's narrowed runtime scope covers buffer writers
  * only, not the scanf input parser.
  */
 

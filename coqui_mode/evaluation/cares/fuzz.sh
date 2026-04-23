@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Launch cuAFL (coqui_mode) on the c-ares DNS parser fuzz target.
+# Launch coqui mode (coqui_mode) on the c-ares DNS parser fuzz target.
 #
 # Pass-through: any args to this script are forwarded to afl-fuzz, so you can
 # append the usual flags, e.g.:

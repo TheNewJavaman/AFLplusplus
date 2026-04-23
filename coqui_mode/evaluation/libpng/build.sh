@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — build libpng cuAFL evaluation target.
+# build.sh — build libpng coqui mode evaluation target.
 #
 # Produces in the current directory:
 #   libpng_read_fuzzer.cubin      — GPU kernel (sm_75, compiled by coqui-cc)
@@ -18,11 +18,11 @@
 #   * --stack-size 32768 (libpng+zlib call chains overflow the 8KB default).
 #   * --slab-pool-size 2 GiB (chunk allocations exceed the per-thread heap).
 #
-# Notes on cuAFL vs coqui nix differences:
+# Notes on coqui mode vs coqui nix differences:
 #   * coqui-cc does NOT accept --heap-size, --batch-size, --ignore-signal=,
-#     or -fsanitize=. The cuAFL runtime derives heap at startup and reads
+#     or -fsanitize=. The coqui mode runtime derives heap at startup and reads
 #     batch size from AFL_COQUI_BATCH_SIZE.
-#   * Sanitizers are not applied at the GPU build; cuAFL relies on AFL++
+#   * Sanitizers are not applied at the GPU build; coqui mode relies on AFL++
 #     (CPU) for crash verification.
 
 set -euo pipefail
@@ -33,7 +33,7 @@ cd "${SCRIPT_DIR}"
 # --- Fixed paths --------------------------------------------------------
 COQUI_REPO="/home/gpizarro/coqui"
 COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/cuafl-libpng-cpu"
+CPU_OUT_LINK="/tmp/coqui-libpng-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
 ARCH="sm_75"
 STACK_SIZE=32768          # libpng+zlib call chains exceed 8KB hardware stack
@@ -97,26 +97,26 @@ echo "=== [3/5] Patch pnglibconf.h and stage libpng headers ==="
 #   PNG_SIMPLIFIED_{READ,WRITE}_*  — the simplified-API functions
 #                               (png_safe_error/png_safe_execute) use
 #                               setjmp/longjmp directly under their own guard.
-#   PNG_CONSOLE_IO_SUPPORTED  — cuAFL specific: gates the fprintf(stderr, ...)
-#                               branches in pngerror.c. cuAFL's coqui-cc
+#   PNG_CONSOLE_IO_SUPPORTED  — coqui mode specific: gates the fprintf(stderr, ...)
+#                               branches in pngerror.c. coqui mode's coqui-cc
 #                               runtime.bc does NOT stub fprintf, so
 #                               ExternalSymbolGatekeeper aborts ("unresolved
 #                               external 'fprintf' — Used by: png_app_error").
 #                               The coqui project's own runtime has a stub;
-#                               cuAFL does not. Stripping CONSOLE_IO_SUPPORTED
+#                               coqui mode does not. Stripping CONSOLE_IO_SUPPORTED
 #                               forces pngerror.c down the "assume nothing"
 #                               path that only calls the user error_fn.
-#   PNG_STDIO_SUPPORTED       — cuAFL specific: gates fread/fwrite usage in
+#   PNG_STDIO_SUPPORTED       — coqui mode specific: gates fread/fwrite usage in
 #                               pngrio.c/pngwio.c. Same reason — no stdio
-#                               stubs in cuAFL's device runtime. Our harness
+#                               stubs in coqui mode's device runtime. Our harness
 #                               uses png_set_read_fn/png_set_write_fn, so the
 #                               default stdio io-ptr paths are unused anyway.
-#   PNG_FLOATING_ARITHMETIC_SUPPORTED — cuAFL specific: gates pow()/floor()
+#   PNG_FLOATING_ARITHMETIC_SUPPORTED — coqui mode specific: gates pow()/floor()
 #                               calls in png.c gamma computation. The NVPTX
 #                               backend cannot select llvm.pow.f64 without
 #                               a math-runtime transform; coqui's build has
 #                               MathTransform.cpp that rewrites intrinsics to
-#                               __coqui_pow et al., cuAFL does not. Stripping
+#                               __coqui_pow et al., coqui mode does not. Stripping
 #                               this macro forces libpng's fixed-point gamma
 #                               fallback (png_log8bit + png_exp8bit +
 #                               png_muldiv) which uses only integer ops.
@@ -155,11 +155,11 @@ echo "=== [4/5] Build GPU cubin via coqui-cc ==="
 # NOTE: coqui-cc does NOT accept --heap-size, --batch-size, --ignore-signal=,
 # or -fsanitize= flags (see libpng.nix for comparison).
 #
-# Extra cuAFL-specific stub: png_abort_stub.c
+# Extra coqui mode-specific stub: png_abort_stub.c
 #   libpng's internal error path ends in PNG_ABORT() (= abort() by default,
 #   pngpriv.h:589), and its png_safe_* paths call abort() directly.
 #   coqui's nix build papers over this with `--ignore-signal=abort` in its
-#   pass plugin; cuAFL's ExternalSymbolGatekeeper does NOT accept `abort`
+#   pass plugin; coqui mode's ExternalSymbolGatekeeper does NOT accept `abort`
 #   ("unresolved external 'abort' — Used by: png_chunk_error"). The stub
 #   provides abort() -> __coqui_trap() so llvm-link has no unresolved
 #   `abort` symbol. Same pattern as coqui_mode/evaluation/bzip2/bz2_assert_stub.c.

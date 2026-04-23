@@ -1,14 +1,14 @@
-# cuAFL — Resume Prompt
+# coqui mode — Resume Prompt
 
-Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/cuAFL` on branch `cuAFL`. Working tree should be clean.
+Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/cuAFL` on branch `coqui-dev`. Working tree should be clean.
 
 ---
 
 ## Prompt
 
-> I'm continuing work on **cuAFL** — a fork of AFL++ that adds a GPU-backed
+> I'm continuing work on **coqui mode** — a fork of AFL++ that adds a GPU-backed
 > executor mode (`coqui_mode`) selected via `--coqui <sync_id>`. This is on
-> branch `cuAFL` of `/home/gpizarro/cuAFL`. End-to-end pipeline works:
+> branch `coqui-dev` of `/home/gpizarro/cuAFL`. End-to-end pipeline works:
 > `coqui-cc` compiles a target to a cubin, `afl-fuzz --coqui gpu0 -- target.elf`
 > launches batched GPU fuzzing alongside a standard CPU forkserver, and per-batch
 > flagged inputs go through the CPU forkserver to populate `trace_bits` before
@@ -18,14 +18,14 @@ Drop the prompt below into a new Claude Code session, run from `/home/gpizarro/c
 > `src/afl-fuzz-coqui.c:332`.
 >
 > ### Read these to get oriented
-> - **Spec (cuAFL integration):** `docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md`
+> - **Spec (coqui mode integration):** `docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md`
 > - **Spec (coqui internals):** `docs/superpowers/specs/2026-04-18-coqui-internals-design.md`
-> - **Plan (cuAFL):** `docs/superpowers/plans/2026-04-18-cuafl-gpu-backend.md`
+> - **Plan (coqui mode):** `docs/superpowers/plans/2026-04-18-coqui-gpu-backend.md`
 > - **Plan (coqui internals):** `docs/superpowers/plans/2026-04-18-coqui-internals.md`
 > - **Port log:** `docs/coqui_port_log.md` (running list of port-on-demand decisions)
 >
-> Commit history is the source of truth — `git log --oneline cuAFL` shows ~40
-> commits, every one with a clear `cuAFL:` prefix.
+> Commit history is the source of truth — `git log --oneline coqui mode` shows ~40
+> commits, every one with a clear `coqui mode:` prefix.
 >
 > ### Current debugging task
 >

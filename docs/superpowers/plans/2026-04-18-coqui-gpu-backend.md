@@ -1,14 +1,14 @@
-# cuAFL GPU Backend Implementation Plan
+# coqui mode GPU Backend Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an AFL++ executor mode that runs inputs on a GPU in batches, selected via `--coqui <sync_id>`. This plan covers the AFL++ integration layer only — the GPU backend internals (LLVM passes, CUDA runtime) are explicitly deferred and shipped as a hollow stub that makes cuAFL compile and run without crashing.
+**Goal:** Add an AFL++ executor mode that runs inputs on a GPU in batches, selected via `--coqui <sync_id>`. This plan covers the AFL++ integration layer only — the GPU backend internals (LLVM passes, CUDA runtime) are explicitly deferred and shipped as a hollow stub that makes coqui mode compile and run without crashing.
 
 **Architecture:** A new boolean `coqui_mode` joins the existing mode flags on `afl_forkserver_t` (alongside `qemu_mode`, `frida_mode`, `nyx_mode`, `cs_mode`). The seam is `common_fuzz_stuff()` in `src/afl-fuzz-run.c` — under `--coqui`, a branch routes inputs into a packed batch sink rather than invoking a forkserver. `fuzz_run_target()` is also short-circuited (returns trivial coverage) so calibrate/trim/sync paths succeed in gpu_mode without a real executor. Det and cmplog stages in `fuzz_one()` are gated off. A new module `src/afl-fuzz-coqui.{c,h}` defines the contract and holds the hollow stub; the real GPU backend will drop in behind the same contract in a later phase.
 
 **Tech Stack:** C99, AFL++ build system (GNU make, no autotools). `src/afl-fuzz*.c` files are picked up automatically via `AFL_FUZZ_FILES = $(wildcard src/afl-fuzz*.c)` — no GNUmakefile changes needed. No CUDA dependency in this plan (stub is pure C).
 
-**Spec:** `docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md`
+**Spec:** `docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md`
 
 **User preferences:**
 - No tests (user directive: "let's skip tests"). Verification is manual smoke-testing and `does it compile`.
@@ -30,7 +30,7 @@
 - `src/afl-fuzz-run.c` — branch in `common_fuzz_stuff` (batch sink) and `fuzz_run_target` (trivial-coverage short-circuit).
 - `src/afl-forkserver.c` — early return in `afl_fsrv_start` when `coqui_mode` is set.
 - `src/afl-fuzz-one.c` — gate det stages and cmplog stage on `afl->gpu_mode`.
-- `Changelog.md` — one-line note for the cuAFL fork.
+- `Changelog.md` — one-line note for the coqui mode fork.
 
 **Not modified:** `GNUmakefile` (wildcard picks up `afl-fuzz-coqui.c`), `Makefile`, sync code, queue code, bitmap code, TUI, stats, power schedules, or any mutation logic.
 
@@ -72,7 +72,7 @@ Expected: builds cleanly, no warnings about the new field.
 
 ```bash
 git add include/forkserver.h
-git commit -m "cuAFL: add coqui_mode field to afl_forkserver_t
+git commit -m "coqui mode: add coqui_mode field to afl_forkserver_t
 
 Mirrors the existing mode boolean pattern (qemu_mode, frida_mode,
 nyx_mode, cs_mode). No behavior attached yet; wiring lands in later
@@ -116,7 +116,7 @@ Expected: builds cleanly. (Struct forward declaration is fine because we only ho
 
 ```bash
 git add include/afl-fuzz.h
-git commit -m "cuAFL: add gpu_mode + coqui context pointer to afl_state_t
+git commit -m "coqui mode: add gpu_mode + coqui context pointer to afl_state_t
 
 Forward-declares struct coqui_ctx so afl-fuzz.h stays free of CUDA
 dependencies. The full type ships in afl-fuzz-coqui.h in a later commit.
@@ -234,13 +234,13 @@ Expected: fails for another reason (missing target, missing seeds dir) but NOT f
 
 ```bash
 git add src/afl-fuzz.c
-git commit -m "cuAFL: add --coqui <sync_id> long-only flag
+git commit -m "coqui mode: add --coqui <sync_id> long-only flag
 
 Converts getopt() to getopt_long() (drop-in superset; all existing
 short flags unchanged). Adds --coqui handler modeled on -S:
 sets sync_id, gpu_mode, fsrv.coqui_mode, skip_deterministic.
 
--G (max input length) is untouched — cuAFL reads afl->max_length
+-G (max input length) is untouched — coqui mode reads afl->max_length
 directly for batch buffer sizing.
 "
 ```
@@ -249,7 +249,7 @@ directly for batch buffer sizing.
 
 ## Phase 2: Contract + Stub
 
-Defines the coqui_mode API in a header and provides a hollow implementation that lets cuAFL run end-to-end without crashing.
+Defines the coqui_mode API in a header and provides a hollow implementation that lets coqui mode run end-to-end without crashing.
 
 ### Task 2.1: Write `include/afl-fuzz-coqui.h`
 
@@ -262,13 +262,13 @@ Create `include/afl-fuzz-coqui.h` with the following content:
 
 ```c
 /*
- * afl-fuzz-coqui.h --- cuAFL coqui_mode contract.
+ * afl-fuzz-coqui.h --- coqui mode coqui_mode contract.
  *
  * Defines the interface between core afl-fuzz and the GPU (coqui) backend.
- * A hollow stub implementation in afl-fuzz-coqui.c makes cuAFL compile and
+ * A hollow stub implementation in afl-fuzz-coqui.c makes coqui mode compile and
  * run without a real GPU; the real backend will drop in behind this contract.
  *
- * Spec: docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md
+ * Spec: docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md
  */
 
 #ifndef _HAVE_AFL_FUZZ_COQUI_H
@@ -382,12 +382,12 @@ Expected: builds cleanly.
 
 ```bash
 git add include/afl-fuzz-coqui.h
-git commit -m "cuAFL: define coqui_mode contract in afl-fuzz-coqui.h
+git commit -m "coqui mode: define coqui_mode contract in afl-fuzz-coqui.h
 
 Types (coqui_status_t, coqui_batch_t, coqui_ctx_t) and 5-function API
 (coqui_init, coqui_submit_input, coqui_flush_batch, coqui_calibrate_one,
 coqui_shutdown). Matches the spec at
-docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md.
+docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md.
 
 Forward-declares struct afl_state so the header stays free of broader
 afl-fuzz.h dependencies.
@@ -403,17 +403,17 @@ afl-fuzz.h dependencies.
 
 - [ ] **Step 1: Create the stub file**
 
-Create `src/afl-fuzz-coqui.c` with a hollow implementation that makes cuAFL compile and run but does no real execution:
+Create `src/afl-fuzz-coqui.c` with a hollow implementation that makes coqui mode compile and run but does no real execution:
 
 ```c
 /*
- * afl-fuzz-coqui.c --- cuAFL coqui_mode stub implementation.
+ * afl-fuzz-coqui.c --- coqui mode coqui_mode stub implementation.
  *
- * Hollow stub behind the coqui_mode contract. Lets cuAFL compile and run
+ * Hollow stub behind the coqui_mode contract. Lets coqui mode compile and run
  * end-to-end under --coqui without a real GPU backend. Real CUDA-backed
  * implementation drops in behind the same contract in a later phase.
  *
- * Spec: docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md
+ * Spec: docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md
  */
 
 #include "afl-fuzz.h"
@@ -595,7 +595,7 @@ Expected: builds cleanly. The new `.c` file is compiled but no one calls its fun
 
 ```bash
 git add src/afl-fuzz-coqui.c
-git commit -m "cuAFL: hollow stub for coqui_mode
+git commit -m "coqui mode: hollow stub for coqui_mode
 
 Implements the 5-function contract from afl-fuzz-coqui.h. Allocates
 ping-pong host buffers, packs inputs with 8-byte alignment, discards
@@ -648,7 +648,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-forkserver.c
-git commit -m "cuAFL: short-circuit afl_fsrv_start in coqui_mode
+git commit -m "coqui mode: short-circuit afl_fsrv_start in coqui_mode
 
 Returns early — no fork+exec, no pipes. coqui_init() in the new
 afl-fuzz-coqui.c path owns execution for --coqui instances. Pattern
@@ -692,7 +692,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz-run.c
-git commit -m "cuAFL: short-circuit fuzz_run_target in gpu_mode
+git commit -m "coqui mode: short-circuit fuzz_run_target in gpu_mode
 
 Calibrate, trim, and sync-in paths all go through fuzz_run_target.
 A single gpu_mode branch at the top populates trace_bits with trivial
@@ -740,7 +740,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz-run.c
-git commit -m "cuAFL: common_fuzz_stuff routes to coqui batch sink in gpu_mode
+git commit -m "coqui mode: common_fuzz_stuff routes to coqui batch sink in gpu_mode
 
 Load-bearing change: every havoc/splice mutation generated by fuzz_one
 calls common_fuzz_stuff, which now routes through coqui_submit_input
@@ -794,7 +794,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz-one.c
-git commit -m "cuAFL: audit det-stage gating under gpu_mode
+git commit -m "coqui mode: audit det-stage gating under gpu_mode
 
 Most det sites are already gated by skip_deterministic (set when
 --coqui is parsed). This commit adds explicit gpu_mode guards to any
@@ -840,7 +840,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz-one.c
-git commit -m "cuAFL: skip cmplog stage in gpu_mode
+git commit -m "coqui mode: skip cmplog stage in gpu_mode
 
 cmplog needs a cmplog-instrumented ELF passed via -c. Under --coqui the
 target is a cubin, so the stage is gated off. Findings from broker-side
@@ -913,7 +913,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz.c
-git commit -m "cuAFL: wire coqui_init/shutdown into afl-fuzz main()
+git commit -m "coqui mode: wire coqui_init/shutdown into afl-fuzz main()
 
 Initializes the coqui context after afl_fsrv_init and before any
 fsrv_start call (which short-circuits in coqui_mode). Cubin path is
@@ -966,7 +966,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz-one.c
-git commit -m "cuAFL: flush pending batch at stage boundaries
+git commit -m "coqui mode: flush pending batch at stage boundaries
 
 Ensures afl->queued_items reflects every havoc/splice mutation before
 the stage-end productivity check runs. Also flushes at fuzz_one exit
@@ -980,9 +980,9 @@ Stub flush is a no-op today; real GPU backend drains the async kernel.
 
 ## Phase 4: Smoke test
 
-Manual validation that cuAFL compiles and runs end-to-end under `--coqui` without crashing.
+Manual validation that coqui mode compiles and runs end-to-end under `--coqui` without crashing.
 
-### Task 4.1: Build cuAFL from scratch
+### Task 4.1: Build coqui mode from scratch
 
 - [ ] **Step 1: Clean build**
 
@@ -1003,7 +1003,7 @@ Expected: `--coqui id` line appears in help output.
 
 ---
 
-### Task 4.2: Run cuAFL with `--coqui` on a simple target
+### Task 4.2: Run coqui mode with `--coqui` on a simple target
 
 - [ ] **Step 1: Prepare a target and seed**
 
@@ -1015,7 +1015,7 @@ mkdir -p /tmp/seeds && echo -n "hello" > /tmp/seeds/seed0
 rm -rf /tmp/out
 ```
 
-- [ ] **Step 2: Run cuAFL in --coqui mode against the target**
+- [ ] **Step 2: Run coqui mode in --coqui mode against the target**
 
 The stub doesn't care what the target is (it doesn't execute anything). We're just checking that afl-fuzz runs without crashing.
 
@@ -1047,7 +1047,7 @@ No commit for this task — it's a validation pass.
 
 ---
 
-### Task 4.3: Run heterogeneous mesh (broker + cuAFL)
+### Task 4.3: Run heterogeneous mesh (broker + coqui mode)
 
 - [ ] **Step 1: Launch the broker in the background**
 
@@ -1059,7 +1059,7 @@ BROKER_PID=$!
 sleep 3
 ```
 
-- [ ] **Step 2: Launch cuAFL as the GPU secondary**
+- [ ] **Step 2: Launch coqui mode as the GPU secondary**
 
 In a separate shell or with `&`:
 
@@ -1088,18 +1088,18 @@ No commit for this task — it's a validation pass.
 ### Task 5.1: Add a Changelog entry
 
 **Files:**
-- Modify: `Changelog.md` (add an entry for the cuAFL fork)
+- Modify: `Changelog.md` (add an entry for the coqui mode fork)
 
 - [ ] **Step 1: Add entry at the top of Changelog.md**
 
 Open `Changelog.md` and add an entry above the existing 4.40c entry:
 
 ```markdown
-### Version ++cuAFL (dev):
+### Version ++coqui mode (dev):
   - Added `--coqui <sync_id>` flag: runs afl-fuzz as a GPU secondary
     (coqui_mode). Currently ships a hollow stub; real GPU backend lands
     in a follow-up phase. See
-    docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md.
+    docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md.
 
 ### Version ++4.40c (release):
 ```
@@ -1108,7 +1108,7 @@ Open `Changelog.md` and add an entry above the existing 4.40c entry:
 
 ```bash
 git add Changelog.md
-git commit -m "cuAFL: Changelog entry for --coqui stub
+git commit -m "coqui mode: Changelog entry for --coqui stub
 
 Documents the new flag and points at the design spec. Real GPU backend
 work is deferred to a follow-up brainstorm."
@@ -1178,7 +1178,7 @@ All types and identifiers referenced across tasks trace back to a defining task.
 
 ---
 
-Plan complete and saved to `docs/superpowers/plans/2026-04-18-cuafl-gpu-backend.md`. Two execution options:
+Plan complete and saved to `docs/superpowers/plans/2026-04-18-coqui-gpu-backend.md`. Two execution options:
 
 **1. Subagent-Driven (recommended)** — dispatch a fresh subagent per task, review between tasks, fast iteration.
 

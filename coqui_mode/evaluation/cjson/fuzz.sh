@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch cuAFL afl-fuzz against the cjson target on GPU device 0.
+# Launch coqui mode afl-fuzz against the cjson target on GPU device 0.
 #
 # Prerequisites: ./build.sh has produced cjson_fuzzer.cubin, cjson_fuzzer.conf,
 # cjson_fuzzer_cpu, and the seeds/ symlink. Output lands in ./out.
@@ -21,7 +21,7 @@ SEEDS="$HERE/seeds"
 OUTDIR="$HERE/out"
 
 # --- Pre-flight ---------------------------------------------------------
-test -x "$AFL_FUZZ" || { echo "[fuzz] missing $AFL_FUZZ — build cuAFL first" >&2; exit 1; }
+test -x "$AFL_FUZZ" || { echo "[fuzz] missing $AFL_FUZZ — build coqui mode first" >&2; exit 1; }
 test -f "$CUBIN"    || { echo "[fuzz] missing $CUBIN — run ./build.sh"     >&2; exit 1; }
 test -f "$CONF"     || { echo "[fuzz] missing $CONF — run ./build.sh"      >&2; exit 1; }
 test -x "$CPU_BIN"  || { echo "[fuzz] missing $CPU_BIN — run ./build.sh"   >&2; exit 1; }
@@ -36,7 +36,7 @@ export AFL_COQUI_CUBIN="$CUBIN"
 # is the env-var fallback that the runtime also consults.
 export AFL_COQUI_DEVICE=${AFL_COQUI_DEVICE:-0}
 
-# Pre-flight bypasses (per cuAFL conventions — host core_pattern + cpufreq
+# Pre-flight bypasses (per coqui mode conventions — host core_pattern + cpufreq
 # checks are warnings, not bugs).
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 export AFL_SKIP_CPUFREQ=1
@@ -62,7 +62,7 @@ if [ -d "$HERE/dict" ]; then
 fi
 
 echo "==============================================================="
-echo "  cuAFL cjson fuzz launch"
+echo "  coqui mode cjson fuzz launch"
 echo "  GPU:    device $AFL_COQUI_DEVICE (expect RTX Titan sm_75)"
 echo "  cubin:  $CUBIN"
 echo "  cpu:    $CPU_BIN"

@@ -8,7 +8,7 @@ libjpeg_turbo_decompress_fuzzer.ptx
 # Patched jpeg source tree staged for coqui-cc
 jpeg_include/
 
-# Symlinks into /tmp/cuafl-libjpeg-turbo-cpu or /nix/store
+# Symlinks into /tmp/coqui-libjpeg-turbo-cpu or /nix/store
 libjpeg_turbo_decompress_fuzzer_cpu
 seeds
 dict

@@ -1,5 +1,5 @@
 /*
- * coqui_memory.c --- per-thread heap allocator for cuAFL coqui_mode.
+ * coqui_memory.c --- per-thread heap allocator for coqui mode coqui_mode.
  *
  * Freelist-first, bump-fallback allocator over the per-thread heap
  * region (set up by MemoryLayout transform; accessed via __coqui_heap_base).

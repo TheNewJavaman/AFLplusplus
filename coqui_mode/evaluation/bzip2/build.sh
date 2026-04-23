@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — build bzip2 cuAFL evaluation target.
+# build.sh — build bzip2 coqui mode evaluation target.
 #
 # Produces in the current directory:
 #   bzip2_fuzzer.cubin — GPU kernel (sm_75)
@@ -11,7 +11,7 @@
 # Mirrors coqui's nix spec: /home/gpizarro/coqui/nix/targets/bzip2.nix
 #
 # Note: the nix spec passes `--heap-size 524288` and `--batch-size 32768` to
-# coqui; cuAFL's coqui-cc does NOT accept those flags. The cuAFL runtime
+# coqui; coqui mode's coqui-cc does NOT accept those flags. The coqui mode runtime
 # derives heap at startup and reads batch size from AFL_COQUI_BATCH_SIZE.
 set -euo pipefail
 
@@ -20,7 +20,7 @@ cd "${SCRIPT_DIR}"
 
 COQUI_REPO="/home/gpizarro/coqui"
 COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/cuafl-bzip2-cpu"
+CPU_OUT_LINK="/tmp/coqui-bzip2-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
 ARCH="sm_75"
 SLAB_POOL_SIZE=2147483648   # 2 GiB — from bzip2.nix

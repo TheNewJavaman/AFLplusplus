@@ -5,7 +5,7 @@ cjson_fuzzer.conf
 cjson_fuzzer.ptx
 .cjson_fuzzer.build/
 
-# Symlinks pointing into /tmp/cuafl-cjson-cpu or /nix/store
+# Symlinks pointing into /tmp/coqui-cjson-cpu or /nix/store
 cjson_fuzzer_cpu
 seeds
 dict

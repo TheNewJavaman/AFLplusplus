@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the cuAFL cjson fuzz target.
+# Build the coqui mode cjson fuzz target.
 #
 # Produces in this directory:
 #   cjson_fuzzer.cubin      — GPU kernel (compiled by coqui-cc from the
@@ -34,7 +34,7 @@ ARCH=sm_75
 STACK_SIZE=32768
 SLAB_POOL_SIZE=0          # cjson.nix does not set a slab pool
 
-CPU_OUT_LINK=/tmp/cuafl-cjson-cpu     # nix result link (CPU aflplusplus build)
+CPU_OUT_LINK=/tmp/coqui-cjson-cpu     # nix result link (CPU aflplusplus build)
 CPU_BINARY_NAME=cjson_read_fuzzer     # from cpu-target-specs.nix (harnessName)
 
 # --- Pre-flight ---------------------------------------------------------
@@ -101,7 +101,7 @@ echo "[build] coqui-cc -> cjson_fuzzer.cubin + .conf"
 
 # --- Summary ------------------------------------------------------------
 echo
-echo "=== cuAFL cjson build complete ==="
+echo "=== coqui mode cjson build complete ==="
 ls -la "$HERE/cjson_fuzzer.cubin" "$HERE/cjson_fuzzer.conf" \
        "$HERE/cjson_fuzzer_cpu" "$HERE/seeds" 2>/dev/null || true
 [ -L "$HERE/dict" ] && ls -la "$HERE/dict" || true

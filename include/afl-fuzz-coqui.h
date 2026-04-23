@@ -1,11 +1,11 @@
 /*
- * afl-fuzz-coqui.h --- cuAFL coqui_mode contract.
+ * afl-fuzz-coqui.h --- coqui mode coqui_mode contract.
  *
  * Defines the interface between core afl-fuzz and the GPU (coqui) backend.
- * A hollow stub implementation in afl-fuzz-coqui.c makes cuAFL compile and
+ * A hollow stub implementation in afl-fuzz-coqui.c makes coqui mode compile and
  * run without a real GPU; the real backend will drop in behind this contract.
  *
- * Spec: docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md
+ * Spec: docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md
  */
 
 #ifndef _HAVE_AFL_FUZZ_COQUI_H

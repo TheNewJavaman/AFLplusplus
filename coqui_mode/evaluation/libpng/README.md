@@ -1,8 +1,8 @@
-# cuAFL evaluation target: libpng
+# coqui mode evaluation target: libpng
 
 libpng fuzz target (reads PNG via libpng's low-level API), adapted from
 coqui's nix spec (`/home/gpizarro/coqui/nix/targets/libpng.nix`) for
-cuAFL's `coqui-cc` compiler and `afl-fuzz --coqui` runtime.
+coqui mode's `coqui-cc` compiler and `afl-fuzz --coqui` runtime.
 
 libpng depends on zlib; both libraries are compiled into a single cubin.
 The harness (`libpng_read_fuzzer.c`, shared with coqui) is libFuzzer-style
@@ -29,7 +29,7 @@ AFL_RESUME=1 ./fuzz.sh    # resume into existing ./out
 - `build.sh` — idempotent build script.
 - `fuzz.sh` — `afl-fuzz --coqui gpu0` launcher with the standard env vars.
 - `png_abort_stub.c` — local `abort()` → `__coqui_trap()` stub (see
-  "cuAFL-only deltas" below).
+  "coqui mode-only deltas" below).
 - `.gitignore` — excludes build outputs and nix-store symlinks.
 
 ## Target details
@@ -51,16 +51,16 @@ Mirrors `nix/targets/libpng.nix`:
 ### pnglibconf.h patching
 
 libpng ships a prebuilt `scripts/pnglibconf.h.prebuilt`. We replicate
-coqui's sed+echo sequence (with cuAFL-specific additions) to produce a
+coqui's sed+echo sequence (with coqui mode-specific additions) to produce a
 patched `libpng_include/pnglibconf.h`:
 
 | Macro stripped                     | Why |
 |-----------------------------------|-----|
 | `PNG_SETJMP_SUPPORTED`            | Forces pngconf.h to skip `#include <setjmp.h>`; coqui-cc's pass aborts on `_setjmp`. Same as libpng.nix. |
 | `PNG_SIMPLIFIED_{READ,WRITE}_*`   | Drops the simplified-API entry points that use setjmp directly under their own guard. Same as libpng.nix. |
-| `PNG_CONSOLE_IO_SUPPORTED` *(cuAFL only)* | Disables `fprintf(stderr, …)` branches in `pngerror.c`. cuAFL's runtime has no `fprintf` stub; `ExternalSymbolGatekeeper` aborts with "unresolved external 'fprintf' — Used by: png_app_error". |
-| `PNG_STDIO_SUPPORTED` *(cuAFL only)* | Disables `fread`/`fwrite` in `pngrio.c`/`pngwio.c`. Same reason — no stdio stubs. The harness registers its own callbacks via `png_set_{read,write}_fn`, so these default paths are unused anyway. |
-| `PNG_FLOATING_ARITHMETIC_SUPPORTED` *(cuAFL only)* | Disables `pow()`/`floor()` usage in `png.c` gamma-table computation. NVPTX cannot lower `llvm.pow.f64` without a math-runtime transform (coqui's `MathTransform.cpp` rewrites it to `__coqui_pow`; cuAFL has no such transform or stub). Falls back to libpng's built-in fixed-point arithmetic path (`png_log8bit` + `png_exp8bit` + `png_muldiv`). The public API `png_set_gamma(double, double)` still works — only the internal table computation changes. |
+| `PNG_CONSOLE_IO_SUPPORTED` *(coqui mode only)* | Disables `fprintf(stderr, …)` branches in `pngerror.c`. coqui mode's runtime has no `fprintf` stub; `ExternalSymbolGatekeeper` aborts with "unresolved external 'fprintf' — Used by: png_app_error". |
+| `PNG_STDIO_SUPPORTED` *(coqui mode only)* | Disables `fread`/`fwrite` in `pngrio.c`/`pngwio.c`. Same reason — no stdio stubs. The harness registers its own callbacks via `png_set_{read,write}_fn`, so these default paths are unused anyway. |
+| `PNG_FLOATING_ARITHMETIC_SUPPORTED` *(coqui mode only)* | Disables `pow()`/`floor()` usage in `png.c` gamma-table computation. NVPTX cannot lower `llvm.pow.f64` without a math-runtime transform (coqui's `MathTransform.cpp` rewrites it to `__coqui_pow`; coqui mode has no such transform or stub). Falls back to libpng's built-in fixed-point arithmetic path (`png_log8bit` + `png_exp8bit` + `png_muldiv`). The public API `png_set_gamma(double, double)` still works — only the internal table computation changes. |
 
 Appended after the strip:
 ```
@@ -69,26 +69,26 @@ Appended after the strip:
 (Same as libpng.nix — lets the fuzzer explore zlib streams without valid
 ADLER32 checksums.)
 
-### cuAFL-only deltas beyond pnglibconf.h
+### coqui mode-only deltas beyond pnglibconf.h
 
 - **`png_abort_stub.c`** — local stub that defines `void abort(void)`
   to call `__coqui_trap()` (PTX `trap; exit;`). libpng's error path
   ends in `PNG_ABORT()` (= `abort()` via `pngpriv.h:589`); with
   `-D PNG_NO_SETJMP`, every `png_error()` eventually hits this.
   coqui's nix build papers over the unresolved `abort` via its pass
-  plugin's `--ignore-signal=abort`, which cuAFL does not support.
+  plugin's `--ignore-signal=abort`, which coqui mode does not support.
   Providing our own `abort()` definition removes the unresolved
   external symbol entirely. Same pattern as
   `coqui_mode/evaluation/bzip2/bz2_assert_stub.c` (which uses the
   same trick for `bz_internal_error` → `abort`).
 
 - **No sanitizers.** coqui's nix build passes
-  `-fsanitize=address,array-bounds,…` to its compiler; cuAFL's
-  `coqui-cc` does not accept `-fsanitize` flags. cuAFL relies on
+  `-fsanitize=address,array-bounds,…` to its compiler; coqui mode's
+  `coqui-cc` does not accept `-fsanitize` flags. coqui mode relies on
   AFL++ (CPU) for sanitizer-based crash verification. The device
   build is stripped-down for throughput.
 
-- **No `--heap-size`/`--batch-size`.** cuAFL's `coqui-cc` does not
+- **No `--heap-size`/`--batch-size`.** coqui mode's `coqui-cc` does not
   accept these flags; the runtime derives heap at startup and reads
   `AFL_COQUI_BATCH_SIZE` from the env. See `bzip2/build.sh` for the
   same note.
@@ -103,7 +103,7 @@ The nix `target-libpng-aflplusplus` build generates:
 - `dict/png.dict` — chunk types, IHDR field values, zlib headers,
   magic sequences.
 
-These are symlinked from `/tmp/cuafl-libpng-cpu/{seeds,dict}` at build
+These are symlinked from `/tmp/coqui-libpng-cpu/{seeds,dict}` at build
 time.
 
 ## Gotchas
@@ -111,14 +111,14 @@ time.
 - **`ptxas` is very slow.** The libpng+zlib kernel is large (~25
   compilation units, heavy ASan instrumentation, all-inline). `ptxas
   -O1` can take 20–30 minutes on a typical workstation, and even
-  longer when multiple cuAFL evaluation builds are running in
+  longer when multiple coqui mode evaluation builds are running in
   parallel due to 10–50 GB RAM per ptxas. See
   `stb_image/README.md` — same pathology. If you need to iterate on
   build flags, expect the full `build.sh` run to be dominated by
   this step.
 
 - **`AFL_COQUI_CUBIN` "mistyped" warning.** Harmless; the variable is
-  read by the runtime but not yet in cuAFL's env-validator table
+  read by the runtime but not yet in coqui mode's env-validator table
   (same as other evaluation targets).
 
 - **Seeds are symlinks into `/nix/store`.** If the dry-run reports
@@ -139,7 +139,7 @@ cached) and rebuilds the cubin. To rebuild from a fully clean state:
 ```bash
 rm -rf libpng_read_fuzzer* libpng_include seeds dict out \
        .libpng_read_fuzzer.build \
-       /tmp/cuafl-libpng-cpu
+       /tmp/coqui-libpng-cpu
 ./build.sh
 ```
 

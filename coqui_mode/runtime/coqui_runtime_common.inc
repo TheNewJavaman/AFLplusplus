@@ -5,7 +5,7 @@
  * Only the portions required by coqui_printf.inc to implement
  * __coqui_sprintf_core / __coqui_snprintf_core are included here.
  * coqui's full runtime_common.inc is ~5200 lines covering libc, math,
- * VFS, syscalls, etc.; cuAFL keeps those concerns in their own .c
+ * VFS, syscalls, etc.; coqui mode keeps those concerns in their own .c
  * files (coqui_libc.c, coqui_memory.c, coqui_asan.c).
  *
  * This header is #included by coqui_printf.c prior to coqui_printf.inc

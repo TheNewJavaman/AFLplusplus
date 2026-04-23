@@ -1,4 +1,4 @@
-# cuAFL cmark target build outputs
+# coqui mode cmark target build outputs
 cmark_fuzzer.cubin
 cmark_fuzzer.conf
 cmark_fuzzer_cpu

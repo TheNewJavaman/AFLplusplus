@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — build libjpeg-turbo cuAFL evaluation target.
+# build.sh — build libjpeg-turbo coqui mode evaluation target.
 #
 # Produces in this directory:
 #   libjpeg_turbo_decompress_fuzzer.cubin  — GPU kernel (sm_75)
@@ -24,8 +24,8 @@
 #   - --slab-pool-size 0 (nix spec does not set a slab pool)
 #
 # Note: the nix spec passes `${sanitizers.default}` (-fsanitize=...) to the
-# coqui driver, but cuAFL's coqui-cc does not accept -fsanitize flags —
-# sanitizers are baked into the cuAFL pass plugin (/usr/local/lib/coqui-cc/
+# coqui driver, but coqui mode's coqui-cc does not accept -fsanitize flags —
+# sanitizers are baked into the coqui mode pass plugin (/usr/local/lib/coqui-cc/
 # CoquiPassPlugin.so). This matches the cjson/bzip2 build.sh pattern.
 #
 # Note: the nix spec stresses that libjpeg-turbo uses setjmp/longjmp in the
@@ -40,7 +40,7 @@ cd "${SCRIPT_DIR}"
 
 COQUI_REPO="/home/gpizarro/coqui"
 COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/cuafl-libjpeg-turbo-cpu"
+CPU_OUT_LINK="/tmp/coqui-libjpeg-turbo-cpu"
 HARNESS_DIR="${COQUI_REPO}/harness/targets"
 ARCH="sm_75"
 STACK_SIZE=32768            # coqui-cc default; matches nix spec (no override)
@@ -179,11 +179,11 @@ echo "=== [4/5] Build GPU cubin via coqui-cc ==="
 #   sources  = jpeg_include/*.c  (patched copies)
 #            + harness/targets/libjpeg_turbo_stubs.c  (SIMD + 12/16-bit no-ops)
 #            + harness/targets/libjpeg_turbo_decompress_fuzzer.c
-#            + libjpeg_turbo_libc_stubs.c (local) — cuAFL pass plugin
+#            + libjpeg_turbo_libc_stubs.c (local) — coqui mode pass plugin
 #              has no snprintf port; jerror.c/format_message calls it
 #              only for error strings that GPU never reads.
 # Sanitizer flags from the nix spec are intentionally omitted — coqui-cc
-# does not expose -fsanitize; the cuAFL pass plugin injects ASan/UBSan
+# does not expose -fsanitize; the coqui mode pass plugin injects ASan/UBSan
 # device-side via CoquiPassPlugin.so.
 STAGED_SRCS=()
 for c in "${LIBJPEG_SRCS[@]}"; do

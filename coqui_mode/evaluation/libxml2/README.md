@@ -1,7 +1,7 @@
-# libxml2 — cuAFL evaluation target
+# libxml2 — coqui mode evaluation target
 
 Port of `/home/gpizarro/coqui/nix/targets/libxml2.nix` to a self-contained
-evaluation directory for `cuAFL --coqui`.
+evaluation directory for `coqui mode --coqui`.
 
 ## Build
 
@@ -14,7 +14,7 @@ Produces (in the current directory):
 - `libxml2_xml_read_fuzzer.cubin` — GPU kernel (sm_75)
 - `libxml2_xml_read_fuzzer.conf`  — runtime config sidecar emitted by coqui-cc
 - `libxml2_xml_read_fuzzer_cpu`   — AFL++ instrumented CPU binary (symlink to
-  `/tmp/cuafl-libxml2-cpu/libxml2_xml_read_fuzzer`)
+  `/tmp/coqui-libxml2-cpu/libxml2_xml_read_fuzzer`)
 - `seeds/`                        — seed corpus (symlink into /nix/store)
 - `dict/`                         — dictionary (symlink into /nix/store)
 
@@ -31,12 +31,12 @@ generated `config.h`, generated `xmlversion.h`, and the patched copies of
 
 Pass-through args go to `afl-fuzz` before the `--` separator.
 
-## Build status: BLOCKED (cuAFL coqui-cc lacks variadic transform)
+## Build status: BLOCKED (coqui mode coqui-cc lacks variadic transform)
 
 `build.sh` runs through steps 1-3 successfully:
 
 1. `nix build .#target-libxml2-aflplusplus` — produces the CPU binary, seeds,
-   and dict under `/tmp/cuafl-libxml2-cpu/`.
+   and dict under `/tmp/coqui-libxml2-cpu/`.
 2. Resolve libxml2 source from the CPU build's `-source` closure
    (`/nix/store/...-source`).
 3. Generate `config.h`, `xmlversion.h`, and patch `error.c`/`xmlstring.c`
@@ -63,7 +63,7 @@ libxml2 is deeply variadic:
   also uses `llvm.va_start`.
 
 Upstream coqui handles this via a `VariadicTransform`/`PrintfTransform` IR
-pass (see `/home/gpizarro/coqui/transforms/`). cuAFL's coqui-cc has
+pass (see `/home/gpizarro/coqui/transforms/`). coqui mode's coqui-cc has
 `IntrinsicReject` — which explicitly hard-fails on `llvm.va_start` — but
 the corresponding transform has not been ported. `coqui_mode/passes/`
 contains the lowering transforms currently enabled, and the variadic one
@@ -105,7 +105,7 @@ coqui_mode/passes/VariadicTransform.cpp -> does NOT exist
   after copying from `/nix/store/...`, otherwise the awk patches can't
   overwrite the intermediate files.
 - **coqui-cc flag mismatch**: the nix spec passes `--heap-size 131072` and
-  `--batch-size 65536`; cuAFL's coqui-cc accepts neither. The cuAFL runtime
+  `--batch-size 65536`; coqui mode's coqui-cc accepts neither. The coqui mode runtime
   derives heap from arch and batch size from `AFL_COQUI_BATCH_SIZE` at
   runtime, so those flags are intentionally dropped from `build.sh`.
 - **Source list**: mirrors the 22-file nix list exactly (libxml2 core +

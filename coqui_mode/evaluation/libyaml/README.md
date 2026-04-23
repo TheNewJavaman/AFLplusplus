@@ -1,7 +1,7 @@
-# libyaml — cuAFL evaluation target
+# libyaml — coqui mode evaluation target
 
 Fuzz target adapting coqui's **libyaml 0.2.5** (parser-only) benchmark for the
-cuAFL `--coqui` mode runner.
+coqui mode `--coqui` mode runner.
 
 Mirrors the nix spec at
 `/home/gpizarro/coqui/nix/targets/libyaml.nix`, producing a self-contained
@@ -11,17 +11,17 @@ build+fuzz workflow that does not require the coqui nix wrapper at fuzz time.
 
 ```
 build.sh            idempotent build (CPU binary via nix + GPU cubin via coqui-cc)
-fuzz.sh             launches cuAFL afl-fuzz --coqui against this target
-libyaml_stubs.c     cuAFL-only glue: strdup, memcpy, memset, memmove
+fuzz.sh             launches coqui mode afl-fuzz --coqui against this target
+libyaml_stubs.c     coqui mode-only glue: strdup, memcpy, memset, memmove
 .gitignore          ignores all generated artifacts
 
 # Produced by build.sh (ignored):
 libyaml_src/                    patched libyaml sources (yaml_private.h buffer shrink)
 libyaml_parser_fuzzer.cubin     sm_75 GPU kernel
 libyaml_parser_fuzzer.conf      companion config from coqui-cc
-libyaml_parser_fuzzer_cpu       -> /tmp/cuafl-libyaml-cpu/libyaml_parser_fuzzer
-seeds                           -> /tmp/cuafl-libyaml-cpu/seeds
-dict                            -> /tmp/cuafl-libyaml-cpu/dict
+libyaml_parser_fuzzer_cpu       -> /tmp/coqui-libyaml-cpu/libyaml_parser_fuzzer
+seeds                           -> /tmp/coqui-libyaml-cpu/seeds
+dict                            -> /tmp/coqui-libyaml-cpu/dict
 out/                            afl-fuzz output
 ```
 
@@ -33,14 +33,14 @@ out/                            afl-fuzz output
 
 Steps (mirrors `nix/targets/libyaml.nix` + `nix/cpu-target-specs.nix::libyaml`):
 
-1. `nix build '.#target-libyaml-aflplusplus'` -> `/tmp/cuafl-libyaml-cpu`
+1. `nix build '.#target-libyaml-aflplusplus'` -> `/tmp/coqui-libyaml-cpu`
 2. Find the libyaml `-source` derivation in the CPU build closure
 3. Copy `api.c reader.c scanner.c parser.c loader.c yaml_private.h` into
    `./libyaml_src/`, then `sed` yaml_private.h to shrink:
      - `INPUT_RAW_BUFFER_SIZE  16384 -> 512`  (keeps INPUT_BUFFER_SIZE under 64KB heap)
      - `INITIAL_{STACK,QUEUE,STRING}_SIZE  16 -> 4`
 4. `coqui-cc` with `-arch sm_75`, coqui's `-D YAML_DECLARE_STATIC`,
-   version macros, plus cuAFL-only `-D NDEBUG`, linking the patched sources +
+   version macros, plus coqui mode-only `-D NDEBUG`, linking the patched sources +
    the upstream harness `harness/targets/libyaml_parser_fuzzer.c` +
    `libyaml_stubs.c`.
 5. Symlink CPU binary, seeds, dict from the nix output.
@@ -60,14 +60,14 @@ Sets these env vars before exec'ing `/home/gpizarro/cuAFL/afl-fuzz --coqui gpu0`
 - `AFL_SKIP_BIN_CHECK=1`
 - `AFL_NO_UI=1`
 
-## cuAFL-specific quirks
+## coqui mode-specific quirks
 
 ### `-D NDEBUG`
 
 libyaml's `api.c` / `scanner.c` call `assert()` from `<assert.h>`. On NVPTX
 clang these lower to `__assert_fail`. coqui's upstream compiler has a
 `LibcTransform` pass that rewrites `__assert_fail -> __coqui_assert_fail`, but
-cuAFL's `coqui-cc` driver runs only the `coqui-link,always-inline` pipeline —
+coqui mode's `coqui-cc` driver runs only the `coqui-link,always-inline` pipeline —
 `LibcTransform` is NOT ported, and the `ExternalSymbolGatekeeper` hard-fails
 on any unresolved libc call.
 
@@ -83,14 +83,14 @@ Analogous to stb_image's `-D STBI_ASSERT(x)=` workaround in the sibling
 
 Four more unresolved-symbol issues after NDEBUG:
 
-| libc symbol | cuAFL runtime.bc status                              |
+| libc symbol | coqui mode runtime.bc status                              |
 |-------------|------------------------------------------------------|
 | `strdup`    | Not in runtime. Implemented via `__coqui_malloc` + `__coqui_strlen` + byte loop. |
 | `memcpy`    | Not in runtime. `__builtin_memcpy` (clang lowers inline). |
 | `memset`    | Not in runtime. `__builtin_memset`.                  |
 | `memmove`   | Not in runtime. Manual forward/backward loop.        |
 
-(The cuAFL coqui-cc runtime exports only `__coqui_malloc/calloc/free/realloc/`
+(The coqui mode coqui-cc runtime exports only `__coqui_malloc/calloc/free/realloc/`
 `memcmp/strlen/strcmp/strncmp/strchr/strtod/trap` — far smaller than coqui's
 GPU runtime.)
 
@@ -108,7 +108,7 @@ per-thread 64 KB GPU heap.
 ## Build status
 
 The `build.sh` script was validated end-to-end:
-- Step [1/5] (nix CPU build) completes and stamps `/tmp/cuafl-libyaml-cpu`.
+- Step [1/5] (nix CPU build) completes and stamps `/tmp/coqui-libyaml-cpu`.
 - Step [2/5] resolves the libyaml source to
   `/nix/store/nvnfhj4nq7m33alwv67mrsjycvas46j5-source`.
 - Step [3/5] writes the patched `libyaml_src/`.
@@ -127,5 +127,5 @@ no contention; longer when multiple evaluation builds run in parallel).
 - GPU build flags: `/home/gpizarro/coqui/nix/targets/libyaml.nix`
 - CPU build flags: `/home/gpizarro/coqui/nix/cpu-target-specs.nix::libyaml`
 - Upstream harness: `/home/gpizarro/coqui/harness/targets/libyaml_parser_fuzzer.c`
-- cuAFL coqui-cc driver: `/usr/local/bin/coqui-cc`
-- cuAFL afl-fuzz binary: `/home/gpizarro/cuAFL/afl-fuzz`
+- coqui mode coqui-cc driver: `/usr/local/bin/coqui-cc`
+- coqui mode afl-fuzz binary: `/home/gpizarro/cuAFL/afl-fuzz`

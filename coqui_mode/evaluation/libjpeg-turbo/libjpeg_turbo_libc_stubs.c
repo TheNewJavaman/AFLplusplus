@@ -1,11 +1,11 @@
 /*
  * libjpeg_turbo_libc_stubs.c --- device-side libc stubs for libjpeg-turbo.
  *
- * cuAFL's CoquiPassPlugin does NOT port libc formatted-print functions
+ * coqui mode's CoquiPassPlugin does NOT port libc formatted-print functions
  * (see /home/gpizarro/cuAFL/coqui_mode/passes/Libc.cpp: only strlen,
  * strcmp, strncmp, memcmp, strchr, strtod are rewritten to __coqui_*
  * equivalents — no snprintf/fprintf/vsnprintf/printf). Upstream coqui
- * provides __coqui_snprintf via musl+LibcTransform, but cuAFL's trimmed
+ * provides __coqui_snprintf via musl+LibcTransform, but coqui mode's trimmed
  * runtime does not carry that port yet.
  *
  * libjpeg-turbo's jerror.c references two libc stdio functions:
@@ -48,10 +48,10 @@ int fprintf(FILE *stream, const char *fmt, ...) {
  * dereferences the pointer. */
 FILE *stderr = (FILE *)0;
 
-/* jerror.c's default error_exit() calls exit(EXIT_FAILURE). The cuAFL
+/* jerror.c's default error_exit() calls exit(EXIT_FAILURE). The coqui mode
  * runtime provides __coqui_exit() (coqui_mode/runtime/coqui_runtime.c)
  * which emits PTX `exit;` so just the current thread dies and the
- * kernel continues processing the rest of the batch. cuAFL's Libc.cpp
+ * kernel continues processing the rest of the batch. coqui mode's Libc.cpp
  * does not rewrite `exit` → `__coqui_exit` yet, so forward the call
  * here.  _Noreturn so the compiler doesn't lose unreachability. */
 void __coqui_exit(void);

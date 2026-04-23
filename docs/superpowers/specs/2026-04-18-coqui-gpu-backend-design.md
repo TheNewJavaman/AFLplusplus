@@ -1,4 +1,4 @@
-# cuAFL: AFL++ with a GPU Execution Backend — Design Spec
+# coqui mode: AFL++ with a GPU Execution Backend — Design Spec
 
 **Status:** Draft
 **Date:** 2026-04-18
@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-cuAFL is an AFL++ fork that adds a new executor mode, `coqui_mode`, selected via a new long-only flag `--coqui <sync_id>`. A cuAFL instance running under `--coqui` behaves as a specialized AFL++ secondary: it shares a sync directory with `-M main` and `-S <id>` peers, writes findings into its own `out/<sync_id>/queue/`, and receives propagated inputs via AFL++'s normal `sync_fuzzers()` mesh. The distinguishing feature is that it executes mutated inputs on an NVIDIA GPU in batches of 8K rather than one at a time through a forkserver.
+coqui mode is an AFL++ fork that adds a new executor mode, `coqui_mode`, selected via a new long-only flag `--coqui <sync_id>`. A coqui mode instance running under `--coqui` behaves as a specialized AFL++ secondary: it shares a sync directory with `-M main` and `-S <id>` peers, writes findings into its own `out/<sync_id>/queue/`, and receives propagated inputs via AFL++'s normal `sync_fuzzers()` mesh. The distinguishing feature is that it executes mutated inputs on an NVIDIA GPU in batches of 8K rather than one at a time through a forkserver.
 
 Every AFL++ subsystem above the execution layer — mutations, corpus management, virgin_bits tracking, power schedules, the TUI, stats, and sync — runs unmodified. The integration seam is the function `common_fuzz_stuff()` in `src/afl-fuzz-run.c`: under `--coqui`, a new branch routes inputs into a packed batch buffer instead of invoking a forkserver. When a batch completes on the GPU, each input flagged as potentially novel is handed back to `save_if_interesting()` with its coverage populated in `trace_bits`. AFL++ decides local novelty; the broker decides canonical novelty; sync propagates findings in both directions.
 
@@ -54,7 +54,7 @@ Every AFL++ subsystem above the execution layer — mutations, corpus management
 
 ### 1.5 Why a new mode rather than riding the forkserver abstraction
 
-AFL++'s existing executor modes (`qemu_mode`, `frida_mode`, `unicorn_mode`, `nyx_mode`, `coresight_mode`) all speak the single-input forkserver IPC protocol. cuAFL cannot — batching 8K inputs per kernel launch is the entire premise. The hook point must be above the forkserver abstraction, which is why the integration lives at `common_fuzz_stuff` rather than at the forkserver layer. This makes cuAFL the first AFL++ executor mode to break the single-input-at-a-time assumption. The new code surface is correspondingly larger than those other modes, but still narrowly scoped to one function's branch.
+AFL++'s existing executor modes (`qemu_mode`, `frida_mode`, `unicorn_mode`, `nyx_mode`, `coresight_mode`) all speak the single-input forkserver IPC protocol. coqui mode cannot — batching 8K inputs per kernel launch is the entire premise. The hook point must be above the forkserver abstraction, which is why the integration lives at `common_fuzz_stuff` rather than at the forkserver layer. This makes coqui mode the first AFL++ executor mode to break the single-input-at-a-time assumption. The new code surface is correspondingly larger than those other modes, but still narrowly scoped to one function's branch.
 
 ## 2. CLI and Instance Lifecycle
 
@@ -70,7 +70,7 @@ The trailing positional argument is a cubin path (produced by `coqui-cc`, the co
 
 ### 2.2 Max input size
 
-cuAFL does not add a max-input-size flag. AFL++'s existing `-G <bytes>` flag (max input length) propagates through `afl->max_length` → `afl->fsrv.max_length` and is read directly by `coqui_init()`. If `max_length == 0` (AFL++'s "unbounded" default), coqui_mode falls back to a compile-time `COQUI_MAX_INPUT_DEFAULT` (4096) and emits a warning recommending an explicit `-G` for GPU fuzzing.
+coqui mode does not add a max-input-size flag. AFL++'s existing `-G <bytes>` flag (max input length) propagates through `afl->max_length` → `afl->fsrv.max_length` and is read directly by `coqui_init()`. If `max_length == 0` (AFL++'s "unbounded" default), coqui_mode falls back to a compile-time `COQUI_MAX_INPUT_DEFAULT` (4096) and emits a warning recommending an explicit `-G` for GPU fuzzing.
 
 ### 2.3 Typical campaign
 
@@ -354,7 +354,7 @@ The initial `afl-fuzz-coqui.c` ships with a stub that fakes the GPU using a trad
 - Launch path (batch full or flush): iterates the batch, runs each input through `afl_fsrv_run_target` on the CPU forkserver, populates `d_coverage` and `d_novelty` manually based on real CPU coverage.
 - `coqui_calibrate_one`: runs the single input through the CPU forkserver directly.
 
-The stub makes cuAFL fully functional for AFL++-side integration work: it finds bugs, syncs with peers, writes queue files — just at CPU speeds plus batch overhead. When the real coqui backend lands, the stub is replaced behind the same contract.
+The stub makes coqui mode fully functional for AFL++-side integration work: it finds bugs, syncs with peers, writes queue files — just at CPU speeds plus batch overhead. When the real coqui backend lands, the stub is replaced behind the same contract.
 
 ### 4.7 Deliberately unspecified
 
@@ -431,7 +431,7 @@ While the GPU runs B0, the CPU's havoc loop fills B1. When B0 completes, the hos
 
 ### 5.5 Sync-in calibration (single-input path)
 
-When `sync_fuzzers()` discovers a new file in another instance's `out/*/queue/`, cuAFL calls `coqui_calibrate_one()`. This submits a one-input batch, synchronous launch, waits for completion, populates `trace_bits` directly. A 8192-wide kernel where 8191 threads idle on `input_lens == 0` is wasteful of silicon but costs ~100 µs; calibration is <0.1% of runtime.
+When `sync_fuzzers()` discovers a new file in another instance's `out/*/queue/`, coqui mode calls `coqui_calibrate_one()`. This submits a one-input batch, synchronous launch, waits for completion, populates `trace_bits` directly. A 8192-wide kernel where 8191 threads idle on `input_lens == 0` is wasteful of silicon but costs ~100 µs; calibration is <0.1% of runtime.
 
 ### 5.6 Rough timing estimates
 
@@ -476,7 +476,7 @@ Broker-side CPU AFL++ runs ~2-10K exec/s on the same target. The ratio of 100-10
 
 ### 6.4 Data-integrity edge cases
 
-- **Orphaned crashes**: If the cuAFL instance dies mid-batch with unwritten crashes, those are lost. The broker would re-discover them if the underlying fault is deterministic. Atomic `rename(tmpfile, crashfile)` via AFL++'s existing `write_crash()` logic mitigates partial writes.
+- **Orphaned crashes**: If the coqui mode instance dies mid-batch with unwritten crashes, those are lost. The broker would re-discover them if the underlying fault is deterministic. Atomic `rename(tmpfile, crashfile)` via AFL++'s existing `write_crash()` logic mitigates partial writes.
 - **Unflushed partial batch on crash**: In-flight mutations lost. Acceptable — AFL++ has similar semantics around mid-mutation crashes.
 - **Graceful restart**: Re-invoking with the same `--coqui gpu0 -o out/` reads the instance's queue dir and resumes. Sync dir is source of truth.
 
@@ -488,13 +488,13 @@ Broker-side CPU AFL++ runs ~2-10K exec/s on the same target. The ratio of 100-10
 | **P2: Contract + stub** | `afl-fuzz-coqui.{c,h}` with the five contract functions implemented as the CPU-forkserver stub. |
 | **P3: Core wiring** | `common_fuzz_stuff` gpu branch; `fuzz_one` det/cmplog gating; `afl_fsrv_start` short-circuit; calibration routing in `afl-fuzz-init.c`. |
 | **P4: Heterogeneous mesh manual validation** | Run `-M main` + `--coqui gpu0` on a bundled AFL++ canary target; confirm findings propagate. |
-| **P5: Ship AFL++ side** | Tag on `cuAFL` branch. Open the follow-up brainstorm for coqui internals. |
+| **P5: Ship AFL++ side** | Tag on `coqui mode` branch. Open the follow-up brainstorm for coqui internals. |
 
-Each phase is a merge-sized commit or PR. P1-P4 land on a feature branch; P5 merges to `cuAFL` branch main.
+Each phase is a merge-sized commit or PR. P1-P4 land on a feature branch; P5 merges to `coqui mode` branch main.
 
 ## 8. Naming Conventions
 
-- **cuAFL**: the AFL++ fork (this project).
+- **coqui mode**: the AFL++ fork (this project).
 - **coqui_mode**: the executor mode (boolean on `afl_forkserver_t`; subdirectory `coqui_mode/`). Named after the underlying research technology, matching AFL++'s pattern for `qemu_mode`/`frida_mode`/`nyx_mode`.
 - **coqui-cc**: the compiler driver in `coqui_mode/` that produces cubins from C/C++ sources, matching AFL++'s `afl-clang-fast` convention.
 - **`--coqui <sync_id>`**: the CLI flag on `afl-fuzz` to launch a GPU secondary.

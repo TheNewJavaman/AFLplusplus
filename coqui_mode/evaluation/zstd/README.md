@@ -1,6 +1,6 @@
-# cuAFL evaluation target: zstd
+# coqui mode evaluation target: zstd
 
-Adapts the `zstd` decompression fuzz target (from coqui) for cuAFL, so
+Adapts the `zstd` decompression fuzz target (from coqui) for coqui mode, so
 `afl-fuzz --coqui` can fuzz the Facebook `zstd` library on the GPU.
 
 Source of truth: `/home/gpizarro/coqui/nix/targets/zstd.nix`
@@ -16,7 +16,7 @@ README.md                            this file
 .gitignore                           ignores build outputs
 zstd_simple_decompress_fuzzer.cubin  produced by build.sh
 zstd_simple_decompress_fuzzer.conf   coqui-cc sidecar: stack_size / slab_pool_size / arch
-zstd_simple_decompress_fuzzer_cpu    AFL++ CPU binary (symlink into /tmp/cuafl-zstd-cpu)
+zstd_simple_decompress_fuzzer_cpu    AFL++ CPU binary (symlink into /tmp/coqui-zstd-cpu)
 seeds/                               symlink to upstream zstd seed corpus (.zst frames)
 dict/                                symlink to zstd frame-magic/block-type dictionary
 out/                                 afl-fuzz output (created on first run)
@@ -33,7 +33,7 @@ The script is idempotent. It:
 
 1. Runs `nix build .#target-zstd-aflplusplus` in `/home/gpizarro/coqui`
    to produce the AFL++-instrumented CPU harness, its seeds, and the zstd
-   dictionary, and symlinks the result under `/tmp/cuafl-zstd-cpu`.
+   dictionary, and symlinks the result under `/tmp/coqui-zstd-cpu`.
 2. Resolves the `facebook/zstd v1.5.6` source path from the nix closure
    (identifies it as the `-source` derivation containing `lib/zstd.h`).
 3. Invokes `/usr/local/bin/coqui-cc` with the exact same includes,
@@ -86,7 +86,7 @@ frame's declared content size does not match the actual decompressed size
 (i.e., it has detected a real zstd bug).
 
 Upstream coqui rewrites `abort` to `__coqui_abort` inside a `LibcTransform`
-LLVM pass. cuAFL's `coqui-cc` is a simplified driver that runs only
+LLVM pass. coqui mode's `coqui-cc` is a simplified driver that runs only
 `coqui-link` + `always-inline`, with NO `LibcTransform` pass and no
 pre-linked `abort` symbol in `runtime.bc`. Without an explicit stub, the
 build fails inside the `ExternalSymbolGatekeeper`:
@@ -98,7 +98,7 @@ Used by: __coqui_fuzz_execute
 ```
 
 The local file `zstd_abort_stub.c` supplies a trivial device-side `abort()`
-that tail-calls `__coqui_trap()` (PTX `trap;`), which cuAFL classifies as a
+that tail-calls `__coqui_trap()` (PTX `trap;`), which coqui mode classifies as a
 signal-11 crash — the desired semantics. This mirrors the pattern used by
 `harness/targets/bz2_assert_stub.c` for bzip2.
 
@@ -108,12 +108,12 @@ See the header comment in the upstream harness: without this, the ZSTD_DCtx
 is ~64KB and does not fit alongside the output buffer in the per-thread
 bump heap. With `=4096`, the DCtx shrinks to ~34KB, leaving ~16KB headroom
 in the 58KB usable heap for the 8KB output buffer and internal
-temporaries. The cuAFL build mirrors `zstd.nix` exactly on this.
+temporaries. The coqui mode build mirrors `zstd.nix` exactly on this.
 
 ### Batch size / heap size
 
-cuAFL's `coqui-cc` does NOT accept `--heap-size` or `--batch-size` flags.
-The cuAFL runtime derives the per-thread heap at startup (from
+coqui mode's `coqui-cc` does NOT accept `--heap-size` or `--batch-size` flags.
+The coqui mode runtime derives the per-thread heap at startup (from
 `--stack-size` and per-device SM geometry) and reads the batch size from
 `AFL_COQUI_BATCH_SIZE` at fuzz time (default: `COQUI_DEFAULT_BATCH_SIZE`
 in `include/afl-fuzz-coqui.h`).
@@ -121,7 +121,7 @@ in `include/afl-fuzz-coqui.h`).
 ### Sanitizers
 
 Upstream `zstd.nix` passes `${sanitizers.default}` (ASan + UBSan on the
-CPU side for `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`). cuAFL drops the
+CPU side for `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`). coqui mode drops the
 sanitizer flags from the GPU build — device-side ASan/UBSan is already
 injected by the coqui pass plugin, and the CPU binary is built by nix
 (which retains its own sanitizer wiring). The CPU binary is used by AFL++

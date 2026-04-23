@@ -1,10 +1,10 @@
-# cuAFL Coqui Internals — Design Spec
+# coqui mode Coqui Internals — Design Spec
 
 **Status:** Draft
 **Date:** 2026-04-18
-**Scope:** The GPU-side of cuAFL — the `coqui-cc` compiler, LLVM pass plugin, device-side runtime, GPU kernel interface, and host-side CUDA launcher that implements the cuAFL contract from `docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md`.
+**Scope:** The GPU-side of coqui mode — the `coqui-cc` compiler, LLVM pass plugin, device-side runtime, GPU kernel interface, and host-side CUDA launcher that implements the coqui mode contract from `docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md`.
 
-This design supersedes the hollow-stub approach of the earlier cuAFL spec by defining the real implementation behind the 5-function contract. It also amends specific parts of that spec (per §11 of this document).
+This design supersedes the hollow-stub approach of the earlier coqui mode spec by defining the real implementation behind the 5-function contract. It also amends specific parts of that spec (per §11 of this document).
 
 ## 1. Overview
 
@@ -16,7 +16,7 @@ This design supersedes the hollow-stub approach of the earlier cuAFL spec by def
 4. **The AFL-compatible coverage scheme** — hash-based edge indexing with bucketing, entirely device-side.
 5. **The GPU device runtime** — C files compiled into every cubin: coverage, heap-only ASan, freelist allocator, tid helpers.
 6. **The kernel interface** — signature, buffer layouts, status struct, novelty bitmap format.
-7. **The host-side CUDA launcher** — real implementation of the 5-function cuAFL contract, reusing AFL++'s standard CPU forkserver alongside GPU batch execution.
+7. **The host-side CUDA launcher** — real implementation of the 5-function coqui mode contract, reusing AFL++'s standard CPU forkserver alongside GPU batch execution.
 8. **The validation strategy** — cjson as minimum-viable probe, libpng as stress test; collaborative port-on-demand loop.
 
 ### 1.2 Core architectural principles
@@ -34,7 +34,7 @@ This design supersedes the hollow-stub approach of the earlier cuAFL spec by def
 
 ### 1.4 Deployment
 
-Same as established in the cuAFL spec: `--coqui <sync_id>` flag, cubin companion to the ELF target (resolved by convention or via `AFL_COQUI_CUBIN` env var), co-existing with `-M main` and optional `-S cpu*` secondaries over the sync dir.
+Same as established in the coqui mode spec: `--coqui <sync_id>` flag, cubin companion to the ELF target (resolved by convention or via `AFL_COQUI_CUBIN` env var), co-existing with `-M main` and optional `-S cpu*` secondaries over the sync dir.
 
 ## 2. `coqui-cc` Compiler Driver
 
@@ -55,8 +55,8 @@ ptxas -arch=sm_<XY> -O1 out.ptx -o out.cubin
 1. **`clang --target=nvptx64-nvidia-cuda` from the first invocation** (not `--target=<host>` + later retarget). This is change #1 from the brainstorm; eliminates `TargetTransform` and likely `AddressSpacesTransform`.
 2. **`runtime.bc` is linked with user bitcode** before the pass plugin runs (same as coqui's pattern).
 3. **Pass plugin runs a smaller set** (see §3).
-4. **No separate oracle/test modes** — cuAFL has no oracle tracing; test infrastructure is a separate concern.
-5. **No CPU-binary companion emission** — coqui built both GPU and CPU artifacts; cuAFL's CPU build is produced separately by the user (via `afl-clang-fast`) and lives alongside the cubin for AFL++'s forkserver.
+4. **No separate oracle/test modes** — coqui mode has no oracle tracing; test infrastructure is a separate concern.
+5. **No CPU-binary companion emission** — coqui built both GPU and CPU artifacts; coqui mode's CPU build is produced separately by the user (via `afl-clang-fast`) and lives alongside the cubin for AFL++'s forkserver.
 
 ### 2.2 Compile flags (per-source file)
 
@@ -163,7 +163,7 @@ User-supplied `--stack-size` is baked into the cubin as a `.conf` sidecar (`<out
 
 - `Target` — NVPTX-from-start removes the need.
 - `AddressSpaces` — **confirmed empirically unnecessary**. With `--target=nvptx64-nvidia-cuda`, clang emits globals without explicit `addrspace(1)` decoration in IR, but the NVPTX backend correctly emits `.global .align N .u32 <name>` in PTX and accesses via `ld.global.*`. No transform needed.
-- `LineTrace` — oracle tracing, not in cuAFL scope.
+- `LineTrace` — oracle tracing, not in coqui mode scope.
 - `SancovCount` — replaced by new `Coverage` transform.
 
 ### 3.5 Collaborative port-on-demand process
@@ -369,7 +369,7 @@ Per-input coverage maps (64 KB × 8192 = 512 MB device memory) stay device-local
 
 ### 5.7 Virgin map lifetime
 
-One shared device-side buffer per cuAFL process, zeroed at `coqui_init`. Grows monotonically during the campaign; never cleared. On instance restart, resets — broker's corpus quickly re-populates it via sync.
+One shared device-side buffer per coqui mode process, zeroed at `coqui_init`. Grows monotonically during the campaign; never cleared. On instance restart, resets — broker's corpus quickly re-populates it via sync.
 
 ### 5.8 The `Coverage` transform
 
@@ -384,9 +384,9 @@ One shared device-side buffer per cuAFL process, zeroed at `coqui_init`. Grows m
 
 Bucketing + virgin-compare sequence lives in the kernel-entry template emitted by `FuzzEntry` — runs after `Coverage`, not inserted by `Coverage` itself.
 
-### 5.9 Amendment to cuAFL spec
+### 5.9 Amendment to coqui mode spec
 
-`docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md` §4.2 and §5.3 describe `d_coverage [batch_size × map_size]` and per-flagged-input coverage DMA — both vanish from the host-side contract under this design. See §11.
+`docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md` §4.2 and §5.3 describe `d_coverage [batch_size × map_size]` and per-flagged-input coverage DMA — both vanish from the host-side contract under this design. See §11.
 
 ## 6. GPU Device Runtime
 
@@ -438,7 +438,7 @@ All in `coqui_mode/runtime/`. Each compiled with `clang --target=nvptx64-nvidia-
 
 | File | Reason |
 |------|--------|
-| `coqui_mutate.c` | GPU-side havoc; cuAFL does mutation on CPU |
+| `coqui_mutate.c` | GPU-side havoc; coqui mode does mutation on CPU |
 | `coqui_trace.c` | Oracle tracing, out of scope |
 | `coqui_cmplog_rt.c` | CmpLog lives on broker |
 | `coqui_sancov.c` | Replaced by hash-based `coqui_coverage.c` |
@@ -475,7 +475,7 @@ extern "C" __global__ void __coqui_fuzz_kernel(
     coqui_status_t       *status);       // [batch_size]
 ```
 
-**Changes from the cuAFL spec's original signature:**
+**Changes from the coqui mode spec's original signature:**
 - Dropped `coverage` parameter (device-local alloca).
 - Dropped `virgin_map` parameter (device global, accessed by symbol via `cuModuleGetGlobal`).
 
@@ -786,14 +786,14 @@ In `docs/coqui_port_log.md`:
 
 ## 10. Naming and Conventions (recap)
 
-- **cuAFL** — the AFL++ fork.
+- **coqui mode** — the AFL++ fork.
 - **coqui_mode** — the executor mode; subdirectory `coqui_mode/`.
 - **coqui-cc** — the compiler tool.
 - **`--coqui <sync_id>`** — CLI flag on `afl-fuzz`.
 
-## 11. Amendments to the cuAFL Spec
+## 11. Amendments to the coqui mode Spec
 
-The earlier cuAFL spec (`docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md`) was written against the hollow-stub model. Under this design, the following sections are amended:
+The earlier coqui mode spec (`docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md`) was written against the hollow-stub model. Under this design, the following sections are amended:
 
 1. **§3.6 (afl_fsrv_start short-circuit):** removed. `afl_fsrv_start` runs normally for coqui_mode — `afl->fsrv` is a real CPU forkserver over the ELF target.
 2. **§3.5 (common_fuzz_stuff branch):** unchanged — still routes to `coqui_submit_input` in gpu_mode.
@@ -810,5 +810,5 @@ Implementation task list for these amendments is tracked separately in the follo
 - UBSan integration (deferred; port on-demand alongside `coqui_ubsan.c`).
 - CmpLog on GPU (by design — lives on broker).
 - GPU-side havoc mutation (CPU does mutation in AFL++).
-- Oracle tracing (not a cuAFL feature).
+- Oracle tracing (not a coqui mode feature).
 - Per-function prologue stack-canary instrumentation (rejected for v1 perf cost).

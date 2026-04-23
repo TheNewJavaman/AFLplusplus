@@ -1073,7 +1073,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
      * can't survive as an orphan. Without this, killing afl-fuzz mid-
      * shutdown leaves the forkserver process holding GPU context resources
      * that degrade subsequent processes' per-thread stack budget — a real
-     * bug surfaced during the 2026-04-20 cuAFL bench harness work. Linux-
+     * bug surfaced during the 2026-04-20 coqui mode bench harness work. Linux-
      * specific; PR_SET_PDEATHSIG persists across execv. */
 #if defined(__linux__)
     prctl(PR_SET_PDEATHSIG, SIGKILL);

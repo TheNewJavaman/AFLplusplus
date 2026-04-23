@@ -1,8 +1,8 @@
-# cuAFL evaluation target: `cares`
+# coqui mode evaluation target: `cares`
 
 Fuzzes the [c-ares](https://c-ares.org/) DNS parser (v1.34.4) via the
 oss-fuzz-adapted `ares_dns_parse` harness, running the hot parsing code
-on the GPU under cuAFL's `coqui_mode`.
+on the GPU under coqui mode's `coqui_mode`.
 
 Mirrors `/home/gpizarro/coqui/nix/targets/cares.nix` — same source
 whitelist, same config-header generation, same `--slab-pool-size 10G`.
@@ -36,7 +36,7 @@ but keep the cached nix build.
 - `COQUI_CC` — path to `coqui-cc` (default `/usr/local/bin/coqui-cc`)
 - `COQUI_REPO` — path to coqui flake repo (default `/home/gpizarro/coqui`)
 - `CPU_OUT_LINK` — nix out-link path for the CPU binary
-  (default `/tmp/cuafl-cares-cpu`)
+  (default `/tmp/coqui-cares-cpu`)
 
 ## Fuzz
 
@@ -55,7 +55,7 @@ Launches:
     -- ./cares_parse_reply_fuzzer_cpu
 ```
 
-with the standard cuAFL env vars set:
+with the standard coqui mode env vars set:
 
 - `AFL_COQUI_CUBIN=$PWD/cares_parse_reply_fuzzer.cubin`
 - `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`
@@ -109,9 +109,9 @@ After a successful build the directory contains:
 ```
 .cares_parse_reply_fuzzer.build/   coqui-cc intermediate bitcode (ignored)
 generated/                         ares_build.h, ares_config.h
-seeds                    -> /tmp/cuafl-cares-cpu/seeds (74 files)
-dict                     -> /tmp/cuafl-cares-cpu/dict/
+seeds                    -> /tmp/coqui-cares-cpu/seeds (74 files)
+dict                     -> /tmp/coqui-cares-cpu/dict/
 cares_parse_reply_fuzzer.cubin
 cares_parse_reply_fuzzer.conf
-cares_parse_reply_fuzzer_cpu -> /tmp/cuafl-cares-cpu/cares_parse_reply_fuzzer
+cares_parse_reply_fuzzer_cpu -> /tmp/coqui-cares-cpu/cares_parse_reply_fuzzer
 ```

@@ -6,7 +6,7 @@ zstd_simple_decompress_fuzzer.ptx
 zstd_simple_decompress_fuzzer.bc
 .zstd_simple_decompress_fuzzer.build/
 
-# Symlinks pointing into /tmp/cuafl-zstd-cpu or /nix/store
+# Symlinks pointing into /tmp/coqui-zstd-cpu or /nix/store
 zstd_simple_decompress_fuzzer_cpu
 seeds
 dict

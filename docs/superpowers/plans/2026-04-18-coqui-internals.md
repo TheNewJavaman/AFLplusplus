@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the GPU-side of cuAFL — `coqui-cc` compiler driver, LLVM pass plugin (10 day-1 passes), GPU device runtime (5 files), and real host-side CUDA launcher replacing the hollow stub — so that `coqui-cc harness.c -o harness.cubin` can be attempted against the cjson harness. Port-on-demand iteration (adding coqui transforms as errors surface) happens after this plan, collaboratively with the user.
+**Goal:** Implement the GPU-side of coqui mode — `coqui-cc` compiler driver, LLVM pass plugin (10 day-1 passes), GPU device runtime (5 files), and real host-side CUDA launcher replacing the hollow stub — so that `coqui-cc harness.c -o harness.cubin` can be attempted against the cjson harness. Port-on-demand iteration (adding coqui transforms as errors surface) happens after this plan, collaboratively with the user.
 
-**Architecture:** NVPTX-from-start compilation pipeline using `clang --target=nvptx64-nvidia-cuda` + custom LLVM pass plugin + existing coqui device runtime (ported and adjusted). Host launcher runs a standard AFL CPU forkserver alongside the GPU batch executor; post-batch flagged inputs go through the CPU forkserver for real `trace_bits` before `save_if_interesting`. The existing cuAFL integration stub gets replaced with real CUDA driver API calls.
+**Architecture:** NVPTX-from-start compilation pipeline using `clang --target=nvptx64-nvidia-cuda` + custom LLVM pass plugin + existing coqui device runtime (ported and adjusted). Host launcher runs a standard AFL CPU forkserver alongside the GPU batch executor; post-batch flagged inputs go through the CPU forkserver for real `trace_bits` before `save_if_interesting`. The existing coqui mode integration stub gets replaced with real CUDA driver API calls.
 
 **Tech Stack:** C99 (GPU runtime), C++ (LLVM pass plugin), Python 3 (coqui-cc driver), CUDA Driver API (`libcuda`), LLVM 18 (clang + opt + llc + llvm-link), CUDA Toolkit 13+ (ptxas, libdevice).
 
 **Specs:**
 - `docs/superpowers/specs/2026-04-18-coqui-internals-design.md` — the design this plan implements
-- `docs/superpowers/specs/2026-04-18-cuafl-gpu-backend-design.md` — the cuAFL contract (amended per §11 of the coqui spec)
+- `docs/superpowers/specs/2026-04-18-coqui-gpu-backend-design.md` — the coqui mode contract (amended per §11 of the coqui spec)
 
 **User preferences:**
 - No automated tests (user directive from prior session). Verification is manual — build success, CLI sanity, structured commits.
@@ -66,7 +66,7 @@
 
 ---
 
-## Phase 1: cuAFL amendments
+## Phase 1: coqui mode amendments
 
 Revert the three stub artifacts (fsrv_start short-circuit, fuzz_run_target short-circuit) and update argv handling so the cubin is resolved as a companion to the ELF target. These amendments are documented in §11 of the coqui spec.
 
@@ -104,7 +104,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-forkserver.c
-git commit -m "cuAFL: un-short-circuit afl_fsrv_start for coqui_mode
+git commit -m "coqui mode: un-short-circuit afl_fsrv_start for coqui_mode
 
 Per coqui internals design §11 amendment: afl->fsrv is now a real CPU
 forkserver running the ELF target alongside the GPU batch executor,
@@ -146,7 +146,7 @@ Expected: builds cleanly.
 
 ```bash
 git add src/afl-fuzz-run.c
-git commit -m "cuAFL: un-short-circuit fuzz_run_target for gpu_mode
+git commit -m "coqui mode: un-short-circuit fuzz_run_target for gpu_mode
 
 Per coqui internals design §11 amendment: calibrate/trim/sync paths
 now run through the real CPU forkserver at afl->fsrv and get real
@@ -222,7 +222,7 @@ Expected: fails with "cubin not found at '/tmp/nonexistent.cubin'" (the check wo
 
 ```bash
 git add src/afl-fuzz.c
-git commit -m "cuAFL: trailing argv is ELF target, cubin resolved as companion
+git commit -m "coqui mode: trailing argv is ELF target, cubin resolved as companion
 
 Per coqui internals design §11 amendment: AFL's standard convention
 applies — argv[optind] is the ELF target that afl->fsrv runs. Cubin
@@ -275,7 +275,7 @@ And use `$(EXTRA_LDFLAGS)` in the afl-fuzz link rule instead of hard-coding `-lc
 
 ```bash
 git add GNUmakefile
-git commit -m "cuAFL: link -lcuda for --coqui mode
+git commit -m "coqui mode: link -lcuda for --coqui mode
 
 Conditional CUDA detection via CUDA_PATH (default /usr/local/cuda).
 If found, links libcuda from the stubs dir; otherwise warns and
@@ -309,9 +309,9 @@ mkdir -p coqui_mode/runtime coqui_mode/passes coqui_mode/bin
 Create `coqui_mode/README.md`:
 
 ```markdown
-# coqui_mode — GPU executor for cuAFL
+# coqui_mode — GPU executor for coqui mode
 
-`coqui_mode` is cuAFL's GPU-backed executor. Targets are compiled to
+`coqui_mode` is coqui mode's GPU-backed executor. Targets are compiled to
 NVIDIA cubins via `coqui-cc`, and AFL++ drives them via the `--coqui`
 CLI flag.
 
@@ -338,7 +338,7 @@ Requires LLVM 18 (matching clang version), CUDA toolkit 13+, and Python 3.
 # Compile target
 coqui-cc -arch sm_75 harness.c lib/*.c -o target.cubin
 
-# Run under cuAFL
+# Run under coqui mode
 afl-clang-fast harness.c lib/*.c -o target
 afl-fuzz --coqui gpu0 -i seeds/ -o out/ -- ./target
 ```
@@ -351,7 +351,7 @@ design details.
 
 ```bash
 git add coqui_mode/README.md
-git commit -m "cuAFL: scaffold coqui_mode/ directory
+git commit -m "coqui mode: scaffold coqui_mode/ directory
 
 Mirrors the qemu_mode/ / nyx_mode/ pattern: top-level subdirectory for
 GPU executor components. README describes the install + usage flow.
@@ -367,7 +367,7 @@ GPU executor components. README describes the install + usage flow.
 
 ```c
 /*
- * coqui_runtime.h --- cuAFL device-side runtime contract.
+ * coqui_runtime.h --- coqui mode device-side runtime contract.
  *
  * Shared header between the LLVM pass plugin and the GPU runtime .c files.
  * Declares types, constants, and function prototypes used across passes.
@@ -481,7 +481,7 @@ extern u8 __coqui_virgin_map[COQUI_COV_MAP_SIZE];
 
 ```bash
 git add coqui_mode/runtime/coqui_runtime.h
-git commit -m "cuAFL: coqui_mode runtime header
+git commit -m "coqui mode: coqui_mode runtime header
 
 Defines the device-side ABI contract: types (coqui_status_t, u8/u32/u64),
 constants (COQUI_COV_MAP_SIZE, bucket classes, phase markers), and
@@ -547,7 +547,7 @@ chmod +x coqui_mode/build_coqui_support.sh
 
 ```bash
 git add coqui_mode/build_coqui_support.sh
-git commit -m "cuAFL: coqui_mode build/install script
+git commit -m "coqui mode: coqui_mode build/install script
 
 Builds the LLVM pass plugin via cmake, compiles the device runtime .c
 files to bitcode, links them into runtime.bc, and installs everything
@@ -632,7 +632,7 @@ int pthread_once(int *once_control, void (*init)(void)) {
 
 ```bash
 git add coqui_mode/runtime/coqui_runtime.c
-git commit -m "cuAFL: coqui_runtime.c — tid, trap, exit, status, stubs
+git commit -m "coqui mode: coqui_runtime.c — tid, trap, exit, status, stubs
 
 Core device-side utilities. Uses PTX inline asm to compute thread
 linear ID from %tid/%ntid/%ctaid. Provides stubs for common POSIX
@@ -738,7 +738,7 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
 
 ```bash
 git add coqui_mode/runtime/coqui_coverage.c
-git commit -m "cuAFL: coqui_coverage.c — AFL bucketing + virgin compare
+git commit -m "coqui mode: coqui_coverage.c — AFL bucketing + virgin compare
 
 256-entry class lookup in .const memory with 8-byte-stride zero-skip
 for bucketing. Atomic-OR via PTX atom.or.b64 into shared virgin map;
@@ -771,7 +771,7 @@ Key design (from coqui internals spec §6.1):
 
 ```c
 /*
- * coqui_memory.c --- per-thread heap allocator for cuAFL coqui_mode.
+ * coqui_memory.c --- per-thread heap allocator for coqui mode coqui_mode.
  *
  * Freelist-first, bump-fallback allocator over the per-thread heap
  * region (set up by MemoryLayout transform; accessed via __coqui_heap_base).
@@ -917,7 +917,7 @@ void *__coqui_realloc(void *ptr, unsigned long size) {
 
 ```bash
 git add coqui_mode/runtime/coqui_memory.c
-git commit -m "cuAFL: coqui_memory.c — per-thread heap allocator
+git commit -m "coqui mode: coqui_memory.c — per-thread heap allocator
 
 Freelist first-fit (8-iter max) with bump-allocate fallback over the
 per-thread heap region emitted by MemoryLayout. Trap on OOM per spec.
@@ -1088,7 +1088,7 @@ void __coqui_asan_free(void *ptr) {
 
 ```bash
 git add coqui_mode/runtime/coqui_asan.c
-git commit -m "cuAFL: coqui_asan.c — heap-only ASan runtime
+git commit -m "coqui mode: coqui_asan.c — heap-only ASan runtime
 
 Ported from /coqui/runtime/coqui_fuzz_asan.c with adjustments for new
 heap/shadow layout (shadow occupies 1/9 of heap region as a suffix,
@@ -1290,7 +1290,7 @@ Expected: cmake configures successfully.
 
 ```bash
 git add coqui_mode/passes/CMakeLists.txt coqui_mode/passes/Transforms.h coqui_mode/passes/CoquiPassPlugin.cpp
-git commit -m "cuAFL: LLVM pass plugin scaffolding
+git commit -m "coqui mode: LLVM pass plugin scaffolding
 
 CMakeLists.txt for building libCoquiPassPlugin.so against LLVM 18.
 Transforms.h declares the 10 day-1 passes. CoquiPassPlugin.cpp
@@ -1396,7 +1396,7 @@ Expected: builds (may still fail to link if other passes aren't implemented yet 
 
 ```bash
 git add coqui_mode/passes/InlineAsmReject.cpp
-git commit -m "cuAFL: InlineAsmReject pass
+git commit -m "coqui mode: InlineAsmReject pass
 
 Silently remove benign compiler-barrier asm (empty string + memory
 clobber). FATAL on any other inline asm with the containing function
@@ -1496,7 +1496,7 @@ bool runLibcReject(Module &M) {
 
 ```bash
 git add coqui_mode/passes/LibcReject.cpp
-git commit -m "cuAFL: LibcReject pass (blocklist only)
+git commit -m "coqui mode: LibcReject pass (blocklist only)
 
 Rejects setjmp/longjmp, pthread_* (except pthread_once), fork/exec,
 signal-family functions. Replacement logic for supported libc is
@@ -1591,7 +1591,7 @@ bool runIntrinsicReject(Module &M) {
 
 ```bash
 git add coqui_mode/passes/IntrinsicReject.cpp
-git commit -m "cuAFL: IntrinsicReject pass
+git commit -m "coqui mode: IntrinsicReject pass
 
 FATAL on blocklisted LLVM intrinsics (setjmp, longjmp, va_start/end,
 frameaddress, etc.) that are neither NVPTX-natively-lowerable nor
@@ -1675,7 +1675,7 @@ bool runFuzzEntry(Module &M) {
   if (!User) {
     report_fatal_error(
       "[coqui-cc] FuzzEntry: LLVMFuzzerTestOneInput not found — "
-      "every cuAFL target must define it");
+      "every coqui mode target must define it");
   }
   User->setName("__coqui_fuzz_execute");
 
@@ -1807,7 +1807,7 @@ bool runFuzzEntry(Module &M) {
 
 ```bash
 git add coqui_mode/passes/FuzzEntry.cpp
-git commit -m "cuAFL: FuzzEntry pass
+git commit -m "coqui mode: FuzzEntry pass
 
 Renames LLVMFuzzerTestOneInput -> __coqui_fuzz_execute, emits
 __coqui_fuzz_kernel with the 5-argument signature from §7.1 of the
@@ -1880,7 +1880,7 @@ bool runHeap(Module &M) {
 
 ```bash
 git add coqui_mode/passes/Heap.cpp
-git commit -m "cuAFL: Heap pass — replace libc allocators
+git commit -m "coqui mode: Heap pass — replace libc allocators
 
 RAUW malloc/free/calloc/realloc/aligned_alloc/posix_memalign to the
 corresponding __coqui_* runtime functions. Ported verbatim from
@@ -1921,7 +1921,7 @@ Skip cross-ConstantExpr references for v1 (coqui also skips those; documented in
 
 ```bash
 git add coqui_mode/passes/StaticGlobals.cpp
-git commit -m "cuAFL: StaticGlobals pass
+git commit -m "coqui mode: StaticGlobals pass
 
 Per-thread localization of writable globals via tid-indexed pool
 access. Each global variable is replaced with calls to a generated
@@ -2097,7 +2097,7 @@ bool runMemoryLayout(Module &M) {
 
 ```bash
 git add coqui_mode/passes/MemoryLayout.cpp
-git commit -m "cuAFL: MemoryLayout pass (new)
+git commit -m "coqui mode: MemoryLayout pass (new)
 
 Emits per-thread region allocas (coverage 64KB, heap H, shadow suffix)
 at kernel entry. Region bases are stored into .local slots at entry
@@ -2213,7 +2213,7 @@ bool runCoverage(Module &M) {
 
 ```bash
 git add coqui_mode/passes/Coverage.cpp
-git commit -m "cuAFL: Coverage pass (new) — AFL hash instrumentation
+git commit -m "coqui mode: Coverage pass (new) — AFL hash instrumentation
 
 Inserts the 6-instruction AFL hash sequence (load prev_loc, XOR with
 per-BB random constant, increment map[idx], store shifted cur_loc to
@@ -2251,7 +2251,7 @@ Writing the full pass is ~400-500 lines. Reference coqui source; keep logic fait
 
 ```bash
 git add coqui_mode/passes/Asan.cpp
-git commit -m "cuAFL: Asan pass — heap-only instrumentation
+git commit -m "coqui mode: Asan pass — heap-only instrumentation
 
 Instruments loads and stores with __coqui_asan_check_load/store_N
 helpers. RAUW __coqui_malloc -> __coqui_asan_malloc etc. Stack
@@ -2355,7 +2355,7 @@ Expected: `libCoquiPassPlugin.so` built. All 10 passes compile and link.
 
 ```bash
 git add coqui_mode/passes/ExternalSymbolGatekeeper.cpp
-git commit -m "cuAFL: ExternalSymbolGatekeeper pass
+git commit -m "coqui mode: ExternalSymbolGatekeeper pass
 
 Runs last in the pipeline. Walks external function declarations;
 FATALs on any with live uses not on the allowlist. Allowlist covers
@@ -2387,7 +2387,7 @@ Understand the stages: clang compilation, llvm-link, opt, llc, ptxas.
 ```python
 #!/usr/bin/env python3
 """
-coqui-cc --- cuAFL compiler driver.
+coqui-cc --- coqui mode compiler driver.
 
 Compiles C/C++ sources targeting NVPTX, runs the coqui pass plugin,
 links the device runtime, produces a .cubin.
@@ -2426,7 +2426,7 @@ def run(cmd, check=True, **kw):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="cuAFL compiler driver")
+    ap = argparse.ArgumentParser(description="coqui mode compiler driver")
     ap.add_argument("sources", nargs="+", help="C/C++ source files")
     ap.add_argument("-o", "--output", required=True, help="output base name")
     ap.add_argument("-arch", default=None, help="target GPU arch (e.g., sm_75)")
@@ -2526,7 +2526,7 @@ chmod +x coqui_mode/bin/coqui-cc
 
 ```bash
 git add coqui_mode/bin/coqui-cc
-git commit -m "cuAFL: coqui-cc compiler driver
+git commit -m "coqui mode: coqui-cc compiler driver
 
 Python orchestrator that compiles C/C++ -> NVPTX IR via clang,
 links device runtime, runs the coqui-link pass pipeline, lowers to
@@ -2599,7 +2599,7 @@ Expected: builds cleanly.
 
 ```bash
 git add include/afl-fuzz-coqui.h
-git commit -m "cuAFL: add CUDA handle fields to coqui_ctx/coqui_batch
+git commit -m "coqui mode: add CUDA handle fields to coqui_ctx/coqui_batch
 
 Header stays cuda.h-free by using void*/u64 for handles; callers in
 afl-fuzz-coqui.c cast to CUcontext/CUmodule/CUdeviceptr as needed.
@@ -2716,7 +2716,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   /* 6. Batch buffers */
   ctx->batch_size = 8192;
   ctx->max_input_size = afl->max_length ? afl->max_length : 4096;
-  /* u64 math to avoid overflow (fix from cuAFL T3.6 post-review) */
+  /* u64 math to avoid overflow (fix from coqui mode T3.6 post-review) */
   unsigned long long budget64 = ((unsigned long long)ctx->batch_size
                                   * ctx->max_input_size) / 4;
   unsigned long long floor64 = (unsigned long long)ctx->max_input_size * 256;
@@ -2818,7 +2818,7 @@ Expected: builds cleanly (requires `-lcuda` linker flag from Task 1.4).
 
 ```bash
 git add src/afl-fuzz-coqui.c
-git commit -m "cuAFL: coqui_init — real CUDA implementation
+git commit -m "coqui mode: coqui_init — real CUDA implementation
 
 Replaces the hollow stub with cuInit/cuCtxCreate/cuModuleLoad/
 cuModuleGetFunction flow per spec §8.4. Verifies sm_75+, checks static
@@ -2953,7 +2953,7 @@ make -j$(nproc) afl-fuzz 2>&1 | tail -10
 
 ```bash
 git add src/afl-fuzz-coqui.c
-git commit -m "cuAFL: coqui_submit_input / launch_batch / flush_batch real impl
+git commit -m "coqui mode: coqui_submit_input / launch_batch / flush_batch real impl
 
 Real CUDA via cuMemcpyHtoD/DtoHAsync, cuLaunchKernel, cuEventRecord.
 Ping-pong: fills pending, flips to executing (which has in-flight work),
@@ -3059,7 +3059,7 @@ make -j$(nproc) afl-fuzz 2>&1 | tail -10
 
 ```bash
 git add src/afl-fuzz-coqui.c
-git commit -m "cuAFL: coqui_await_and_process — flagged input handling
+git commit -m "coqui mode: coqui_await_and_process — flagged input handling
 
 Polls cuStreamQuery until kernel completes or timeout fires. On
 timeout: cuCtxSynchronize best-effort recovery + continue. For each
@@ -3146,7 +3146,7 @@ make -j$(nproc) afl-fuzz 2>&1 | tail -10
 
 ```bash
 git add src/afl-fuzz-coqui.c
-git commit -m "cuAFL: coqui_shutdown real CUDA teardown + deprecate calibrate_one
+git commit -m "coqui mode: coqui_shutdown real CUDA teardown + deprecate calibrate_one
 
 cuStreamSynchronize/Destroy, cuMemFreeHost/cuMemFree for all buffers,
 cuModuleUnload, cuCtxDestroy. coqui_calibrate_one kept as a no-op stub
@@ -3176,7 +3176,7 @@ Expected: `libCoquiPassPlugin.so` built.
 - [ ] **Step 2: Run install script**
 
 ```bash
-cd ../../..   # back to cuAFL root
+cd ../../..   # back to coqui mode root
 sudo PREFIX=/usr/local ./coqui_mode/build_coqui_support.sh 2>&1 | tail -10
 ```
 
@@ -3215,7 +3215,7 @@ coqui-cc cjson_read_fuzzer.c cjson.c -o cjson_fuzzer 2>&1 | tail -40
 ```
 
 Expected outcomes (any of these is the expected end of the plan):
-- **Compiles cleanly** → success! Move to end-to-end test with cuAFL.
+- **Compiles cleanly** → success! Move to end-to-end test with coqui mode.
 - **Fails at `ExternalSymbolGatekeeper`** with `unresolved external 'strlen'` (or similar) → first port-on-demand trigger. Report the error to user.
 - **Fails at an earlier pass** (rare — something we didn't anticipate) → report to user for design-level decision.
 
@@ -3230,7 +3230,7 @@ echo "" >> docs/coqui_port_log.md
 echo "## YYYY-MM-DD — first cjson compile attempt" >> docs/coqui_port_log.md
 # ... record the error ...
 git add docs/coqui_port_log.md
-git commit -m "cuAFL: coqui port log — first cjson compile attempt"
+git commit -m "coqui mode: coqui port log — first cjson compile attempt"
 ```
 
 No further automated tasks. Report status to user and await next instruction.
@@ -3253,7 +3253,7 @@ No further automated tasks. Report status to user and await next instruction.
 | §8 host launcher | Phase 6 (T6.1–T6.5) |
 | §9 validation | Phase 7 (validation attempt; port-on-demand after) |
 | §10 naming | All tasks use --coqui consistently |
-| §11 cuAFL amendments | Phase 1 (T1.1–T1.4) |
+| §11 coqui mode amendments | Phase 1 (T1.1–T1.4) |
 | §12 out of scope | Not implemented, per spec |
 
 **Placeholder scan:** no "TBD", "TODO", or "implement later" markers. Each code block is complete. Two places reference future porting (coqui_slab.c setup kernel, full StaticGlobals port), but both are explicitly flagged as part of the port-on-demand process, not day-1.

@@ -1,5 +1,5 @@
 /*
- * coqui_runtime.h --- cuAFL device-side runtime contract.
+ * coqui_runtime.h --- coqui mode device-side runtime contract.
  *
  * Shared header between the LLVM pass plugin and the GPU runtime .c files.
  * Declares types, constants, and function prototypes used across passes.

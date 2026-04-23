@@ -1,8 +1,8 @@
-# cuAFL evaluation target: stb_image
+# coqui mode evaluation target: stb_image
 
 stb_image multi-format image decoder fuzzer (PNG/BMP/GIF/JPEG/TGA/PSD/PIC/PNM),
 adapted from coqui's nix target
-(`/home/gpizarro/coqui/nix/targets/stb_image.nix`) for cuAFL's `coqui-cc`
+(`/home/gpizarro/coqui/nix/targets/stb_image.nix`) for coqui mode's `coqui-cc`
 compiler and `afl-fuzz --coqui` runtime.
 
 stb is a header-only library (nothings/stb, commit `28d546d5eb77`), so only the
@@ -39,31 +39,31 @@ Mirrors `nix/targets/stb_image.nix`:
 - `--slab-pool-size 0` (nix spec doesn't set a slab pool).
 - Arch: `sm_75` (RTX Titan).
 
-### cuAFL-only deltas
+### coqui mode-only deltas
 
 The nix build works via the coqui compiler wrapper, which provides a few
-runtime stubs that cuAFL's `coqui-cc` does not. Two extra `-D` flags are
+runtime stubs that coqui mode's `coqui-cc` does not. Two extra `-D` flags are
 therefore required here that are NOT in the nix spec:
 
 - `-D "STBI_ASSERT(x)="` — the 2 `STBI_ASSERT` calls in stb_image.h
-  expand to `assert(x)` → `__assert_fail`, which cuAFL's
+  expand to `assert(x)` → `__assert_fail`, which coqui mode's
   `ExternalSymbolGatekeeper` rejects. stb_image officially supports
   `STBI_ASSERT` override (see stb_image.h line 15), so we disable them.
 - `-D STBI_NO_HDR` — the Radiance HDR decoder
   (`stbi__hdr_info` / `stbi__hdr_load`) calls `strtol()`, which is not
-  in cuAFL's runtime allowlist. Disabling HDR on GPU removes the
+  in coqui mode's runtime allowlist. Disabling HDR on GPU removes the
   offending code path.
 
 **Coverage impact:** the CPU AFL++ binary (built by nix) still has HDR
 enabled, so HDR-specific bugs can be hit by CPU verification — but the
 GPU won't drive coverage toward HDR paths. Lifting this requires either
-a `strtol` stub in cuAFL's `runtime.bc` or patching stb_image.h's HDR
+a `strtol` stub in coqui mode's `runtime.bc` or patching stb_image.h's HDR
 parser (out of scope for this target dir).
 
 ## Seeds & dict
 
 Symlinked from the nix CPU build output
-(`/tmp/cuafl-stb_image-cpu/seeds`, `/tmp/cuafl-stb_image-cpu/dict`):
+(`/tmp/coqui-stb_image-cpu/seeds`, `/tmp/coqui-stb_image-cpu/dict`):
 
 - `seeds/white.png` — minimal 1×1 PNG.
 - `seeds/red.bmp` — minimal 1×1 BMP.
@@ -78,11 +78,11 @@ Symlinked from the nix CPU build output
   take ~20–30 minutes on a typical workstation even at `-O1`. If you
   need to iterate on other flags, expect a full `build.sh` run to be
   dominated by this step.
-- **HDR format disabled on GPU only.** See the cuAFL-only deltas
+- **HDR format disabled on GPU only.** See the coqui mode-only deltas
   above. GPU coverage will not steer inputs toward Radiance HDR code.
 - **`AFL_COQUI_CUBIN` "mistyped" warning.** Harmless; same symptom as
-  other cuAFL evaluation targets. The variable is read, just not yet
-  listed in cuAFL's env-validator table.
+  other coqui mode evaluation targets. The variable is read, just not yet
+  listed in coqui mode's env-validator table.
 - **Seeds are symlinks into `/nix/store`.** `afl-fuzz` tolerates these
   for this target (unlike bzip2, which had to materialise them with
   `cp -L` for its CPU binary to read them). If the dry-run reports
@@ -97,7 +97,7 @@ cached) and rebuilds the cubin. To rebuild from a fully clean state:
 ```bash
 rm -rf stb_image_read_fuzzer* seeds dict out \
        .stb_image_read_fuzzer.build \
-       /tmp/cuafl-stb_image-cpu
+       /tmp/coqui-stb_image-cpu
 ./build.sh
 ```
 
@@ -109,7 +109,7 @@ slow to finish within the test window:
 
 | Stage | Tool | Status |
 |---|---|---|
-| CPU binary | `nix build .#target-stb_image-aflplusplus` | PASS (produces `/tmp/cuafl-stb_image-cpu/stb_image_read_fuzzer`) |
+| CPU binary | `nix build .#target-stb_image-aflplusplus` | PASS (produces `/tmp/coqui-stb_image-cpu/stb_image_read_fuzzer`) |
 | stb source resolve | `nix-store -qR` | PASS (`/nix/store/<hash>-source` with `stb_image.h`) |
 | clang → NVPTX bitcode | `clang --target=nvptx64-nvidia-cuda` | PASS |
 | runtime link | `llvm-link` | PASS |
@@ -128,7 +128,7 @@ ptxas warning : Unresolved extern variable '__coqui_virgin_map' in whole program
 ptxas warning : Unresolved extern variable '__coqui_global_statics_pool_base' in whole program compilation, ignoring extern qualifier
 ```
 
-These externs are resolved at kernel-launch time by cuAFL's runtime
+These externs are resolved at kernel-launch time by coqui mode's runtime
 (the same pattern all other coqui-mode targets rely on).
 
 Because stb_image's kernel is enormous (every decoder inlined into
