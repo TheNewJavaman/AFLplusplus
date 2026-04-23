@@ -17,7 +17,11 @@ set(COQUI_PASS_SOURCES
     IntrinsicReject.cpp
     FuzzEntry.cpp
     Heap.cpp
+    Sprintf.cpp
     Libc.cpp
+    Variadic.cpp
+    Reloc.cpp
+    Math.cpp
     StaticGlobals.cpp
     MemoryLayout.cpp
     Coverage.cpp

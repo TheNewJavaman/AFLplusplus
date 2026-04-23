@@ -135,10 +135,19 @@ def main():
     if args.emit_ptx:
         sys.exit(0)
 
-    # 5. ptxas -> .cubin
+    # 5. ptxas -> .cubin.
+    #
+    # -O1 minimum (project constraint). ASan-instrumented PTX can push ptxas
+    # to ~100 GB RSS on some targets (stb_image, libpng). coqui-cc does NOT
+    # serialize ptxas internally — if you are running multiple coqui-cc
+    # invocations simultaneously, the caller is responsible for sequencing
+    # them (e.g., a serial for-loop). An earlier attempt to flock this call
+    # broke under SIGKILL of a waiter and left the lock file held
+    # indefinitely.
+    ptxas_opt = os.environ.get("COQUI_PTXAS_OPT", "-O1")
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
     run([
-        "ptxas", f"-arch={arch}", "-O1",
+        "ptxas", f"-arch={arch}", ptxas_opt,
         str(ptx_path), "-o", str(cubin),
     ])
 
