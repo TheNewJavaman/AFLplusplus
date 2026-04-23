@@ -4,9 +4,9 @@ Adapts the cmark (CommonMark Markdown parser) fuzz target from coqui so it can
 be driven with coqui mode's `afl-fuzz --coqui`.
 
 - Upstream: https://github.com/commonmark/cmark (pinned to `0.31.1`)
-- GPU ref spec: `/home/gpizarro/coqui/nix/targets/cmark.nix`
-- AFL++ CPU spec: `target-cmark-aflplusplus` in `/home/gpizarro/coqui/flake.nix`
-- Harness: `/home/gpizarro/coqui/harness/targets/cmark_fuzzer.c` (libFuzzer-style,
+- GPU ref spec: `cmark` target in the legacy coqui codebase
+- AFL++ CPU spec: `target-cmark-aflplusplus` in the legacy coqui codebase
+- Harness: `cmark_fuzzer.c` from the legacy coqui codebase (libFuzzer-style,
   4-byte `options` + 4-byte `width` prefix; mode selected by upper 2 bits of
   `options`)
 
@@ -94,8 +94,8 @@ Used by: cmark_render_html
 
 ## Gotchas
 
-- Requires a working coqui flake at `/home/gpizarro/coqui` (for the AFL++
-  CPU build) and a local install of coqui mode's `coqui-cc` at
+- Requires a working coqui flake from the legacy coqui codebase (for the
+  AFL++ CPU build) and a local install of coqui mode's `coqui-cc` at
   `/usr/local/bin/coqui-cc` (for the GPU build).
 - `--arch sm_75` is hardcoded in `build.sh` (matches the RTX Titan test box
   per `CLAUDE.local.md`).
