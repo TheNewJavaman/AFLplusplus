@@ -96,22 +96,23 @@ static llvm::MDNode *createBranchWeightMD(llvm::LLVMContext &Ctx,
        ConstantAsMetadata::get(ConstantInt::get(I32, FalseWeight))});
 }
 
-/// Create an outlined fast-path helper.
+/// Create an outlined fast-path helper (Task 2 signature with precomputed
+/// heap/shadow bases):
 ///
-///   void __coqui_asan_check_fast_{load|store}_N(ptr addr) {
-///     i64 heap_base = (i64) __coqui_heap_base();
-///     i64 shadow_base = (i64) __coqui_shadow_base();
-///     i64 usable = shadow_base - heap_base;
+///   void __coqui_asan_check_fast_{load|store}_N(ptr addr,
+///                                                i64 heap_base,
+///                                                i64 shadow_base) {
+///     i64 usable = zext(__coqui_heap_size());   // compile-time constant
 ///     i64 rel = (i64)addr - heap_base;
-///     if (rel >= usable) return;                    // 95/5: likely out of heap -> skip
+///     if (rel >= usable) return;                 // 95/5: likely out of heap
 ///     i8 sbyte = *(i8*)(shadow_base + (rel >> 3));
-///     if (sbyte == 0) return;                        // 99/1: likely clean -> skip
+///     if (sbyte == 0) return;                     // 99/1: likely clean
 ///     __coqui_asan_slowpath_{load|store}_N(addr);
 ///   }
 ///
-/// NoInline so each callsite is literally one `call` instruction — this is
-/// the whole point of the port. The helper body contains the fast-path logic
-/// that used to be inlined at every load/store site.
+/// NoInline — each callsite is literally one `call` instruction. The helper
+/// itself must NOT be instrumented; protection relies on the `__coqui_`
+/// prefix skip in the main instrumentation loop.
 static llvm::Function *createSizedFastHelper(llvm::Module &M,
                                              llvm::StringRef HelperName,
                                              uint64_t AccessSize,
@@ -123,13 +124,10 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Type *I64Ty = Type::getInt64Ty(Ctx);
   Type *PtrTy = PointerType::get(Ctx, 0);
 
-  // Runtime decls we call from the helper body.
-  FunctionType *HeapBaseTy = FunctionType::get(PtrTy, false);
-  FunctionCallee HeapBaseFn =
-      M.getOrInsertFunction("__coqui_heap_base", HeapBaseTy);
-  FunctionCallee ShadowBaseFn =
-      M.getOrInsertFunction("__coqui_shadow_base", HeapBaseTy);
-
+  // Slowpath declaration. heap_base/shadow_base now arrive as function
+  // arguments — the caller (computeHeapContext) hoists the per-thread
+  // getter calls to the entry of each instrumented function so all helper
+  // calls within that function share one result.
   FunctionType *SlowTy = FunctionType::get(VoidTy, {PtrTy}, false);
   FunctionCallee SlowFn = M.getOrInsertFunction(SlowpathName, SlowTy);
 
@@ -151,12 +149,19 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   (void)AccessSize;
 
   // Create the helper function.
-  FunctionType *HelperTy = FunctionType::get(VoidTy, {PtrTy}, false);
+  // This helper is named __coqui_asan_check_fast_* so the "skip functions
+  // with __coqui_ prefix" predicate in the main instrumentation loop
+  // excludes it from self-ASan. Preserve the prefix if you rename.
+  // Signature: void(ptr, i64 heap_base, i64 shadow_base).
+  FunctionType *HelperTy =
+      FunctionType::get(VoidTy, {PtrTy, I64Ty, I64Ty}, false);
   Function *F = Function::Create(HelperTy, GlobalValue::InternalLinkage,
                                  HelperName, M);
   F->setCallingConv(CallingConv::C);
   F->addFnAttr(Attribute::NoInline);
   F->getArg(0)->setName("addr");
+  F->getArg(1)->setName("heap.base");
+  F->getArg(2)->setName("shadow.base");
 
   BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", F);
   BasicBlock *ShadowBB = BasicBlock::Create(Ctx, "shadow", F);
@@ -168,10 +173,8 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
 
   // --- entry: range check ---
   IRBuilder<> B(EntryBB);
-  Value *HeapBase = B.CreateCall(HeapBaseFn, {}, "hb");
-  Value *HeapBaseI64 = B.CreatePtrToInt(HeapBase, I64Ty, "hb.i64");
-  Value *ShadowBase = B.CreateCall(ShadowBaseFn, {}, "sb");
-  Value *ShadowBaseI64 = B.CreatePtrToInt(ShadowBase, I64Ty, "sb.i64");
+  Value *HeapBaseI64 = F->getArg(1);
+  Value *ShadowBaseI64 = F->getArg(2);
   Value *HeapSize32 = B.CreateCall(HeapSizeFn, {}, "heap_size");
   Value *Usable = B.CreateZExt(HeapSize32, I64Ty, "usable");
   Value *AddrI64 = B.CreatePtrToInt(F->getArg(0), I64Ty, "addr.i64");
@@ -200,6 +203,38 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   B.CreateRetVoid();
 
   return F;
+}
+
+/// At the entry of `F`, emit calls to __coqui_heap_base() and
+/// __coqui_shadow_base() and convert to i64. Returns the pair.
+///
+/// These are per-thread values (per the slot-pool getters in
+/// MemoryLayout.cpp). Hoisting them to function entry means LLVM will
+/// compute them once per function invocation instead of once per
+/// access-site helper call.
+///
+/// DO NOT subtract them to derive `usable` — heap and shadow are
+/// separate allocas. Use __coqui_heap_size() for usable instead (it
+/// inlines to a compile-time constant).
+struct HeapCtx { llvm::Value *HeapBase; llvm::Value *ShadowBase; };
+
+static HeapCtx computeHeapContext(llvm::Function &F) {
+  using namespace llvm;
+  Module &M = *F.getParent();
+  LLVMContext &C = M.getContext();
+  Type *I64 = Type::getInt64Ty(C);
+  Type *PtrTy = PointerType::get(C, 0);
+  FunctionType *FnTy = FunctionType::get(PtrTy, false);
+  FunctionCallee HB = M.getOrInsertFunction("__coqui_heap_base", FnTy);
+  FunctionCallee SB = M.getOrInsertFunction("__coqui_shadow_base", FnTy);
+
+  Instruction *InsertPt = &*F.getEntryBlock().getFirstInsertionPt();
+  IRBuilder<> B(InsertPt);
+  Value *Hb = B.CreateCall(HB, {}, "asan.hb");
+  Value *HbI64 = B.CreatePtrToInt(Hb, I64, "asan.hb.i64");
+  Value *Sb = B.CreateCall(SB, {}, "asan.sb");
+  Value *SbI64 = B.CreatePtrToInt(Sb, I64, "asan.sb.i64");
+  return {HbI64, SbI64};
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +371,12 @@ bool runAsan(Module &M) {
     if (ToInstrument.empty())
       continue;
 
+    // Hoist __coqui_heap_base() / __coqui_shadow_base() to the entry of this
+    // function so every helper callsite below shares one materialization of
+    // each (instead of re-evaluating the per-thread getters in every helper
+    // body call).
+    HeapCtx Ctx = computeHeapContext(F);
+
     for (Instruction *I : ToInstrument) {
       IRBuilder<> B(I); // inserts before I
 
@@ -345,7 +386,8 @@ bool runAsan(Module &M) {
           continue;
         unsigned Sz = selectSize(TS.getFixedValue());
         Function *Helper = getFastHelper(/*IsStore=*/false, Sz);
-        B.CreateCall(Helper, {LI->getPointerOperand()});
+        B.CreateCall(Helper,
+                     {LI->getPointerOperand(), Ctx.HeapBase, Ctx.ShadowBase});
         ++LoadCount;
       } else {
         auto *SI = cast<StoreInst>(I);
@@ -354,7 +396,8 @@ bool runAsan(Module &M) {
           continue;
         unsigned Sz = selectSize(TS.getFixedValue());
         Function *Helper = getFastHelper(/*IsStore=*/true, Sz);
-        B.CreateCall(Helper, {SI->getPointerOperand()});
+        B.CreateCall(Helper,
+                     {SI->getPointerOperand(), Ctx.HeapBase, Ctx.ShadowBase});
         ++StoreCount;
       }
     }
@@ -377,14 +420,14 @@ bool runAsan(Module &M) {
   static const char *kAsanInternal[] = {
       "__coqui_asan_malloc",
       "__coqui_asan_free",
-      "__coqui_asan_check_load_1",
-      "__coqui_asan_check_load_2",
-      "__coqui_asan_check_load_4",
-      "__coqui_asan_check_load_8",
-      "__coqui_asan_check_store_1",
-      "__coqui_asan_check_store_2",
-      "__coqui_asan_check_store_4",
-      "__coqui_asan_check_store_8",
+      "__coqui_asan_check_fast_load_1",
+      "__coqui_asan_check_fast_load_2",
+      "__coqui_asan_check_fast_load_4",
+      "__coqui_asan_check_fast_load_8",
+      "__coqui_asan_check_fast_store_1",
+      "__coqui_asan_check_fast_store_2",
+      "__coqui_asan_check_fast_store_4",
+      "__coqui_asan_check_fast_store_8",
   };
 
   // For each allocator we'll RAUW: declare the _raw alias as a separate
