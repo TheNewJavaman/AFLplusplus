@@ -1,5 +1,5 @@
 /*
- * LibcReject.cpp --- reject unsupported libc patterns.
+ * RejectLibc.cpp --- reject unsupported libc patterns.
  *
  * Blocklist-only; does NOT provide replacements. Replacements get
  * ported on demand as the gatekeeper flags them.
@@ -52,7 +52,7 @@ static const std::set<std::string> &blocklist() {
   return list;
 }
 
-bool runLibcReject(Module &M) {
+bool runRejectLibc(Module &M) {
   for (Function &F : M) {
     if (!F.isDeclaration()) continue;   /* only care about external refs */
 
@@ -63,7 +63,7 @@ bool runLibcReject(Module &M) {
 
     std::string msg;
     raw_string_ostream os(msg);
-    os << "[coqui-cc] LibcReject: '" << name
+    os << "[coqui-cc] RejectLibc: '" << name
        << "' is not supported on GPU; disable this feature at build time "
        << "(e.g., -DTARGET_NO_PTHREADS, -DPNG_NO_SETJMP).";
     report_fatal_error(os.str().c_str());

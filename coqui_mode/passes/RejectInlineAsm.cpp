@@ -1,5 +1,5 @@
 /*
- * InlineAsmReject.cpp --- reject arch-specific inline asm.
+ * RejectInlineAsm.cpp --- reject arch-specific inline asm.
  *
  * Strip benign compiler barriers (empty or whitespace-only asm strings
  * with "memory" clobber) silently. FATAL on anything else with
@@ -30,7 +30,7 @@ static bool isBenign(StringRef asmStr, StringRef constraints) {
   return false;
 }
 
-bool runInlineAsmReject(Module &M) {
+bool runRejectInlineAsm(Module &M) {
   bool changed = false;
   std::vector<CallInst*> toErase;
 
@@ -56,7 +56,7 @@ bool runInlineAsmReject(Module &M) {
         /* Non-trivial asm — FATAL with context */
         std::string msg;
         raw_string_ostream os(msg);
-        os << "[coqui-cc] InlineAsmReject: non-trivial inline asm in function '"
+        os << "[coqui-cc] RejectInlineAsm: non-trivial inline asm in function '"
            << F.getName() << "': " << asmStr.str();
         report_fatal_error(os.str().c_str());
       }

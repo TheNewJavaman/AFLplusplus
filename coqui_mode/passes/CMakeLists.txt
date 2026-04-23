@@ -12,9 +12,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(COQUI_PASS_SOURCES
     CoquiPassPlugin.cpp
-    InlineAsmReject.cpp
-    LibcReject.cpp
-    IntrinsicReject.cpp
+    RejectInlineAsm.cpp
+    RejectLibc.cpp
+    RejectIntrinsics.cpp
     FuzzEntry.cpp
     Heap.cpp
     Sprintf.cpp

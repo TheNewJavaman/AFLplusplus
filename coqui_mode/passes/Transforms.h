@@ -12,9 +12,9 @@ namespace coqui {
 
 /* Each returns true if the module was modified (standard LLVM convention). */
 
-bool runInlineAsmReject(llvm::Module &M);
-bool runLibcReject(llvm::Module &M);
-bool runIntrinsicReject(llvm::Module &M);
+bool runRejectInlineAsm(llvm::Module &M);
+bool runRejectLibc(llvm::Module &M);
+bool runRejectIntrinsics(llvm::Module &M);
 bool runFuzzEntry(llvm::Module &M);
 bool runHeap(llvm::Module &M);
 bool runSprintf(llvm::Module &M);

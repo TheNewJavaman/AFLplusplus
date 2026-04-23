@@ -1,8 +1,7 @@
 /*
  * CoquiPassPlugin.cpp --- LLVM pass plugin entry + registration.
  *
- * Registers the `coqui-link` pass pipeline that runs all day-1 passes
- * in order.
+ * Registers the `coqui` pass that runs all cuAFL transforms in order.
  */
 
 #include "Transforms.h"
@@ -16,25 +15,34 @@ using namespace llvm;
 
 namespace {
 
-struct CoquiLinkPass : public PassInfoMixin<CoquiLinkPass> {
+struct CoquiPass : public PassInfoMixin<CoquiPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    /* Each runX() returns true if it modified the module. OR them to decide
+     * whether to preserve analyses at the end. The individual passes mostly
+     * DO modify (instrument, rewrite calls, inject globals) so we almost
+     * always end up returning none(); tracking it anyway keeps the analysis
+     * cache alive in the degenerate "nothing to do" case (e.g. running the
+     * plugin on an already-transformed module). */
+    bool Changed = false;
+
     /* Pass order from coqui internals spec §3.2 */
-    coqui::runInlineAsmReject(M);
-    coqui::runLibcReject(M);
-    coqui::runVariadic(M);          /* lower user-defined variadics BEFORE IntrinsicReject catches llvm.va_* */
-    coqui::runIntrinsicReject(M);
-    coqui::runFuzzEntry(M);
-    coqui::runHeap(M);
-    coqui::runSprintf(M);           /* must run BEFORE runLibc so raw sprintf/snprintf are still resolvable by name */
-    coqui::runLibc(M);              /* minimum libc string/math replacements */
-    coqui::runMath(M);              /* rewrite llvm.pow/log/exp → __coqui_* runtime calls (NVPTX can't select) */
-    coqui::runReloc(M);             /* break circular global initializer deps (breaks NVPTX AsmPrinter) */
-    coqui::runStaticGlobals(M);
-    coqui::runMemoryLayout(M);
-    coqui::runCoverage(M);
-    coqui::runAsan(M);
-    coqui::runExternalSymbolGatekeeper(M);
-    return PreservedAnalyses::none();
+    Changed |= coqui::runRejectInlineAsm(M);
+    Changed |= coqui::runRejectLibc(M);
+    Changed |= coqui::runVariadic(M);           /* before RejectIntrinsics so llvm.va_* is lowered first */
+    Changed |= coqui::runRejectIntrinsics(M);
+    Changed |= coqui::runFuzzEntry(M);
+    Changed |= coqui::runHeap(M);
+    Changed |= coqui::runSprintf(M);            /* before runLibc so raw sprintf/snprintf are resolvable */
+    Changed |= coqui::runLibc(M);
+    Changed |= coqui::runMath(M);               /* rewrite llvm.pow/log/exp -> __coqui_* runtime calls */
+    Changed |= coqui::runReloc(M);              /* break cyclic global init deps (NVPTX AsmPrinter can't handle) */
+    Changed |= coqui::runStaticGlobals(M);
+    Changed |= coqui::runMemoryLayout(M);
+    Changed |= coqui::runCoverage(M);
+    Changed |= coqui::runAsan(M);
+    Changed |= coqui::runExternalSymbolGatekeeper(M);
+
+    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 
@@ -50,8 +58,8 @@ llvmGetPassPluginInfo() {
       PB.registerPipelineParsingCallback(
         [](StringRef Name, ModulePassManager &MPM,
            ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "coqui-link") {
-            MPM.addPass(CoquiLinkPass());
+          if (Name == "coqui") {
+            MPM.addPass(CoquiPass());
             return true;
           }
           return false;

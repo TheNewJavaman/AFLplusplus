@@ -104,11 +104,11 @@ def main():
     with_runtime_bc = workdir / "with_runtime.bc"
     run(["llvm-link", str(pruned_bc), RUNTIME_BC, "-o", str(with_runtime_bc)])
 
-    # 3c. opt with coqui-link pipeline
+    # 3c. opt with coqui pipeline
     # Forward --stack-size to the pass via -coqui-stack-size so the IR
     # layout's heap/shadow sizes track the runtime cuCtxSetLimit value.
     #
-    # Chain always-inline AFTER coqui-link: the ASan pass INSERTS calls to
+    # Chain always-inline AFTER coqui: the ASan pass INSERTS calls to
     # runtime fast-path wrappers (__coqui_asan_check_load/store_N) during
     # this phase, so the inliner must run afterward to see those new call
     # sites. Runtime fast-path wrappers carry always_inline; their outlined
@@ -116,7 +116,7 @@ def main():
     transformed_bc = workdir / "transformed.bc"
     run([
         "opt", "-load-pass-plugin", PASS_PLUGIN,
-        "-passes=coqui-link,always-inline",
+        "-passes=coqui,always-inline",
         f"-coqui-stack-size={args.stack_size}",
         str(with_runtime_bc), "-o", str(transformed_bc),
     ])

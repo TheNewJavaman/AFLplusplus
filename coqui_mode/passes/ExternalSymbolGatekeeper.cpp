@@ -1,7 +1,7 @@
 /*
  * ExternalSymbolGatekeeper.cpp --- final check for unresolved externals.
  *
- * Runs LAST in the coqui-link pipeline. Scans all external function
+ * Runs LAST in the coqui pipeline. Scans all external function
  * declarations that have live uses. FATALs with a specific message
  * for any symbol not on the allowlist.
  *

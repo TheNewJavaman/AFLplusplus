@@ -1,5 +1,5 @@
 /*
- * IntrinsicReject.cpp --- reject unhandled LLVM intrinsics.
+ * RejectIntrinsics.cpp --- reject unhandled LLVM intrinsics.
  *
  * Hard-fail on any intrinsic that is neither natively lowerable by the
  * NVPTX backend nor handled by a ported transform.
@@ -58,7 +58,7 @@ static std::string normalizeName(StringRef Full) {
   return s.substr(0, second);
 }
 
-bool runIntrinsicReject(Module &M) {
+bool runRejectIntrinsics(Module &M) {
   for (Function &F : M) {
     if (!F.isIntrinsic()) continue;
 
@@ -70,7 +70,7 @@ bool runIntrinsicReject(Module &M) {
 
     std::string msg;
     raw_string_ostream os(msg);
-    os << "[coqui-cc] IntrinsicReject: '" << fullName
+    os << "[coqui-cc] RejectIntrinsics: '" << fullName
        << "' not handled. Port the relevant transform or disable this "
        << "feature in the target.";
     report_fatal_error(os.str().c_str());
