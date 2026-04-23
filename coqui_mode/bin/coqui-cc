@@ -126,11 +126,18 @@ def main():
         sys.exit(0)
 
     # 4. llc -> .ptx
+    #
+    # COQUI_LLC_OPT can override the opt level (default: llc's implicit, which
+    # is -O2). On huge ASan-instrumented modules (libxml2: 211k outlined call
+    # sites) llc -O2 register allocation stalls; -O1 is what coqui's driver
+    # uses and completes. Scoped to env-var so normal targets stay at -O2.
     ptx_path = out.with_suffix(".ptx") if args.emit_ptx else workdir / "out.ptx"
-    run([
-        "llc", f"-march=nvptx64", f"-mcpu={arch}",
-        str(transformed_bc), "-o", str(ptx_path),
-    ])
+    llc_cmd = ["llc", f"-march=nvptx64", f"-mcpu={arch}"]
+    llc_opt = os.environ.get("COQUI_LLC_OPT", "")
+    if llc_opt:
+        llc_cmd.append(llc_opt)
+    llc_cmd += [str(transformed_bc), "-o", str(ptx_path)]
+    run(llc_cmd)
 
     if args.emit_ptx:
         sys.exit(0)
