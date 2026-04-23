@@ -148,6 +148,43 @@ Initial smoke test. Minimal seed = 1 byte `'a'`.
 Kernel phase breakdown (from last coqui-rate): `init=0% exec=3% classify=15% virgin=82%`.
 Coqui secondary's own fuzzer_stats show `execs_done=100` (post-calibration counter was not climbing yet); the authoritative GPU throughput is the `[coqui-rate]` sample above.
 
+### 2026-04-23 04:33 UTC — bzip2 pair (coqui crashes, main runs solo)  (commit 80c5f5cf)
+
+Paired run attempted, coqui crashed with `CUDA_ERROR_LAUNCH_FAILED` on
+first batch (known issue — bzip2 kernel needs more stack). Main continued
+solo for the full 60 s window.
+
+| config | value |
+|---|---|
+| clients   | 1 main + 1 coqui (crashed) + 0 plain |
+| duration  | 60 s (AFL run_time; post-calibration snapshot not collected in this run) |
+| seed      | 37 bytes — minimal valid bzip2 stream |
+| stack     | 64 KiB (default) |
+| driver    | fork-per-exec |
+
+| instance | exec rate | cvg | corpus | edges |
+|---|---:|---:|---:|---:|
+| main (CPU) | **1,438 exec/s** | 21.92% | 268 | 461 |
+| coqui | crash on batch #1 | — | — | — |
+
+Comparing against the 30 s plain main run above (1,105 exec/s, 19.26% cvg,
+405 edges): with 2× more fuzzing time, coverage plateaus only slightly
+(21.9% vs 19.3%) — bzip2's cvg ceiling is low without a more diverse seed
+corpus.
+
+### Build blockers observed
+
+- **ptxas -O1 is pathological on ASan-instrumented PTX for some targets**:
+  cmark (53 GB RSS / 55 min killed), cares (13 GB / 77 min killed). libpng
+  earlier in this session also blew up to 100+ GB. The constraint is -O1
+  minimum (per `feedback_compilation_opt_level.md`); the workaround is to
+  reduce ASan instrumentation density or shrink the per-target source list.
+  Targets affected: cares, cmark, libpng, libxml2, libyaml, stb_image,
+  zstd all have cubin builds that reach ptxas but take >30 min at -O1.
+- **Sequential build driver**: /tmp/seq_rebuild.sh waits for any in-flight
+  ptxas, then builds each remaining target one at a time. It hit the
+  pathological-ptxas issue on cmark and cares; killed both and stopped.
+
 ### Known issues blocking wider bench runs
 
 - **`--coqui` + persistent-mode CPU binary**: cuAFL's `--coqui` forkserver path times out during AFL's dry-run calibration when the target binary uses AFL's persistent-mode features (either shm-fuzz via `__AFL_FUZZ_TESTCASE_BUF` or the stdin-fed `__AFL_LOOP` form). Pure AFL CPU mode works fine with persistent binaries; only the `--coqui` path is affected. Until this is debugged, `--coqui` benches have to use fork-per-exec (non-persistent) drivers. **This violates the project's persistent-mode constraint.** See `include/afl-fuzz-coqui.h` / `src/afl-fuzz-coqui.c` for coqui-mode state and investigate why the CPU forkserver calibration path behaves differently under `--coqui`.
