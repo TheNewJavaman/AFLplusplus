@@ -1,117 +1,104 @@
 #!/usr/bin/env bash
-# build.sh — build stb_image coqui mode evaluation target.
+# build.sh — build stb_image coqui mode evaluation target (nix-free).
 #
 # Produces in the current directory:
-#   stb_image_read_fuzzer.cubin — GPU kernel (sm_75)
+#   stb_image_read_fuzzer.cubin — GPU kernel (configurable via ARCH env, default sm_75)
 #   stb_image_read_fuzzer.conf  — companion config emitted by coqui-cc
-#   stb_image_read_fuzzer_cpu   — AFL++ instrumented CPU binary (symlink to nix store)
-#   seeds/                      — initial seed corpus (symlink to nix store)
-#   dict/                       — fuzzing dictionary (symlink to nix store)
+#   stb_image_read_fuzzer_cpu   — AFL++ instrumented CPU binary
+#   .build/                     — cached upstream source (stb_image.h)
 #
-# Mirrors coqui's nix spec: the `stb_image` target in the legacy coqui codebase
+# No external dependencies beyond afl-clang-fast (from this repo) and
+# coqui-cc (installed to /usr/local/bin). stb_image.h is fetched from
+# github.com/nothings/stb at a pinned commit.
 #
-# stb_image notes:
-#   - stb is a header-only library, so only the harness .c is compiled
-#     (STB_IMAGE_IMPLEMENTATION is defined inside stb_image_read_fuzzer.c).
-#   - STBI_NO_STDIO / STBI_NO_SIMD / STBI_NO_THREAD_LOCALS are defined in the
-#     harness itself; we don't need to pass them as -D.
-#   - nix spec uses --stack-size 65536 (double the default) because the
-#     multi-format decoder is stack-overflow-prone. Dim cap is 64 in harness.
-#   - nix spec sets sanitizer flags via the coqui wrapper; coqui-cc does NOT
-#     accept those flags, so we omit them here (they only matter for the CPU
-#     binary, which nix builds separately).
-#   - stb_image.h calls assert() which expands to __assert_fail on NVPTX.
-#     coqui mode's runtime has no __assert_fail stub, and its ExternalSymbolGatekeeper
-#     hard-fails. stb_image documents an override: define STBI_ASSERT(x) before
-#     the header. We pass `-D STBI_ASSERT(x)=` so asserts become no-ops on GPU.
-#     (Nix/coqui doesn't need this because the coqui wrapper provides a stub.)
-#   - STBI_NO_HDR: the Radiance HDR decoder calls strtol(), which coqui mode's runtime
-#     does not stub. Disabling HDR on GPU is a GPU-only restriction; the CPU
-#     AFL++ binary built by nix still enables HDR. Consequence: GPU-driven
-#     coverage won't steer toward HDR code paths. Add a runtime strtol stub
-#     (ideally in coqui mode runtime.bc) to lift this limitation.
+# Overrides:
+#   ARCH          GPU compute capability (default sm_75)
+#   AFL_CC        path to afl-clang-fast (default: this repo's own afl-clang-fast)
+#   COQUI_CC      path to coqui-cc (default /usr/local/bin/coqui-cc)
+#   STB_CACHE     path to cache the fetched stb_image.h (default .build/stb_image.h)
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
-COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/coqui-stb_image-cpu"
-HARNESS_DIR="${COQUI_REPO}/harness/targets"
-ARCH="${ARCH:-sm_75}"
-STACK_SIZE=65536         # from stb_image.nix (--stack-size 65536)
-SLAB_POOL_SIZE=0         # stb_image.nix does not set a slab pool
-
+# --- Config -----------------------------------------------------------------
 HARNESS_BASENAME="stb_image_read_fuzzer"
+HARNESS_SRC="${SCRIPT_DIR}/harness.c"
+ARCH="${ARCH:-sm_75}"
+STACK_SIZE=65536          # multi-format decoder is stack-heavy
+SLAB_POOL_SIZE=0
 
-echo "=== [1/4] Build AFL++ CPU binary via nix ==="
-# Idempotent: `nix build` is a no-op if the derivation is already realised.
-cd "${COQUI_REPO}"
-nix build '.#target-stb_image-aflplusplus' --out-link "${CPU_OUT_LINK}"
-cd "${SCRIPT_DIR}"
+# stb upstream pin (matches coqui's legacy fetch at rev 28d546d5e)
+STB_COMMIT="28d546d5eb77d4585506a20480f4de2e706dff4c"
+STB_URL="https://raw.githubusercontent.com/nothings/stb/${STB_COMMIT}/stb_image.h"
 
-if [[ ! -x "${CPU_OUT_LINK}/${HARNESS_BASENAME}" ]]; then
-  echo "ERROR: CPU binary not found at ${CPU_OUT_LINK}/${HARNESS_BASENAME}" >&2
+# Tools
+AFL_CC="${AFL_CC:-${SCRIPT_DIR}/../../../afl-clang-fast}"
+COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
+STB_CACHE="${STB_CACHE:-${SCRIPT_DIR}/.build/stb_image.h}"
+
+# Sanitizers matching legacy coqui (address + UBSan except object-size).
+# stb_image has flexible-array member usage in some decoders so we avoid
+# object-size. Same set used for the legacy cmark target.
+SANITIZE_FLAGS=(
+  "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
+  "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+)
+
+# --- Pre-flight -------------------------------------------------------------
+[[ -x "$AFL_CC" ]]   || { echo "ERROR: afl-clang-fast not found at $AFL_CC" >&2; exit 1; }
+[[ -x "$COQUI_CC" ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
+[[ -f "$HARNESS_SRC" ]] || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
+
+# --- [1/3] Fetch upstream stb_image.h ---------------------------------------
+echo "=== [1/3] Fetch stb_image.h at pinned commit ==="
+mkdir -p "$(dirname "$STB_CACHE")"
+if [[ ! -f "$STB_CACHE" ]]; then
+  echo "  curl $STB_URL -> $STB_CACHE"
+  curl -fsSL "$STB_URL" -o "$STB_CACHE"
+fi
+# Light integrity check: commit pin in the URL already pins contents, but
+# verify the file is non-empty and has the stb header signature.
+if ! grep -q "stb_image" "$STB_CACHE"; then
+  echo "ERROR: cached $STB_CACHE doesn't look like stb_image.h" >&2
+  rm -f "$STB_CACHE"
   exit 1
 fi
+echo "  stb_image.h: $(wc -l <"$STB_CACHE") lines, $(wc -c <"$STB_CACHE") bytes"
 
-echo "=== [2/4] Resolve stb source path ==="
-# stb is fetched via fetchFromGitHub, so the header lives in a `-source`
-# derivation inside the CPU build's closure. Look for one that contains
-# stb_image.h so we don't accidentally pick up some other -source derivation.
-STB_SRC=$(nix-store -qR "${CPU_OUT_LINK}" \
-  | grep -E '/nix/store/[^/]+-source$' \
-  | xargs -I{} sh -c '[ -f "{}/stb_image.h" ] && echo "{}"' \
-  | head -n1)
-if [[ -z "${STB_SRC}" || ! -f "${STB_SRC}/stb_image.h" ]]; then
-  echo "ERROR: could not locate stb source (expected stb_image.h)" >&2
-  exit 1
-fi
-echo "  stb source: ${STB_SRC}"
+# --- [2/3] Build AFL++ CPU binary -------------------------------------------
+echo "=== [2/3] Build AFL++ CPU binary with afl-clang-fast ==="
+CPU_OUT="${HARNESS_BASENAME}_cpu"
+"$AFL_CC" -O2 -g \
+  "${SANITIZE_FLAGS[@]}" \
+  -fsanitize=fuzzer \
+  -I "$(dirname "$STB_CACHE")" \
+  "$HARNESS_SRC" \
+  -o "$CPU_OUT" \
+  -lm
 
-HARNESS="${HARNESS_DIR}/${HARNESS_BASENAME}.c"
-if [[ ! -f "${HARNESS}" ]]; then
-  echo "ERROR: missing harness: ${HARNESS}" >&2
-  exit 1
-fi
+[[ -x "$CPU_OUT" ]] || { echo "ERROR: CPU binary not produced" >&2; exit 1; }
 
-echo "=== [3/4] Build GPU cubin via coqui-cc ==="
-# Flags mirror the `stb_image` target in the legacy coqui codebase plus one coqui mode-only
-# fix:
-#   -arch sm_75                 — required for coqui mode runtime (RTX Titan)
-#   --stack-size 65536          — nix spec overrides the 32768 default
-#   -I <stb source>             — stb_image.h lives there
-#   -D STBI_ASSERT(x)=          — disable stb_image's internal assert() (coqui mode-only;
-#                                 nix builds rely on a runtime __assert_fail stub
-#                                 that coqui mode doesn't ship)
-# The harness .c defines STB_IMAGE_IMPLEMENTATION + STBI_NO_STDIO internally,
-# so no extra -D is needed (unlike bzip2/cjson).
-"${COQUI_CC}" \
-  -arch "${ARCH}" \
-  --stack-size "${STACK_SIZE}" \
-  --slab-pool-size "${SLAB_POOL_SIZE}" \
-  -I "${STB_SRC}" \
+# --- [3/3] Build GPU cubin via coqui-cc -------------------------------------
+echo "=== [3/3] Build GPU cubin via coqui-cc ==="
+# coqui-cc takes the harness + stb_image.h include dir. STBI_ASSERT is
+# stubbed because coqui mode's runtime has no __assert_fail. STBI_NO_HDR
+# disables the Radiance decoder (uses strtol which isn't in the runtime).
+"$COQUI_CC" \
+  -arch "$ARCH" \
+  --stack-size "$STACK_SIZE" \
+  --slab-pool-size "$SLAB_POOL_SIZE" \
+  -I "$(dirname "$STB_CACHE")" \
   -D "STBI_ASSERT(x)=" \
   -D STBI_NO_HDR \
-  "${HARNESS}" \
-  -o "${HARNESS_BASENAME}"
+  "$HARNESS_SRC" \
+  -o "$HARNESS_BASENAME"
 
-if [[ ! -f "${HARNESS_BASENAME}.cubin" || ! -f "${HARNESS_BASENAME}.conf" ]]; then
-  echo "ERROR: coqui-cc did not emit ${HARNESS_BASENAME}.cubin / .conf" >&2
-  exit 1
-fi
-
-echo "=== [4/4] Link CPU binary + seeds + dict ==="
-ln -sfn "${CPU_OUT_LINK}/${HARNESS_BASENAME}" "${HARNESS_BASENAME}_cpu"
-ln -sfn "${CPU_OUT_LINK}/seeds" seeds
-if [[ -d "${CPU_OUT_LINK}/dict" ]]; then
-  ln -sfn "${CPU_OUT_LINK}/dict" dict
-fi
+[[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \
+  || { echo "ERROR: coqui-cc did not emit .cubin/.conf" >&2; exit 1; }
 
 echo
 echo "=== Build complete ==="
-ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" \
-       "${HARNESS_BASENAME}_cpu" seeds 2>/dev/null || true
-[[ -L dict ]] && ls -la dict || true
+ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds dict
 echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"

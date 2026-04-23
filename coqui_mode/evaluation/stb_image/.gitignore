@@ -3,9 +3,16 @@
 *.conf
 stb_image_read_fuzzer_cpu
 
-# Symlinks to nix store
-/seeds
-/dict
+# Upstream source cache (fetched by build.sh at pinned commit)
+/.build/
+
+# coqui-cc intermediate build dir (.harness.build/)
+/.*_fuzzer.build/
 
 # afl-fuzz output
 /out/
+
+# Bench artifacts / logs
+build.log
+*.log
+/seed_min/
