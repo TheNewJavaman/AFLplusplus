@@ -146,3 +146,6 @@ test/test-ijon-pcguard
 test/test-instr.plain.mycheck
 test/test-multiple-mutators
 
+
+# coqui mode docs are Claude's local reference — never committed
+coqui_mode/docs/
