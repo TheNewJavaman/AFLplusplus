@@ -30,20 +30,12 @@ else
   mkdir -p "$OUTDIR"
 fi
 
-DICT_FILE=""
-if [ -d "$SCRIPT_DIR/dict" ]; then
-  DICT_FILE=$(ls "$SCRIPT_DIR/dict"/*.dict 2>/dev/null | head -n1 || true)
-fi
-DICT_ARG=""
-[ -n "$DICT_FILE" ] && DICT_ARG=" -x $DICT_FILE"
-
 echo "==============================================================="
 echo "  coqui mode libpng fuzz workspace ready"
 echo "  cubin:  $CUBIN"
 echo "  cpu:    $CPU_BIN"
-echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) files)"
+echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) file(s))"
 echo "  out:    $OUTDIR"
-[ -n "$DICT_FILE" ] && echo "  dict:   $DICT_FILE"
 echo "==============================================================="
 
 cat <<INNEREOF
@@ -59,12 +51,12 @@ export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\
 # 2. Pick ONE instance to launch:
 
 # Main (CPU master):
-$AFL_FUZZ -M main -i $SEEDS -o $OUTDIR$DICT_ARG -- $CPU_BIN
+$AFL_FUZZ -M main -i $SEEDS -o $OUTDIR -- $CPU_BIN
 
 # Secondary (CPU parallel fuzzer; repeat with sec2/sec3/... for more):
-$AFL_FUZZ -S sec1 -i $SEEDS -o $OUTDIR$DICT_ARG -- $CPU_BIN
+$AFL_FUZZ -S sec1 -i $SEEDS -o $OUTDIR -- $CPU_BIN
 
 # Coqui (GPU-backed fuzzer, device $AFL_DEVICE):
-$AFL_FUZZ --coqui gpu$AFL_DEVICE -i $SEEDS -o $OUTDIR$DICT_ARG -- $CPU_BIN
+$AFL_FUZZ --coqui gpu$AFL_DEVICE -i $SEEDS -o $OUTDIR -- $CPU_BIN
 
 INNEREOF

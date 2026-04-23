@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # fuzz.sh — prep the coqui mode bzip2 fuzz workspace + print suggested
 # launch commands. Does NOT exec afl-fuzz; user picks Main/Secondary/Coqui.
-#
-# Prereq: run ./build.sh first (produces bzip2_fuzzer.{cubin,conf}, _cpu, seeds/).
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,9 +14,10 @@ SEEDS="${SCRIPT_DIR}/seeds"
 OUTDIR="${SCRIPT_DIR}/out"
 AFL_DEVICE="${AFL_COQUI_DEVICE:-0}"
 
-for f in bzip2_fuzzer.cubin bzip2_fuzzer.conf bzip2_fuzzer_cpu seeds; do
-  if [[ ! -e "${f}" ]]; then
-    echo "ERROR: ${f} not found; run ./build.sh first" >&2
+# Pre-flight
+for f in "$CUBIN" "$CPU_BIN" "$SEEDS"; do
+  if [ ! -e "$f" ]; then
+    echo "ERROR: missing $f -- run ./build.sh first." >&2
     exit 1
   fi
 done
@@ -34,11 +34,11 @@ echo "==============================================================="
 echo "  coqui mode bzip2 fuzz workspace ready"
 echo "  cubin:  $CUBIN"
 echo "  cpu:    $CPU_BIN"
-echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) files)"
+echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) file(s))"
 echo "  out:    $OUTDIR"
 echo "==============================================================="
 
-cat <<EOF
+cat <<INNEREOF
 
 # 1. Set environment once (or prefix each command):
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\
@@ -59,4 +59,4 @@ $AFL_FUZZ -S sec1 -i $SEEDS -o $OUTDIR -- $CPU_BIN
 # Coqui (GPU-backed fuzzer, device $AFL_DEVICE):
 $AFL_FUZZ --coqui gpu$AFL_DEVICE -i $SEEDS -o $OUTDIR -- $CPU_BIN
 
-EOF
+INNEREOF

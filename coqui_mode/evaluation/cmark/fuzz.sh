@@ -5,17 +5,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "${SCRIPT_DIR}"
 
-HARNESS="cmark_fuzzer"
-CUBIN="$SCRIPT_DIR/${HARNESS}.cubin"
-CPU_BIN="$SCRIPT_DIR/${HARNESS}_cpu"
-SEEDS="$SCRIPT_DIR/seeds"
-OUTDIR="$SCRIPT_DIR/out"
 AFL_FUZZ="${AFL_FUZZ:-$SCRIPT_DIR/../../../afl-fuzz}"
+CUBIN="${SCRIPT_DIR}/cmark_fuzzer.cubin"
+CPU_BIN="${SCRIPT_DIR}/cmark_fuzzer_cpu"
+SEEDS="${SCRIPT_DIR}/seeds"
+OUTDIR="${SCRIPT_DIR}/out"
 AFL_DEVICE="${AFL_COQUI_DEVICE:-0}"
 
-# Sanity.
+# Pre-flight
 for f in "$CUBIN" "$CPU_BIN" "$SEEDS"; do
   if [ ! -e "$f" ]; then
     echo "ERROR: missing $f -- run ./build.sh first." >&2
@@ -35,11 +34,11 @@ echo "==============================================================="
 echo "  coqui mode cmark fuzz workspace ready"
 echo "  cubin:  $CUBIN"
 echo "  cpu:    $CPU_BIN"
-echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) files)"
+echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) file(s))"
 echo "  out:    $OUTDIR"
 echo "==============================================================="
 
-cat <<EOF
+cat <<INNEREOF
 
 # 1. Set environment once (or prefix each command):
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\
@@ -60,4 +59,4 @@ $AFL_FUZZ -S sec1 -i $SEEDS -o $OUTDIR -- $CPU_BIN
 # Coqui (GPU-backed fuzzer, device $AFL_DEVICE):
 $AFL_FUZZ --coqui gpu$AFL_DEVICE -i $SEEDS -o $OUTDIR -- $CPU_BIN
 
-EOF
+INNEREOF

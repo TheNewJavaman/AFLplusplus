@@ -30,14 +30,12 @@ else
   mkdir -p "$OUTDIR"
 fi
 
-
 echo "==============================================================="
 echo "  coqui mode zstd fuzz workspace ready"
 echo "  cubin:  $CUBIN"
 echo "  cpu:    $CPU_BIN"
-echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) files)"
+echo "  seeds:  $SEEDS  ($(ls "$SEEDS" | wc -l) file(s))"
 echo "  out:    $OUTDIR"
-
 echo "==============================================================="
 
 cat <<INNEREOF
