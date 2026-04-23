@@ -33,7 +33,7 @@ in `coqui_fuzz_asan.c`. Largest single port remaining. Blocks build of
 cmark, cares, libpng, libxml2, libyaml, stb_image, zstd — i.e. 7 of 10
 targets.
 
-## 2. Stripped `--heap-size` / `--batch-size` / `--slab-pool-size` knobs
+## 2. Missing runtime overrides for heap-size / batch-size
 
 **Symptom:** bzip2 `--coqui` fails with `CUDA_ERROR_LAUNCH_FAILED` on
 first batch, even with 64 KiB stack.
@@ -48,19 +48,20 @@ first batch, even with 64 KiB stack.
 | stb_image | **65536** | default | default | default |
 | cjson | default | default | default | default |
 
-cuAFL's `coqui-cc` dropped `--heap-size` / `--batch-size` with a comment
-saying "heap derived at runtime / batch is runtime env var". The runtime
-DOES derive heap as `(total_budget - cov - stack) * 8/9` (so
-`512 - 64 - 64 = 384 KB` available; heap gets 341 KB of that) — **but
-that's smaller than bzip2 needs (512 KB)**. And batch size is hardcoded
-to 8192 with no env override honored.
+cuAFL's `coqui-cc` has `--stack-size` (with `AFL_COQUI_STACK_SIZE` runtime
+env override) and `--slab-pool-size`, but NO runtime env override for
+heap-size or batch-size. The runtime derives heap as
+`(total_budget - cov - stack) * 8/9` (so `512 - 64 - 64 = 384 KB`
+available; heap gets 341 KB of that) — **but that's smaller than bzip2
+needs (512 KB)**. Batch size is hardcoded to 8192.
 
-**Fix:** restore `--heap-size`, `--batch-size`, `--slab-pool-size` as
-coqui-cc flags; write them into the `.conf` sidecar; have `afl-fuzz-coqui.c`
-parse the conf at `coqui_init()` (or introduce `AFL_COQUI_HEAP_SIZE` /
-`AFL_COQUI_BATCH_SIZE` env-var overrides). The slab pool code exists in
-the runtime already — routing the allocator overflow to it is partly
-ported.
+**Fix (runtime-first, matching user preference for iterative tuning):**
+add `AFL_COQUI_HEAP_SIZE` and `AFL_COQUI_BATCH_SIZE` runtime env vars in
+`src/afl-fuzz-coqui.c` following the existing `AFL_COQUI_STACK_SIZE`
+pattern. No coqui-cc changes needed — the values don't need to be baked
+into the cubin; AFL applies them at `coqui_init()`. The slab pool
+allocator code exists in the runtime already — routing the allocator
+overflow to it is partly ported.
 
 ## 3. libjpeg-turbo explicit source list + stubs file
 
@@ -117,5 +118,5 @@ instead of `fuzz_run_target` under our flag.
 ## Priority for next pass
 
 1. **Port outlined ASan** — biggest impact (unblocks 7/10 targets).
-2. **Restore `--heap-size` / `--batch-size` / `--slab-pool-size`** — fixes bzip2; likely fixes `libpng` et al. once they build.
+2. **Add `AFL_COQUI_HEAP_SIZE` / `AFL_COQUI_BATCH_SIZE` runtime env vars** — matches user preference for iterative tuning; fixes bzip2; likely fixes `libpng` et al. once they build.
 3. **Fix persistent-mode under --coqui** — required to get real CPU-main throughput (currently fork-per-exec = 1.5k/s vs. an expected ~100k/s).
