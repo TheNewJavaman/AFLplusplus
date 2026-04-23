@@ -81,6 +81,51 @@ Two `[coqui-rate]` samples captured before / after a force-reset:
 
 Run hit "coqui kernel stuck past 4000000 us" twice; force-resets cost ~30 s of wall time each. Steady-state peak submits/s ≈ **1.0 M/s**.
 
+### 2026-04-23 02:37 UTC — cjson main + coqui post-calibration (commit 353e9a93)
+
+First run with the new **post-calibration bench methodology**: start both
+instances, wait for main to clear calibration (execs_done > 100 on main
++ coqui has emitted at least one `[coqui-rate]` sample), *then* start
+the 60 s window.
+
+Also: discovered that `fuzzer_stats` `execs_done` for the coqui side
+lags the real counter by orders of magnitude — the file is only
+flushed at specific AFL internal checkpoints and coqui batches fire
+inside tight havoc loops that bypass those. Authoritative GPU
+throughput is taken from `[coqui-rate]` samples, not `fuzzer_stats`.
+
+| config | value |
+|---|---|
+| clients   | **1 main + 1 coqui + 0 plain** |
+| duration  | 60 s post-cal (total wall ≈ 180 s incl warmup) |
+| seed      | 1 byte `'a'` |
+| stack     | 64 KiB (default) |
+| heap      | 113 KiB (derived) |
+| slab      | 0 |
+| batch     | 8192 |
+| driver    | fork-per-exec stdin-fed (see Known Issues) |
+
+**Main (CPU)** — from `fuzzer_stats` delta over bench window:
+| metric | start | end | rate |
+|---|---:|---:|---:|
+| execs_done | 83,730 | 165,015 | **1,355 exec/s** |
+| bitmap_cvg | 10.17% | 11.09% | +0.92% |
+| edges_found | 166 | 181 | +15 |
+| corpus | 165 | 229 | +64 |
+
+**Coqui (GPU0)** — from `[coqui-rate]` samples during bench window (n=3):
+| submits/s | batches/s | host wall/batch |
+|---:|---:|---:|
+| **881,334** (peak) | 107.6 | 9.3 ms |
+| 893,957 | 109.1 | 9.2 ms |
+| 581,065 | 70.9 | 14.1 ms |
+
+avg ≈ **785 k submits/s**, median ≈ 881 k. coqui fuzzer_stats: cvg 0.31% → 2.63%, corpus 1 → 5 (coqui secondary admits fewer entries than main since it imports main's output asynchronously).
+
+No kernel-stuck / CUDA-error events this run.
+
+**Headline**: post-calibration, the pair delivers **~786 k GPU submits/s + 1,355 CPU execs/s** on cjson with the 1-byte `'a'` seed. This compares favorably to the earlier 60 s-including-calibration run that logged 1,566 main exec/s + 0 coqui (calibration starvation masked the GPU throughput entirely).
+
 ### 2026-04-23 02:30 UTC — cjson main+coqui (commit cebabfee, larger corpus)
 
 Initial smoke test. Minimal seed = 1 byte `'a'`.
