@@ -1,230 +1,271 @@
 #!/usr/bin/env bash
-# build.sh — build libpng coqui mode evaluation target.
+# build.sh — build libpng coqui mode evaluation target (nix-free).
 #
 # Produces in the current directory:
-#   libpng_read_fuzzer.cubin      — GPU kernel (sm_75, compiled by coqui-cc)
-#   libpng_read_fuzzer.conf       — companion config emitted by coqui-cc
-#   libpng_read_fuzzer_cpu        — AFL++ instrumented CPU binary (symlink)
-#   libpng_include/               — patched pnglibconf.h + libpng header symlinks
-#   seeds/                        — initial seed corpus (symlink)
-#   dict/                         — fuzzing dictionary (symlink)
+#   libpng_read_fuzzer.cubin — GPU kernel (configurable via ARCH env, default sm_75)
+#   libpng_read_fuzzer.conf  — companion config emitted by coqui-cc
+#   libpng_read_fuzzer_cpu   — AFL++ instrumented CPU binary (libFuzzer-compatible)
+#   libpng_include/          — patched pnglibconf.h + libpng header symlinks
+#   .build/                  — cached upstream libpng + zlib sources
 #
-# Mirrors the `libpng` target in the legacy coqui codebase — specifically:
-#   * Patched pnglibconf.h (strip PNG_SETJMP_SUPPORTED + PNG_SIMPLIFIED_*,
-#     add PNG_DISABLE_ADLER32_CHECK_SUPPORTED) via sed + echo.
-#   * Symlink libpng's *.h into libpng_include/ so -I picks them up next to
-#     the patched pnglibconf.h.
-#   * Compile zlib + libpng sources + harness with -D PNG_NO_STDIO -D PNG_NO_SETJMP.
-#   * --stack-size 32768 (libpng+zlib call chains overflow the 8KB default).
-#   * --slab-pool-size 2 GiB (chunk allocations exceed the per-thread heap).
+# No external dependencies beyond afl-clang-fast (from this repo) and
+# coqui-cc (installed to /usr/local/bin). libpng v1.6.43 and zlib v1.3.1
+# are fetched from GitHub release tarballs at pinned commits.
 #
-# Notes on coqui mode vs coqui nix differences:
-#   * coqui-cc does NOT accept --heap-size, --batch-size, --ignore-signal=,
-#     or -fsanitize=. The coqui mode runtime derives heap at startup and reads
-#     batch size from AFL_COQUI_BATCH_SIZE.
-#   * Sanitizers on the GPU build are not selected via -fsanitize= at
-#     compile time. Instead:
-#       - ASan is instrumented by coqui_mode/passes/Asan.cpp (outlined
-#         fast-path helpers + heap shadow; enabled by default for every
-#         cubin this driver builds).
-#       - UBSan is NOT yet ported on the GPU side (no Ubsan.cpp pass).
-#         CPU crash verification via afl-fuzz catches the UBSan-class
-#         bugs post-hoc using the AFL++-instrumented CPU binary.
-#       - CFI, MSan, TSan: not applicable for this fuzz surface.
+# Overrides (set as env vars before running build.sh):
+#   ARCH            GPU compute capability (default sm_75)
+#   AFL_CC          path to afl-clang-fast wrapper (default: this repo's own).
+#                   build.sh unsets this after reading so afl-cc itself does
+#                   not treat it as a backend-clang override.
+#   COQUI_CC        path to coqui-cc (default /usr/local/bin/coqui-cc)
+#   COQUI_LLC_OPT   extra llc flags forwarded to coqui-cc. If llc stalls on
+#                   libpng's large module (~44k instrumented accesses) on
+#                   your host, set this to "-O1" before running build.sh.
+#                   Default unset (llc uses -O2).
+#
+# GPU vs CPU build differences:
+#   GPU build defines PNG_NO_STDIO + PNG_NO_SETJMP so libpng errors route
+#   through PNG_ABORT() -> abort() -> __coqui_trap() (see png_abort_stub.c).
+#   CPU build defines PNG_NO_STDIO only; setjmp is kept so libpng longjmps
+#   back to the harness on parse errors, keeping the persistent-mode loop
+#   alive for AFL++.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-# --- Fixed paths --------------------------------------------------------
-COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
-COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/coqui-libpng-cpu"
-HARNESS_DIR="${COQUI_REPO}/harness/targets"
+# --- Config -----------------------------------------------------------------
+HARNESS_BASENAME="libpng_read_fuzzer"
+HARNESS_SRC="${SCRIPT_DIR}/harness.c"
 ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768          # libpng+zlib call chains exceed 8KB hardware stack
 SLAB_POOL_SIZE=2147483648 # 2 GiB — matches libpng.nix
 
-CPU_BINARY_NAME="libpng_read_fuzzer"
+# Upstream pins (matches coqui's nix fetchFromGitHub revs).
+LIBPNG_VERSION="1.6.43"
+LIBPNG_URL="https://github.com/pnggroup/libpng/archive/refs/tags/v${LIBPNG_VERSION}.tar.gz"
+ZLIB_VERSION="1.3.1"
+ZLIB_URL="https://github.com/madler/zlib/archive/refs/tags/v${ZLIB_VERSION}.tar.gz"
 
-# --- Pre-flight ---------------------------------------------------------
-test -x "${COQUI_CC}"             || { echo "[build] missing ${COQUI_CC}" >&2; exit 1; }
-test -d "${COQUI_REPO}"           || { echo "[build] missing ${COQUI_REPO}" >&2; exit 1; }
-test -f "${COQUI_REPO}/flake.nix" || { echo "[build] ${COQUI_REPO} is not a flake" >&2; exit 1; }
-test -f "${HARNESS_DIR}/libpng_read_fuzzer.c" \
-  || { echo "[build] missing harness at ${HARNESS_DIR}/libpng_read_fuzzer.c" >&2; exit 1; }
+BUILD_DIR="${SCRIPT_DIR}/.build"
+LIBPNG_SRC="${BUILD_DIR}/libpng-${LIBPNG_VERSION}"
+ZLIB_SRC="${BUILD_DIR}/zlib-${ZLIB_VERSION}"
 
-echo "=== [1/5] Build AFL++ CPU binary via nix ==="
-# target-libpng-aflplusplus ships: harness binary + seeds/ + dict/.
-# Idempotent: `nix build` is a no-op if the derivation is already realised.
-( cd "${COQUI_REPO}" && nix build '.#target-libpng-aflplusplus' \
-    --out-link "${CPU_OUT_LINK}" )
+# Tools. AFL_CC is the wrapper; unset the env var of the same name below so
+# afl-cc doesn't interpret it as an override of its internal backend clang
+# (that would cause infinite recursion: afl-cc execs $AFL_CC, which is
+# another afl-cc, which reads $AFL_CC again, etc.).
+AFL_CC_BIN="${AFL_CC:-${SCRIPT_DIR}/../../../afl-clang-fast}"
+unset AFL_CC
+COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
 
-if [[ ! -x "${CPU_OUT_LINK}/${CPU_BINARY_NAME}" ]]; then
-  echo "[build] ERROR: CPU binary not found at ${CPU_OUT_LINK}/${CPU_BINARY_NAME}" >&2
-  exit 1
-fi
+# Users hitting llc register-allocator stalls can export COQUI_LLC_OPT="-O1"
+# before invoking build.sh. coqui-cc will forward it to its llc step.
+export COQUI_LLC_OPT="${COQUI_LLC_OPT:-}"
 
-echo "=== [2/5] Resolve libpng + zlib source paths ==="
-# Both are `-source` nix derivations in the closure. We identify them by
-# the presence of distinctive files so we don't hardcode store hashes.
-LIBPNG_SRC=""
-ZLIB_SRC=""
-for src in $(nix-store -qR "${CPU_OUT_LINK}" | grep -E -- '-source$'); do
-  if [[ -z "${LIBPNG_SRC}" && -f "${src}/png.c" && -d "${src}/scripts" ]]; then
-    LIBPNG_SRC="${src}"
+# Sanitizers matching legacy coqui cpu-target-specs.nix (sanitizers.default).
+SANITIZE_FLAGS=(
+  "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
+  "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+)
+
+# libpng + zlib source lists (matches libpng.nix and cpu-target-specs.nix).
+ZLIB_SOURCES=(
+  adler32.c compress.c crc32.c deflate.c infback.c inffast.c
+  inflate.c inftrees.c trees.c uncompr.c zutil.c
+)
+LIBPNG_SOURCES=(
+  png.c pngerror.c pngget.c pngmem.c pngpread.c pngread.c
+  pngrio.c pngrtran.c pngrutil.c pngset.c pngtrans.c pngwio.c
+  pngwrite.c pngwtran.c pngwutil.c
+)
+
+# --- Pre-flight -------------------------------------------------------------
+[[ -x "$AFL_CC_BIN" ]]   || { echo "ERROR: afl-clang-fast not found at $AFL_CC_BIN" >&2; exit 1; }
+[[ -x "$COQUI_CC" ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
+[[ -f "$HARNESS_SRC" ]] || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
+[[ -f "${SCRIPT_DIR}/png_abort_stub.c" ]] \
+  || { echo "ERROR: png_abort_stub.c missing" >&2; exit 1; }
+
+# --- [1/4] Fetch upstream libpng + zlib sources -----------------------------
+echo "=== [1/4] Fetch libpng ${LIBPNG_VERSION} + zlib ${ZLIB_VERSION} ==="
+mkdir -p "$BUILD_DIR"
+
+fetch_tarball() {
+  local url="$1" out_dir="$2" marker="$3"
+  if [[ -f "$out_dir/$marker" ]]; then
+    echo "  cached: $out_dir"
+    return 0
   fi
-  if [[ -z "${ZLIB_SRC}" && -f "${src}/adler32.c" && -f "${src}/deflate.c" ]]; then
-    ZLIB_SRC="${src}"
-  fi
-done
+  echo "  curl $url"
+  rm -rf "$out_dir"
+  curl -fsSL "$url" | tar -xz -C "$BUILD_DIR"
+  [[ -f "$out_dir/$marker" ]] \
+    || { echo "ERROR: expected $out_dir/$marker after extraction" >&2; exit 1; }
+}
 
-if [[ -z "${LIBPNG_SRC}" ]]; then
-  echo "[build] ERROR: could not resolve libpng source (expected png.c in /nix/store/*-source)" >&2
-  exit 1
-fi
-if [[ -z "${ZLIB_SRC}" ]]; then
-  echo "[build] ERROR: could not resolve zlib source (expected adler32.c + deflate.c in /nix/store/*-source)" >&2
-  exit 1
-fi
-echo "  libpng src: ${LIBPNG_SRC}"
-echo "  zlib src:   ${ZLIB_SRC}"
+fetch_tarball "$LIBPNG_URL" "$LIBPNG_SRC" "png.c"
+fetch_tarball "$ZLIB_URL"   "$ZLIB_SRC"   "adler32.c"
 
-test -f "${LIBPNG_SRC}/scripts/pnglibconf.h.prebuilt" \
-  || { echo "[build] ERROR: ${LIBPNG_SRC} missing scripts/pnglibconf.h.prebuilt" >&2; exit 1; }
-
-echo "=== [3/5] Patch pnglibconf.h and stage libpng headers ==="
-# Use the prebuilt pnglibconf.h shipped with libpng, but strip several
-# feature-support macros that the prebuilt header unconditionally defines
-# (overriding -D PNG_NO_SETJMP / -D PNG_NO_STDIO from the command line):
+# --- [2/4] Stage patched pnglibconf.h + libpng headers ----------------------
+echo "=== [2/4] Patch pnglibconf.h and stage libpng headers ==="
+# The prebuilt pnglibconf.h ships with several feature-support macros
+# unconditionally defined; we strip different subsets for the CPU vs GPU
+# builds and append PNG_DISABLE_ADLER32_CHECK_SUPPORTED so the fuzzer can
+# explore zlib streams without needing valid checksums (matches libpng.nix).
 #
-#   PNG_SETJMP_SUPPORTED      — stripped so pngconf.h does NOT #include
-#                               <setjmp.h>; coqui-cc's pass aborts on _setjmp.
-#   PNG_SIMPLIFIED_{READ,WRITE}_*  — the simplified-API functions
-#                               (png_safe_error/png_safe_execute) use
-#                               setjmp/longjmp directly under their own guard.
-#   PNG_CONSOLE_IO_SUPPORTED  — coqui mode specific: gates the fprintf(stderr, ...)
-#                               branches in pngerror.c. coqui mode's coqui-cc
-#                               runtime.bc does NOT stub fprintf, so
-#                               ExternalSymbolGatekeeper aborts ("unresolved
-#                               external 'fprintf' — Used by: png_app_error").
-#                               The coqui project's own runtime has a stub;
-#                               coqui mode does not. Stripping CONSOLE_IO_SUPPORTED
-#                               forces pngerror.c down the "assume nothing"
-#                               path that only calls the user error_fn.
-#   PNG_STDIO_SUPPORTED       — coqui mode specific: gates fread/fwrite usage in
-#                               pngrio.c/pngwio.c. Same reason — no stdio
-#                               stubs in coqui mode's device runtime. Our harness
-#                               uses png_set_read_fn/png_set_write_fn, so the
-#                               default stdio io-ptr paths are unused anyway.
-#   PNG_FLOATING_ARITHMETIC_SUPPORTED — coqui mode specific: gates pow()/floor()
-#                               calls in png.c gamma computation. The NVPTX
-#                               backend cannot select llvm.pow.f64 without
-#                               a math-runtime transform; coqui's build has
-#                               MathTransform.cpp that rewrites intrinsics to
-#                               __coqui_pow et al., coqui mode does not. Stripping
-#                               this macro forces libpng's fixed-point gamma
-#                               fallback (png_log8bit + png_exp8bit +
-#                               png_muldiv) which uses only integer ops.
-#                               PNG_FLOATING_POINT_SUPPORTED is kept so the
-#                               public API (png_set_gamma(double,double))
-#                               still accepts FP args from the harness; only
-#                               the internal gamma table computation switches
-#                               to fixed-point.
-#
-# Then append PNG_DISABLE_ADLER32_CHECK_SUPPORTED so the fuzzer can explore
-# zlib streams without needing valid checksums (matches libpng.nix).
-rm -rf libpng_include
-mkdir -p libpng_include
+# Two staged header dirs:
+#   libpng_include/     — CPU build: keeps PNG_SETJMP_SUPPORTED (harness's
+#                         setjmp path needs png_jmpbuf), keeps stdio +
+#                         console_io + fp arithmetic (host libc has them).
+#                         Only strips PNG_SIMPLIFIED_{READ,WRITE}_* so the
+#                         simplified API (unused) isn't linked.
+#   libpng_include_gpu/ — GPU build: strips everything libpng.nix strips,
+#                         matching the legacy GPU build:
+#                           PNG_SETJMP_SUPPORTED — pngconf.h would
+#                             #include <setjmp.h>, coqui-cc's pass aborts
+#                             on _setjmp.
+#                           PNG_SIMPLIFIED_{READ,WRITE}_* — simplified-API
+#                             functions use setjmp/longjmp directly.
+#                           PNG_CONSOLE_IO_SUPPORTED — gates fprintf in
+#                             pngerror.c; ExternalSymbolGatekeeper rejects
+#                             unresolved fprintf.
+#                           PNG_STDIO_SUPPORTED — gates fread/fwrite in
+#                             pngrio.c/pngwio.c; harness uses callbacks.
+#                           PNG_FLOATING_ARITHMETIC_SUPPORTED — gates
+#                             pow/floor in png.c gamma code; NVPTX can't
+#                             select llvm.pow.f64. Stripping forces the
+#                             fixed-point gamma fallback. PNG_FLOATING_
+#                             POINT_SUPPORTED stays so the public API
+#                             (png_set_gamma(double,double)) still takes FP.
+rm -rf libpng_include libpng_include_gpu
+mkdir -p libpng_include libpng_include_gpu
+
+# CPU: only strip the simplified-API macros and append ADLER32 bypass.
+# The CPU setjmp path in the harness depends on PNG_SETJMP_SUPPORTED.
+sed -e '/^#define PNG_SIMPLIFIED_.*$/d' \
+    "${LIBPNG_SRC}/scripts/pnglibconf.h.prebuilt" > libpng_include/pnglibconf.h
+echo '#define PNG_DISABLE_ADLER32_CHECK_SUPPORTED' >> libpng_include/pnglibconf.h
+
+# GPU: strip setjmp, simplified-API, stdio/console-io, and fp-arithmetic.
 sed -e '/^#define PNG_SETJMP_SUPPORTED$/d' \
     -e '/^#define PNG_SIMPLIFIED_.*$/d' \
     -e '/^#define PNG_CONSOLE_IO_SUPPORTED$/d' \
     -e '/^#define PNG_STDIO_SUPPORTED$/d' \
     -e '/^#define PNG_FLOATING_ARITHMETIC_SUPPORTED$/d' \
-    "${LIBPNG_SRC}/scripts/pnglibconf.h.prebuilt" > libpng_include/pnglibconf.h
-echo '#define PNG_DISABLE_ADLER32_CHECK_SUPPORTED' >> libpng_include/pnglibconf.h
+    "${LIBPNG_SRC}/scripts/pnglibconf.h.prebuilt" > libpng_include_gpu/pnglibconf.h
+echo '#define PNG_DISABLE_ADLER32_CHECK_SUPPORTED' >> libpng_include_gpu/pnglibconf.h
 
-# Symlink the libpng public headers so `#include "png.h"` resolves alongside
-# the patched pnglibconf.h inside libpng_include/.
+# Symlink libpng's public headers alongside the patched pnglibconf.h in
+# both include dirs so `#include "png.h"` resolves correctly.
 for h in "${LIBPNG_SRC}"/*.h; do
-  ln -sf "${h}" "libpng_include/$(basename "${h}")"
+  ln -sf "$h" "libpng_include/$(basename "$h")"
+  ln -sf "$h" "libpng_include_gpu/$(basename "$h")"
 done
 
-echo "=== [4/5] Build GPU cubin via coqui-cc ==="
-# Flags mirror the `libpng` target in the legacy coqui codebase:
-#   -D PNG_NO_STDIO  — disable stdio-based PNG I/O (we use callbacks)
-#   -D PNG_NO_SETJMP — route libpng errors through PNG_ABORT()->abort()->__coqui_abort
-#   -I libpng_include -I ${zlib_src}
-#   --stack-size 32768  — deep call chains (png_read_image -> ... -> inflate_fast)
-#   --slab-pool-size 2 GiB — per-chunk allocations exceed the 64KB per-thread heap
+# --- [3/4] Build AFL++ CPU binary via afl-clang-fast ------------------------
+echo "=== [3/4] Build AFL++ CPU binary with afl-clang-fast ==="
+CPU_OUT="${HARNESS_BASENAME}_cpu"
+CPU_OBJ_DIR="${BUILD_DIR}/cpu_obj"
+mkdir -p "$CPU_OBJ_DIR"
+
+# Defines: PNG_NO_STDIO only (keep setjmp on CPU for longjmp-based recovery
+# — matches cpu-target-specs.nix libpng entry). -lstdc++ is preserved for
+# parity with the legacy spec's isCxx = true even though the harness is
+# pure C (harmless for a C program).
+#
+# We compile each translation unit to an object file individually because
+# afl-clang-fast prepends its own pass-plugin flags per-input-file and
+# exceeds MAX_PARAMS_NUM (2048) when passing 27 sources at once.
+#
+# NOTE: -fsanitize=fuzzer is NOT used for per-file compile. afl-cc handles
+# -fsanitize=fuzzer by swapping in libAFLDriver.a, and while that only
+# matters at link time, the interaction with -fsanitize=address,... in the
+# same compile command causes afl-cc to duplicate its -fpass-plugin flags
+# multiple times, blowing past MAX_PARAMS_NUM (2048) even for a single
+# translation unit. Compile with sanitizers only, link with fuzzer driver.
+CPU_CFLAGS=(
+  -O2 -g
+  "${SANITIZE_FLAGS[@]}"
+  -I libpng_include
+  -I "$ZLIB_SRC"
+  -D PNG_NO_STDIO
+)
+
+compile_cpu_obj() {
+  local src="$1" obj="$2"
+  "$AFL_CC_BIN" "${CPU_CFLAGS[@]}" -c "$src" -o "$obj"
+}
+
+CPU_OBJS=()
+compile_cpu_obj "$HARNESS_SRC" "${CPU_OBJ_DIR}/harness.o"
+CPU_OBJS+=("${CPU_OBJ_DIR}/harness.o")
+for f in "${ZLIB_SOURCES[@]}"; do
+  obj="${CPU_OBJ_DIR}/zlib_${f%.c}.o"
+  compile_cpu_obj "${ZLIB_SRC}/${f}" "$obj"
+  CPU_OBJS+=("$obj")
+done
+for f in "${LIBPNG_SOURCES[@]}"; do
+  obj="${CPU_OBJ_DIR}/libpng_${f%.c}.o"
+  compile_cpu_obj "${LIBPNG_SRC}/${f}" "$obj"
+  CPU_OBJS+=("$obj")
+done
+
+# Link with fuzzer driver + sanitizer runtimes.
+"$AFL_CC_BIN" -O2 -g \
+  "${SANITIZE_FLAGS[@]}" \
+  -fsanitize=fuzzer \
+  "${CPU_OBJS[@]}" \
+  -o "$CPU_OUT" \
+  -lm -lstdc++
+
+[[ -x "$CPU_OUT" ]] || { echo "ERROR: CPU binary not produced" >&2; exit 1; }
+
+# --- [4/4] Build GPU cubin via coqui-cc -------------------------------------
+echo "=== [4/4] Build GPU cubin via coqui-cc ==="
+# Flags mirror the `libpng` target in the legacy coqui nix spec:
+#   -D PNG_NO_STDIO  — disable stdio-based PNG I/O (harness uses callbacks)
+#   -D PNG_NO_SETJMP — route libpng errors through PNG_ABORT() -> abort()
+#                      -> __coqui_trap() (see png_abort_stub.c)
+#   -I libpng_include_gpu -I ${zlib_src}
+#   --stack-size 32768  — deep call chains overflow 8KB default
+#   --slab-pool-size 2 GiB — per-chunk allocations exceed 64KB per-thread heap
 #
 # NOTE: coqui-cc does NOT accept --heap-size, --batch-size, --ignore-signal=,
-# or -fsanitize= flags (see libpng.nix for comparison).
+# or -fsanitize= flags (see libpng.nix for comparison). The coqui mode
+# runtime derives heap at startup and reads batch size from
+# AFL_COQUI_BATCH_SIZE at fuzz-time.
 #
-# Extra coqui mode-specific stub: png_abort_stub.c
-#   libpng's internal error path ends in PNG_ABORT() (= abort() by default,
-#   pngpriv.h:589), and its png_safe_* paths call abort() directly.
-#   coqui's nix build papers over this with `--ignore-signal=abort` in its
-#   pass plugin; coqui mode's ExternalSymbolGatekeeper does NOT accept `abort`
-#   ("unresolved external 'abort' — Used by: png_chunk_error"). The stub
-#   provides abort() -> __coqui_trap() so llvm-link has no unresolved
-#   `abort` symbol. Same pattern as coqui_mode/evaluation/bzip2/bz2_assert_stub.c.
+# png_abort_stub.c: libpng's unrecoverable-error path ends in PNG_ABORT()
+# (= abort() by default, pngpriv.h). coqui-cc's ExternalSymbolGatekeeper
+# rejects `abort` (only __coqui_* / __llvm_* / llvm.* pass). The stub
+# provides abort() -> __coqui_trap() so llvm-link has no unresolved symbol.
 #
-# Source list is identical to libpng.nix: all zlib object files needed for
-# inflate + deflate, plus libpng's read + write paths (harness exercises both).
-"${COQUI_CC}" \
-  -arch "${ARCH}" \
-  --stack-size "${STACK_SIZE}" \
-  --slab-pool-size "${SLAB_POOL_SIZE}" \
-  -I libpng_include \
-  -I "${ZLIB_SRC}" \
+# flock /tmp/coqui-cc.lock serializes with parallel target builds — ptxas
+# at -O1 can consume tens of GB; concurrent builds OOM the host.
+GPU_SOURCES=()
+for f in "${ZLIB_SOURCES[@]}";   do GPU_SOURCES+=("${ZLIB_SRC}/${f}");   done
+for f in "${LIBPNG_SOURCES[@]}"; do GPU_SOURCES+=("${LIBPNG_SRC}/${f}"); done
+GPU_SOURCES+=("${SCRIPT_DIR}/png_abort_stub.c")
+GPU_SOURCES+=("$HARNESS_SRC")
+
+flock /tmp/coqui-cc.lock \
+"$COQUI_CC" \
+  -arch "$ARCH" \
+  --stack-size "$STACK_SIZE" \
+  --slab-pool-size "$SLAB_POOL_SIZE" \
+  -I libpng_include_gpu \
+  -I "$ZLIB_SRC" \
   -D PNG_NO_STDIO \
   -D PNG_NO_SETJMP \
-  "${ZLIB_SRC}/adler32.c" \
-  "${ZLIB_SRC}/compress.c" \
-  "${ZLIB_SRC}/crc32.c" \
-  "${ZLIB_SRC}/deflate.c" \
-  "${ZLIB_SRC}/infback.c" \
-  "${ZLIB_SRC}/inffast.c" \
-  "${ZLIB_SRC}/inflate.c" \
-  "${ZLIB_SRC}/inftrees.c" \
-  "${ZLIB_SRC}/trees.c" \
-  "${ZLIB_SRC}/uncompr.c" \
-  "${ZLIB_SRC}/zutil.c" \
-  "${LIBPNG_SRC}/png.c" \
-  "${LIBPNG_SRC}/pngerror.c" \
-  "${LIBPNG_SRC}/pngget.c" \
-  "${LIBPNG_SRC}/pngmem.c" \
-  "${LIBPNG_SRC}/pngpread.c" \
-  "${LIBPNG_SRC}/pngread.c" \
-  "${LIBPNG_SRC}/pngrio.c" \
-  "${LIBPNG_SRC}/pngrtran.c" \
-  "${LIBPNG_SRC}/pngrutil.c" \
-  "${LIBPNG_SRC}/pngset.c" \
-  "${LIBPNG_SRC}/pngtrans.c" \
-  "${LIBPNG_SRC}/pngwio.c" \
-  "${LIBPNG_SRC}/pngwrite.c" \
-  "${LIBPNG_SRC}/pngwtran.c" \
-  "${LIBPNG_SRC}/pngwutil.c" \
-  "${SCRIPT_DIR}/png_abort_stub.c" \
-  "${HARNESS_DIR}/libpng_read_fuzzer.c" \
-  -o libpng_read_fuzzer
+  "${GPU_SOURCES[@]}" \
+  -o "$HARNESS_BASENAME"
 
-if [[ ! -f libpng_read_fuzzer.cubin || ! -f libpng_read_fuzzer.conf ]]; then
-  echo "[build] ERROR: coqui-cc did not emit libpng_read_fuzzer.cubin / .conf" >&2
-  exit 1
-fi
-
-echo "=== [5/5] Link CPU binary + seeds + dict ==="
-ln -sfn "${CPU_OUT_LINK}/${CPU_BINARY_NAME}" libpng_read_fuzzer_cpu
-ln -sfn "${CPU_OUT_LINK}/seeds" seeds
-if [[ -d "${CPU_OUT_LINK}/dict" ]]; then
-  ln -sfn "${CPU_OUT_LINK}/dict" dict
-fi
+[[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \
+  || { echo "ERROR: coqui-cc did not emit .cubin/.conf" >&2; exit 1; }
 
 echo
-echo "=== libpng build complete ==="
-ls -la libpng_read_fuzzer.cubin libpng_read_fuzzer.conf libpng_read_fuzzer_cpu seeds 2>/dev/null || true
-[[ -L dict ]] && ls -la dict || true
-echo "  conf:"; sed 's/^/    /' libpng_read_fuzzer.conf
+echo "=== Build complete ==="
+ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
+echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"

@@ -1,27 +1,29 @@
 # Build outputs
+*.cubin
+*.conf
 libpng_read_fuzzer
-libpng_read_fuzzer.cubin
-libpng_read_fuzzer.conf
+libpng_read_fuzzer_cpu
 libpng_read_fuzzer.ptx
 libpng_read_fuzzer.bc
 
-# Symlinks into /tmp/coqui-libpng-cpu or /nix/store
-libpng_read_fuzzer_cpu
-seeds
-dict
+# Upstream source cache (fetched by build.sh at pinned commits)
+/.build/
 
-# Staged headers (generated from /nix/store/*-source at build time)
-libpng_include/
+# coqui-cc intermediate build dir
+/.*_fuzzer.build/
 
-# afl-fuzz runtime output
-out/
-out-*/
+# Staged headers (generated from .build/ at build time)
+/libpng_include/
+/libpng_include_gpu/
 
-# Build caches + logs
-.build/
-.cache/
-.libpng_read_fuzzer.build/
+# afl-fuzz output
+/out/
+/out-*/
+
+# Bench artifacts / logs
 build.log
+*.log
+/seed_min/
 
 # Editor/OS junk
 *.swp
