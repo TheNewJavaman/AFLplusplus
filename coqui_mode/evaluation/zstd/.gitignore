@@ -1,27 +1,18 @@
-# Build artifacts
-zstd_simple_decompress_fuzzer
-zstd_simple_decompress_fuzzer.cubin
-zstd_simple_decompress_fuzzer.conf
-zstd_simple_decompress_fuzzer.ptx
-zstd_simple_decompress_fuzzer.bc
-.zstd_simple_decompress_fuzzer.build/
-
-# Symlinks pointing into /tmp/coqui-zstd-cpu or /nix/store
-zstd_simple_decompress_fuzzer_cpu
-seeds
-dict
-
-# afl-fuzz runtime output
-out/
-out-*/
-
-# Generic
+# Build outputs
 *.cubin
 *.conf
-*.ptx
-*.bc
-*_cpu
+zstd_simple_decompress_fuzzer_cpu
 
-# Editor/OS junk
-*.swp
-.DS_Store
+# Upstream source cache (fetched by build.sh at pinned commit)
+/.build/
+
+# coqui-cc intermediate build dir (.harness.build/)
+/.*_fuzzer.build/
+
+# afl-fuzz output
+/out/
+
+# Bench artifacts / logs
+build.log
+*.log
+/seed_min/
