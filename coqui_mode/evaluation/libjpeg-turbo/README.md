@@ -37,10 +37,6 @@ target builds.
   and `j12init_*` / `j16init_*` symbols (we compile 8-bit only).
   Needed on BOTH CPU and GPU — libjpeg-turbo references these
   unconditionally.
-- `libjpeg_turbo_libc_stubs.c` — **device-only** stubs for `snprintf`,
-  `fprintf`, `stderr`, and `exit` (coqui mode's `Libc.cpp` does not
-  port stdio-format functions or `exit`). The CPU build does NOT
-  compile this file.
 - `seeds/min.jpg` — minimal 1x1 JPEG seed.
 - `.gitignore` — excludes build artifacts + `.build/` cache +
   `jpeg_include/`.

@@ -26,11 +26,10 @@ can serialize with any parallel target builds.
 ## Layout
 
 - `build.sh` / `fuzz.sh` — entry points (set -euo pipefail).
-- `harness.c` — in-tree libFuzzer-style harness.
-- `zstd_abort_stub.c` — local `abort()` → `__coqui_trap()` stub.
-  The harness calls `abort()` on content-size mismatch (real bug);
-  coqui mode's `ExternalSymbolGatekeeper` only accepts `__coqui_*` /
-  `__llvm_*` externals, so the upstream path needed this stub.
+- `harness.c` — in-tree libFuzzer-style harness. The harness calls
+  `abort()` on content-size mismatch (real bug); the `Libc.cpp` pass
+  rewrites `abort` → `__coqui_abort` (→ `__coqui_trap()`), so no
+  local stub is needed.
 - `seeds/min.zst` — single minimal zstd frame.
 - `.gitignore` — excludes build artifacts + `.build/` cache.
 - `.build/` (ignored) — cached zstd source tarball extraction.

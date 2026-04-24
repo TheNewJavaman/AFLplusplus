@@ -30,10 +30,6 @@ with any parallel target builds.
 
 - `build.sh` / `fuzz.sh` — entry points (set -euo pipefail).
 - `harness.c` — in-tree libFuzzer-style harness.
-- `png_abort_stub.c` — local `abort()` → `__coqui_trap()` stub (see
-  notes below). libpng's error path ends in `PNG_ABORT()` =
-  `abort()`; coqui mode's `ExternalSymbolGatekeeper` only accepts
-  `__coqui_*`/`__llvm_*` externals.
 - `seeds/1x1_gray.png` — minimal 1x1 grayscale PNG seed.
 - `.gitignore` — excludes build artifacts + `.build/` cache +
   `libpng_include/` + `libpng_include_gpu/`.
@@ -63,10 +59,9 @@ with any parallel target builds.
   `PNG_STDIO_SUPPORTED`, `PNG_FLOATING_ARITHMETIC_SUPPORTED`). The
   floating-point strip forces libpng's fixed-point gamma path (NVPTX
   can't lower `llvm.pow.f64`).
-- `png_abort_stub.c` is required because every `png_error()` path
-  with `-D PNG_NO_SETJMP` terminates in `abort()`; the stub redirects
-  to `__coqui_trap()` (PTX `trap; exit;`) so the external-symbol
-  gatekeeper is satisfied.
+- Every `png_error()` path with `-D PNG_NO_SETJMP` terminates in
+  `abort()`, which the `Libc.cpp` pass rewrites to `__coqui_abort()`
+  (→ `__coqui_trap()`; PTX `trap; exit;`) — no local stub needed.
 - `ptxas` is very slow — the libpng+zlib kernel is large (~25 TUs,
   heavy ASan instrumentation, all-inline). Expect 20-30 minutes at
   `-O1`, peaking at 10-50 GB RAM. Do not run multiple `./build.sh`

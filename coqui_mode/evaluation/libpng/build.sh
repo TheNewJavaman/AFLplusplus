@@ -25,7 +25,8 @@
 #
 # GPU vs CPU build differences:
 #   GPU build defines PNG_NO_STDIO + PNG_NO_SETJMP so libpng errors route
-#   through PNG_ABORT() -> abort() -> __coqui_trap() (see png_abort_stub.c).
+#   through PNG_ABORT() -> abort(), which the Libc.cpp pass rewrites to
+#   __coqui_abort() -> __coqui_trap().
 #   CPU build defines PNG_NO_STDIO only; setjmp is kept so libpng longjmps
 #   back to the harness on parse errors, keeping the persistent-mode loop
 #   alive for AFL++.
@@ -86,8 +87,6 @@ LIBPNG_SOURCES=(
 [[ -x "$AFL_CC_BIN" ]]   || { echo "ERROR: afl-clang-fast not found at $AFL_CC_BIN" >&2; exit 1; }
 [[ -x "$COQUI_CC" ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
 [[ -f "$HARNESS_SRC" ]] || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
-[[ -f "${SCRIPT_DIR}/png_abort_stub.c" ]] \
-  || { echo "ERROR: png_abort_stub.c missing" >&2; exit 1; }
 
 # --- [1/4] Fetch upstream libpng + zlib sources -----------------------------
 echo "=== [1/4] Fetch libpng ${LIBPNG_VERSION} + zlib ${ZLIB_VERSION} ==="
@@ -228,7 +227,7 @@ echo "=== [4/4] Build GPU cubin via coqui-cc ==="
 # Flags mirror the `libpng` target in the legacy coqui nix spec:
 #   -D PNG_NO_STDIO  — disable stdio-based PNG I/O (harness uses callbacks)
 #   -D PNG_NO_SETJMP — route libpng errors through PNG_ABORT() -> abort()
-#                      -> __coqui_trap() (see png_abort_stub.c)
+#                      -> Libc.cpp rewrite -> __coqui_abort() -> __coqui_trap()
 #   -I libpng_include_gpu -I ${zlib_src}
 #   --stack-size 32768  — deep call chains overflow 8KB default
 #   --slab-pool-size 2 GiB — per-chunk allocations exceed 64KB per-thread heap
@@ -238,17 +237,15 @@ echo "=== [4/4] Build GPU cubin via coqui-cc ==="
 # runtime derives heap at startup and reads batch size from
 # AFL_COQUI_BATCH_SIZE at fuzz-time.
 #
-# png_abort_stub.c: libpng's unrecoverable-error path ends in PNG_ABORT()
-# (= abort() by default, pngpriv.h). coqui-cc's ExternalSymbolGatekeeper
-# rejects `abort` (only __coqui_* / __llvm_* / llvm.* pass). The stub
-# provides abort() -> __coqui_trap() so llvm-link has no unresolved symbol.
+# libpng's unrecoverable-error path ends in PNG_ABORT() (= abort() by
+# default, pngpriv.h). The Libc.cpp pass rewrites `abort` -> `__coqui_abort`
+# (coqui_libc.c: __coqui_abort -> __coqui_trap), so no local stub is needed.
 #
 # flock /tmp/coqui-cc.lock serializes with parallel target builds — ptxas
 # at -O1 can consume tens of GB; concurrent builds OOM the host.
 GPU_SOURCES=()
 for f in "${ZLIB_SOURCES[@]}";   do GPU_SOURCES+=("${ZLIB_SRC}/${f}");   done
 for f in "${LIBPNG_SOURCES[@]}"; do GPU_SOURCES+=("${LIBPNG_SRC}/${f}"); done
-GPU_SOURCES+=("${SCRIPT_DIR}/png_abort_stub.c")
 GPU_SOURCES+=("$HARNESS_SRC")
 
 flock /tmp/coqui-cc.lock \

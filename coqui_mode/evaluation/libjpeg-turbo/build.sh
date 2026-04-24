@@ -36,7 +36,6 @@ cd "${SCRIPT_DIR}"
 HARNESS_BASENAME="libjpeg_turbo_decompress_fuzzer"
 HARNESS_SRC="${SCRIPT_DIR}/harness.c"
 STUBS_SRC="${SCRIPT_DIR}/libjpeg_turbo_stubs.c"
-LIBC_STUBS_SRC="${SCRIPT_DIR}/libjpeg_turbo_libc_stubs.c"
 ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768          # coqui-cc default; matches nix spec (no override)
 SLAB_POOL_SIZE=0          # libjpeg-turbo.nix does not set a slab pool
@@ -75,7 +74,6 @@ SANITIZE_FLAGS=(
 [[ -x "$COQUI_CC"       ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC"             >&2; exit 1; }
 [[ -f "$HARNESS_SRC"    ]] || { echo "ERROR: harness missing at $HARNESS_SRC"             >&2; exit 1; }
 [[ -f "$STUBS_SRC"      ]] || { echo "ERROR: jsimd stubs missing at $STUBS_SRC"           >&2; exit 1; }
-[[ -f "$LIBC_STUBS_SRC" ]] || { echo "ERROR: libc stubs missing at $LIBC_STUBS_SRC"       >&2; exit 1; }
 
 # --- [1/4] Fetch upstream libjpeg-turbo at pinned tag -----------------------
 echo "=== [1/4] Fetch libjpeg-turbo ${LIBJPEG_TAG} ==="
@@ -187,9 +185,6 @@ echo "=== [3/4] Build AFL++ CPU binary with afl-clang-fast ==="
 # afl-cc injects (__AFL_LOOP, __AFL_FUZZ_INIT, __AFL_FUZZ_TESTCASE_BUF, …)
 # overflows when combined with 20+ .c sources and a dozen sanitizer flags
 # on one command line.
-#
-# Note: libjpeg_turbo_libc_stubs.c is GPU-only — the real libc provides the
-# snprintf/fprintf/exit symbols for the CPU binary.
 CPU_BUILD_DIR="${SCRIPT_DIR}/.build/cpu-obj"
 rm -rf "${CPU_BUILD_DIR}"
 mkdir -p "${CPU_BUILD_DIR}"
@@ -232,9 +227,9 @@ CPU_OUT="${HARNESS_BASENAME}_cpu"
 #   sources  = jpeg_include/*.c  (patched copies)
 #            + libjpeg_turbo_stubs.c  (SIMD + 12/16-bit no-ops)
 #            + harness.c
-#            + libjpeg_turbo_libc_stubs.c — coqui mode pass plugin has no
-#              snprintf port; jerror.c/format_message calls it only for
-#              error strings that the GPU never reads.
+# jerror.c's snprintf/fprintf/exit/stderr references are rewritten to
+# their __coqui_* equivalents by the Libc.cpp pass; no local libc shim
+# is needed anymore.
 # Sanitizer flags from the nix spec are intentionally omitted — coqui-cc
 # does not expose -fsanitize; the coqui mode pass plugin injects ASan/UBSan
 # device-side via CoquiPassPlugin.so.  Also, ptxas is memory-heavy at -O1;
@@ -252,7 +247,6 @@ flock /tmp/coqui-cc.lock \
     "${STAGED_SRCS[@]}" \
     "${STUBS_SRC}" \
     "${HARNESS_SRC}" \
-    "${LIBC_STUBS_SRC}" \
     -o "${HARNESS_BASENAME}"
 
 [[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \

@@ -28,9 +28,6 @@ with any parallel target builds.
 
 - `build.sh` / `fuzz.sh` — entry points (set -euo pipefail).
 - `harness.c` — in-tree libFuzzer-style harness.
-- `libyaml_stubs.c` — GPU-side stubs for `strdup`, `memcpy`, `memset`,
-  `memmove` (not in coqui mode's runtime.bc). Compiled into both
-  CPU and GPU builds.
 - `seeds/min.yaml` — single minimal YAML seed.
 - `.gitignore` — excludes build artifacts + `.build/` cache +
   `libyaml_src/`.
@@ -51,17 +48,14 @@ with any parallel target builds.
 - No `--stack-size` / `--slab-pool-size` override — libyaml fits
   under coqui-cc defaults (32 KB stack, no slab pool) once the buffer
   shrink is applied.
-- `-D NDEBUG` is required on the GPU build. libyaml's
-  `api.c` / `scanner.c` call `assert()` which lowers to
-  `__assert_fail` on NVPTX. coqui mode's `coqui-cc` only runs the
-  `coqui-link,always-inline` pipeline — no `LibcTransform` — and
-  `ExternalSymbolGatekeeper` rejects `__assert_fail`. GPU asserts
-  become no-ops; the CPU AFL++ binary still honors them. Analogous
-  to stb_image's `-D STBI_ASSERT(x)=` workaround.
-- `libyaml_stubs.c` is needed because coqui mode's runtime exports
-  only `__coqui_{malloc,calloc,free,realloc,memcmp,strlen,strcmp,strncmp,strchr,strtod,trap}`.
-  `strdup` is implemented via `__coqui_malloc` + `__coqui_strlen` +
-  byte copy; the mem* stubs use clang builtins / manual loops.
+- `-D NDEBUG` is used on the GPU build to make `assert()` a no-op so
+  data-dependent GPU asserts don't terminate batches. The Libc.cpp
+  pass rewrites `__assert_fail` to `__coqui_assert_fail` when NDEBUG
+  is off, so this is optional hygiene. The CPU AFL++ binary still
+  honors asserts either way.
+- `strdup` / `memcpy` / `memset` / `memmove` / etc. call sites are
+  rewritten by the `Libc.cpp` pass to the runtime's `__coqui_*`
+  equivalents; no local libc shim is needed.
 - `fuzz.sh` sets `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`,
   `AFL_SKIP_CPUFREQ=1`, `AFL_SKIP_BIN_CHECK=1`, `AFL_NO_UI=1` per the
   project convention; override by exporting them yourself. GPU device
