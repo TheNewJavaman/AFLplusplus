@@ -1,26 +1,21 @@
-# coqui-cc build outputs
-libyaml_parser_fuzzer
-libyaml_parser_fuzzer.cubin
-libyaml_parser_fuzzer.conf
-libyaml_parser_fuzzer.ptx
-libyaml_parser_fuzzer.bc
-libyaml_parser_fuzzer_cpu
-
-# Patched libyaml sources produced by build.sh step [3/5]
-libyaml_src/
-
-# Symlinks into /nix/store
-seeds
-dict
-
-# Fuzzer outputs
-out/
-.build/
-.cache/
-
-# Generic
+# Build outputs
 *.cubin
 *.conf
-*.ptx
-*.bc
-*_cpu
+libyaml_parser_fuzzer_cpu
+
+# Patched libyaml sources (produced by build.sh from cached fetch)
+/libyaml_src/
+
+# Upstream source cache (fetched by build.sh at pinned tag)
+/.build/
+
+# coqui-cc intermediate build dir (.harness.build/)
+/.*_fuzzer.build/
+
+# afl-fuzz output
+/out/
+
+# Bench artifacts / logs
+build.log
+*.log
+/seed_min/
