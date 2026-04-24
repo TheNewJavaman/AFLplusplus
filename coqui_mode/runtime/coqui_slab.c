@@ -261,6 +261,10 @@ static char *slab_alloc_slabs(unsigned int n) {
  * Slab bucket helpers
  * ===------------------------------------------------------------------=== */
 
+/* `const, always_inline, nothrow` — pure size→bucket lookup, hot per
+ * slab_malloc call. `const` because the result is a function of the
+ * argument alone (no memory access). */
+__attribute__((const, always_inline, nothrow))
 static unsigned int slab_size_to_bucket(unsigned int size) {
   if (size <= SLAB_MIN_BUCKET_SIZE) return 0;
   int msb = 31 - __builtin_clz(size - 1);
@@ -283,7 +287,11 @@ static unsigned int slab_size_to_bucket(unsigned int size) {
 #define SLAB_OVERFLOW_GROW_SLABS    64   /* 256KB per chain */
 #define SLAB_MAX_SINGLE_ALLOC  (1024u * 1024u)  /* 1MB per-allocation cap */
 
-__attribute__((noinline))
+/* `noinline, nothrow`: large body covering bucket lookup + per-thread
+ * freelist + bump-allocate + slab-acquire fall-through. Function pointer
+ * registered with ASan via __coqui_asan_register_slab so an inline body
+ * would not survive the indirect call anyway. */
+__attribute__((noinline, nothrow))
 void *__coqui_slab_malloc(unsigned long size) {
   if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
     return (void *)0;
@@ -373,7 +381,8 @@ void *__coqui_slab_malloc(unsigned long size) {
   return (void *)(block + 8); /* user area after 8B size header */
 }
 
-__attribute__((noinline))
+/* `noinline, nothrow`: same rationale as __coqui_slab_malloc. */
+__attribute__((noinline, nothrow))
 void __coqui_slab_free(void *ptr) {
   if (!ptr) return;
 
@@ -407,6 +416,9 @@ void __coqui_slab_free(void *ptr) {
  * push each slab range onto the global free stack for reuse.
  * ===------------------------------------------------------------------=== */
 
+/* `nothrow`: C runtime entry called from __coqui_trap_with_reason / clean
+ * thread exit. Never throws. */
+__attribute__((nothrow))
 void __coqui_slab_release_thread(void) {
   if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
     return;
@@ -437,7 +449,8 @@ void __coqui_slab_release_thread(void) {
 /* Called once per kernel launch (idempotent -- every thread runs it).
  * Parameter-free: the slab globals are bound by the host via
  * cuModuleGetGlobal / cuMemcpyHtoD before launch. This only computes
- * ctrl_slabs (needs runtime grid dims) and registers with ASan. */
+ * ctrl_slabs (needs runtime grid dims) and registers with ASan. `nothrow`. */
+__attribute__((nothrow))
 void __coqui_slab_setup(void) {
   if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
     return;
@@ -451,7 +464,8 @@ void __coqui_slab_setup(void) {
 
 /* Called by thread 0 of every block, before the __syncthreads() barrier
  * that precedes per-thread work. Zeros the shared-memory bucket strip
- * and the per-block allocation counter. */
+ * and the per-block allocation counter. `nothrow`. */
+__attribute__((nothrow))
 void __coqui_slab_init_block(void) {
   if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
     return;

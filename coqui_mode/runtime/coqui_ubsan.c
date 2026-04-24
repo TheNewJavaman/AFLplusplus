@@ -46,7 +46,11 @@ extern coqui_status_t *__coqui_status_array;
  * Follows the same pattern as coqui_asan.c::asan_report: set the classified
  * error code, stamp a partial-coverage signature so the host can dedup
  * crash-verify, then __coqui_exit() to leave the kernel running for other
- * threads. */
+ * threads.
+ *
+ * `noinline, cold, nothrow`: only entered when a UBSan check tripped;
+ * keep the crash-sig fold and status writes off the hot path. */
+__attribute__((noinline, cold, nothrow))
 static void ubsan_report_fatal(int code) {
     u32 tid = __coqui_fuzz_tid();
     __coqui_status_array[tid].ubsan_fatal = 1;
@@ -61,7 +65,12 @@ static void ubsan_report_fatal(int code) {
  * Clang emits recoverable handlers (without _abort suffix) for checks
  * that are NOT in -fno-sanitize-recover=. The handler must return so
  * the thread can continue executing — matching host behavior where
- * the recoverable handler prints a diagnostic and returns. */
+ * the recoverable handler prints a diagnostic and returns.
+ *
+ * `cold, nothrow`: still cold (only on UBSan trip); not noinline because
+ * the body is a single status-array store and a small inline reduces
+ * call overhead at the (also rarely-taken) recoverable handler call site. */
+__attribute__((cold, nothrow))
 static void ubsan_report_recover(int code) {
     u32 tid = __coqui_fuzz_tid();
     __coqui_status_array[tid].ubsan_error = (u32)code;
@@ -83,11 +92,17 @@ static void ubsan_report_recover(int code) {
  *   D  = (ptr data)
  * ===-------------------------------------------------------------------=== */
 
+/* `cold, nothrow` on every handler: clang emits these on poisoned paths
+ * only — they should never be reached in clean execution. `nothrow` is
+ * mandatory (UBSan handlers never throw). */
+
 /* (void *data, unsigned long lhs, unsigned long rhs) + _abort variant */
 #define UBSAN_VV(name, code)                                                  \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name(void *d, unsigned long a, unsigned long b) {   \
         (void)d; (void)a; (void)b; ubsan_report_recover(code);                \
     }                                                                          \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name##_abort(void *d, unsigned long a,              \
                                        unsigned long b) {                      \
         (void)d; (void)a; (void)b; ubsan_report_fatal(code);                  \
@@ -95,24 +110,29 @@ static void ubsan_report_recover(int code) {
 
 /* (void *data, unsigned long val) + _abort variant */
 #define UBSAN_V(name, code)                                                   \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name(void *d, unsigned long a) {                    \
         (void)d; (void)a; ubsan_report_recover(code);                         \
     }                                                                          \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name##_abort(void *d, unsigned long a) {            \
         (void)d; (void)a; ubsan_report_fatal(code);                           \
     }
 
 /* (void *data) + _abort variant */
 #define UBSAN_D(name, code)                                                   \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name(void *d) {                                     \
         (void)d; ubsan_report_recover(code);                                  \
     }                                                                          \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name##_abort(void *d) {                             \
         (void)d; ubsan_report_fatal(code);                                    \
     }
 
 /* (void *data) — always fatal, no _abort variant */
 #define UBSAN_FATAL(name, code)                                               \
+    __attribute__((cold, nothrow))                                             \
     void __ubsan_handle_##name(void *d) {                                     \
         (void)d; ubsan_report_fatal(code);                                    \
     }
@@ -170,9 +190,11 @@ UBSAN_V(vla_bound_not_positive, 12)
 UBSAN_D(nonnull_arg, 13)
 
 /* nonnull_return_v1 takes (ptr data, ptr loc). */
+__attribute__((cold, nothrow))
 void __ubsan_handle_nonnull_return_v1(void *d, void *loc) {
     (void)d; (void)loc; ubsan_report_recover(14);
 }
+__attribute__((cold, nothrow))
 void __ubsan_handle_nonnull_return_v1_abort(void *d, void *loc) {
     (void)d; (void)loc; ubsan_report_fatal(14);
 }
@@ -180,9 +202,11 @@ void __ubsan_handle_nonnull_return_v1_abort(void *d, void *loc) {
 /* Dynamic type (vptr) cache miss — vtable pointer doesn't match expected
  * type. Kept for manual -fsanitize=vptr use; not enabled by default
  * (requires -frtti). */
+__attribute__((cold, nothrow))
 void __ubsan_handle_dynamic_type_cache_miss(void *d, void *ptr, void *hash) {
     (void)d; (void)ptr; (void)hash; ubsan_report_recover(15);
 }
+__attribute__((cold, nothrow))
 void __ubsan_handle_dynamic_type_cache_miss_abort(void *d, void *ptr,
                                                    void *hash) {
     (void)d; (void)ptr; (void)hash; ubsan_report_fatal(15);
@@ -190,6 +214,6 @@ void __ubsan_handle_dynamic_type_cache_miss_abort(void *d, void *ptr,
 
 /* __cxa_bad_typeid: called when typeid is applied to a null polymorphic
  * pointer. Weak: libc++abi provides its own definition for C++ targets. */
-__attribute__((weak)) void __cxa_bad_typeid(void) {
+__attribute__((weak, cold, nothrow)) void __cxa_bad_typeid(void) {
     ubsan_report_fatal(15);
 }

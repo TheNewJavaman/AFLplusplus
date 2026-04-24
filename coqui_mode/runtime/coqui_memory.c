@@ -26,16 +26,21 @@ typedef struct heap_hdr {
 #define HEAP_HDR_SIZE  sizeof(heap_hdr_t)   /* 16 bytes */
 #define BLOCK_HDR_SIZE 8u                   /* [size:u32][pad:u32] */
 
-/* Align up to 8 bytes. */
+/* Align up to 8 bytes. `const, always_inline, nothrow` — pure arithmetic. */
+__attribute__((const, always_inline, nothrow))
 static u32 align8(u32 x) { return (x + 7u) & ~7u; }
 
-/* Get this thread's heap control header. */
+/* Get this thread's heap control header. `pure` because it reads only the
+ * (per-thread, runtime-stable) heap base; `always_inline` because every
+ * heap op opens with this load. `nothrow`. */
+__attribute__((pure, always_inline, nothrow))
 static heap_hdr_t *heap_hdr(void) {
     return (heap_hdr_t *)__coqui_heap_base();
 }
 
 /* Initialize the heap control header (called once per thread at kernel entry).
-   MemoryLayout transform inserts a call to this. */
+   MemoryLayout transform inserts a call to this. `nothrow`. */
+__attribute__((nothrow))
 void __coqui_memory_init(void) {
     heap_hdr_t *hdr = heap_hdr();
     hdr->free_head = (void *)0;
@@ -46,7 +51,13 @@ void __coqui_memory_init(void) {
  * the Asan pass's bulk RAUW (__coqui_malloc → __coqui_asan_malloc) does not
  * rewrite calls inside the allocator implementation itself. The asan-internal
  * redirect in the pass rewires __coqui_asan_malloc's call from __coqui_malloc
- * to __coqui_malloc_raw, so all paths terminate at _raw with no recursion. */
+ * to __coqui_malloc_raw, so all paths terminate at _raw with no recursion.
+ *
+ * `nothrow`: C runtime entry. Body has both fast path (freelist hit) and
+ * bump path; per-thread freelist hit is the hot case but also moderate
+ * size, so we keep this out-of-line. The thin __coqui_malloc wrapper
+ * below is always_inline. */
+__attribute__((nothrow))
 void *__coqui_malloc_raw(unsigned long size) {
     if (size == 0) size = 1;
     u32 need = align8((u32)size) + BLOCK_HDR_SIZE;
@@ -92,6 +103,7 @@ extern char *__coqui_slab_pool __attribute__((weak));
 extern unsigned long __coqui_slab_pool_size __attribute__((weak));
 __attribute__((weak)) void __coqui_slab_free(void *ptr);
 
+__attribute__((nothrow))
 void __coqui_free_raw(void *ptr) {
     if (!ptr) return;
 
@@ -136,11 +148,18 @@ void __coqui_free_raw(void *ptr) {
 /* Public allocator names. After the Asan pass's RAUW these have no callers
  * (every __coqui_malloc/__coqui_free site is rewritten to the asan version)
  * and the bodies are dropped from the linked module. They remain here as the
- * source-level entry points users / libc shims call before the pass runs. */
+ * source-level entry points users / libc shims call before the pass runs.
+ *
+ * NOT always_inline: Asan.cpp does RAUW on the Function symbol; if these
+ * were inlined into user call sites before the pass ran, the bypass-asan
+ * routing would silently elide the asan wrapper. Leave these as plain
+ * (linked) wrappers; nothrow only. */
+__attribute__((nothrow))
 void *__coqui_malloc(unsigned long size) {
     return __coqui_malloc_raw(size);
 }
 
+__attribute__((nothrow))
 void __coqui_free(void *ptr) {
     __coqui_free_raw(ptr);
 }
@@ -160,6 +179,7 @@ static void *memcpy_u8(void *dst, const void *src, unsigned long n) {
     return dst;
 }
 
+__attribute__((nothrow))
 void *__coqui_calloc(unsigned long nmemb, unsigned long size) {
     unsigned long total = nmemb * size;
     void *p = __coqui_malloc(total);
@@ -167,6 +187,7 @@ void *__coqui_calloc(unsigned long nmemb, unsigned long size) {
     return p;
 }
 
+__attribute__((nothrow))
 void *__coqui_realloc(void *ptr, unsigned long size) {
     if (!ptr) return __coqui_malloc(size);
     if (size == 0) { __coqui_free(ptr); return (void *)0; }

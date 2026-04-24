@@ -51,7 +51,9 @@ static inline void __coqui_classify_word(u64 *w) {
  * single OR across the 8 loaded words lets us skip whole cachelines when
  * they're all zero, which is the common case for sparse cov_maps. The
  * compiler is free to coalesce the 8 adjacent 64-bit loads into wider
- * LDG.E.128 instructions. Per-word classify semantics unchanged. */
+ * LDG.E.128 instructions. Per-word classify semantics unchanged.
+ * `nothrow`. */
+__attribute__((nothrow))
 void __coqui_classify_counts(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
@@ -88,6 +90,7 @@ void __coqui_classify_counts(u8 *map) {
  * still diverge) while the word is in a register. Skipping zero words
  * from the hash is safe because the u32 index is always mixed in, so
  * two maps that differ only in which zeros are skipped can't collide. */
+__attribute__((nothrow))
 u32 __coqui_classify_counts_and_sig(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
@@ -168,7 +171,11 @@ u32 __coqui_classify_counts_and_sig(u8 *map) {
 
 /* Same FNV-1a fold, read-only (no classify). Used by crash paths that
  * fire mid-execution (asan_report) where the cov_map is partially
- * written; the signature groups crashes at the same site. */
+ * written; the signature groups crashes at the same site.
+ *
+ * `pure, nothrow`: reads only the cov_map argument's memory and returns
+ * a derived value with no side effects. */
+__attribute__((pure, nothrow))
 u32 __coqui_trace_sig(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
@@ -214,6 +221,7 @@ static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
     return ((u64)hi << 32) | lo;
 }
 
+__attribute__((nothrow))
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;

@@ -134,9 +134,13 @@ static llvm::MDNode *createBranchWeightMD(llvm::LLVMContext &Ctx,
 ///     __coqui_asan_slowpath_{load|store}_N(addr);
 ///   }
 ///
-/// NoInline — each callsite is literally one `call` instruction. The helper
-/// itself must NOT be instrumented; protection relies on the `__coqui_`
-/// prefix skip in the main instrumentation loop.
+/// AlwaysInline + NoUnwind — the helper body is the literal fast path; we
+/// want it folded into every call site so the common-case shadow-byte
+/// check is straight-line PTX (no `call`/`ret` overhead). Branch-weight
+/// metadata on the conditional branches keeps the cold slow-path call
+/// out of the icache hot stream. The helper itself must NOT be
+/// instrumented (`__coqui_` prefix skip in the main instrumentation loop
+/// covers that); body never throws.
 static llvm::Function *createSizedFastHelper(llvm::Module &M,
                                              llvm::StringRef HelperName,
                                              uint64_t AccessSize,
@@ -182,7 +186,14 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Function *F = Function::Create(HelperTy, GlobalValue::InternalLinkage,
                                  HelperName, M);
   F->setCallingConv(CallingConv::C);
-  F->addFnAttr(Attribute::NoInline);
+  // AlwaysInline: fold the fast path (range + shadow byte) into each call
+  // site so the hot path is straight-line PTX (entry / shadow / ok BBs
+  // collapse into the caller). NoUnwind: nothing in the body can throw
+  // — keeps the call site free of EH metadata and lets the inliner avoid
+  // synthesizing a landing pad. The slab-check + slowpath branches still
+  // carry branch-weight metadata so llc lays them out cold.
+  F->addFnAttr(Attribute::AlwaysInline);
+  F->addFnAttr(Attribute::NoUnwind);
   F->getArg(0)->setName("addr");
   F->getArg(1)->setName("heap.base");
   F->getArg(2)->setName("shadow.base");
