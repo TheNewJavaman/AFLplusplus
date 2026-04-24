@@ -29,6 +29,7 @@ set(COQUI_PASS_SOURCES
     Coverage.cpp
     Asan.cpp
     ExternalSymbolGatekeeper.cpp
+    LineTrace.cpp
 )
 
 add_library(CoquiPassPlugin SHARED ${COQUI_PASS_SOURCES})

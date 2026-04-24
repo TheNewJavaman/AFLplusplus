@@ -276,4 +276,24 @@ int __coqui_fuzz_execute(const unsigned char *data, unsigned long size);
 /* Device-global virgin map (allocated at module load, accessed via cuModuleGetGlobal) */
 extern u8 __coqui_virgin_map[COQUI_COV_MAP_SIZE];
 
+/* -- Line-trace runtime (oracle mode; coqui_trace.c) --
+ *
+ * Per-line execution recorder gated by the `-coqui-line-trace` opt flag.
+ * When enabled, the LineTrace pass inserts calls to __coqui_trace_line()
+ * at every unique source line; the host allocates a buffer + counter
+ * array and binds them via cuModuleGetGlobal + HtoD. Production runs
+ * leave the symbols at NULL and the recorder short-circuits.
+ *
+ * Buffer geometry (must match host afl-fuzz-coqui.h):
+ *   trace[t * COQUI_TRACE_MAX_ENTRIES + i] == ID of the i'th line
+ *                                              executed by thread t
+ *   __coqui_trace_count[t] == entries written by thread t (≤ MAX)
+ *
+ * On overflow, the recorder stops for that thread and __coqui_trace_count
+ * remains pinned at COQUI_TRACE_MAX_ENTRIES — the host treats this as a
+ * divergence signal (the CPU expected trace must also fit). */
+extern unsigned int *__coqui_trace_buffer;     /* tid-indexed stripe base */
+extern unsigned int *__coqui_trace_count;      /* per-thread fill count */
+void __coqui_trace_line(unsigned int line_id);
+
 #endif /* _COQUI_RUNTIME_H */
