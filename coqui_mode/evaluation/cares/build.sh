@@ -1,85 +1,90 @@
 #!/usr/bin/env bash
+# build.sh - build c-ares coqui mode evaluation target (nix-free).
 #
-# Build the c-ares (DNS parser) fuzz target for coqui mode.
+# Produces in the current directory:
+#   cares_parse_reply_fuzzer.cubin  - GPU kernel (configurable via ARCH env, default sm_75)
+#   cares_parse_reply_fuzzer.conf   - companion config emitted by coqui-cc
+#   cares_parse_reply_fuzzer_cpu    - AFL++ instrumented CPU binary
+#   generated/                      - generated config headers (ares_build.h, ares_config.h)
+#   .build/                         - cached upstream c-ares source
 #
-# Produces in this directory:
-#   cares_parse_reply_fuzzer.cubin  - GPU kernel (for coqui mode coqui_mode)
-#   cares_parse_reply_fuzzer.conf   - runtime config (emitted alongside cubin)
-#   cares_parse_reply_fuzzer_cpu    - AFL++-instrumented CPU binary (forkserver target)
-#   seeds/                          - 74 DNS wire-format seed corpus (symlink to nix store)
-#   dict/dns.dict                   - DNS wire dictionary (symlink to nix store)
+# No external dependencies beyond afl-clang-fast (from this repo) and
+# coqui-cc (installed to /usr/local/bin). c-ares sources are fetched
+# from github.com/c-ares/c-ares at a pinned tag (v1.34.4).
 #
-# Sources and flags mirror the `cares` target in the legacy coqui codebase.
+# Overrides:
+#   ARCH             GPU compute capability (default sm_75)
+#   AFL_CLANG_FAST   path to afl-clang-fast
+#                    (default: this repo's own afl-clang-fast)
+#   COQUI_CC         path to coqui-cc (default /usr/local/bin/coqui-cc)
+#   CARES_CACHE      path to cache the cloned c-ares source
+#                    (default .build/c-ares-c-ares-<tag>)
+#
+# NOTE: don't use AFL_CC as the override name - afl-cc reserves that env
+# var to override its underlying clang, and passing afl-clang-fast as
+# AFL_CC causes afl-cc to invoke itself recursively until it exhausts
+# MAX_PARAMS_NUM.
 
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$HERE"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-HARNESS="cares_parse_reply_fuzzer"
-
-# --- Prerequisites -----------------------------------------------------------
-
-COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
-COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
-CPU_OUT_LINK="${CPU_OUT_LINK:-/tmp/coqui-cares-cpu}"
+# --- Config -----------------------------------------------------------------
+HARNESS_BASENAME="cares_parse_reply_fuzzer"
+HARNESS_SRC="${SCRIPT_DIR}/harness.c"
+STUBS_SRC="${SCRIPT_DIR}/cares_stubs.c"
 ARCH="${ARCH:-sm_75}"
+SLAB_POOL_SIZE=10737418240        # 10 GiB - DNS name decompression can blow up heap
 
-command -v "$COQUI_CC" >/dev/null || {
-  echo "error: coqui-cc not found at $COQUI_CC" >&2
-  exit 1
-}
-[ -d "$COQUI_REPO" ] || {
-  echo "error: coqui repo not found at $COQUI_REPO" >&2
-  exit 1
-}
+# c-ares upstream pin (matches legacy coqui fetch at v1.34.4)
+CARES_TAG="v1.34.4"
+CARES_REPO="https://github.com/c-ares/c-ares.git"
 
-# --- Step 1: Build AFL++ CPU binary via nix ----------------------------------
-# The CPU fuzzer variant is used by coqui mode as the forkserver target (it provides
-# the classified exit path for crash verification). We consume the nix-built
-# artifact directly so we inherit oss-fuzz-equivalent build flags + sanitizers.
+# Tools
+AFL_CLANG_FAST="${AFL_CLANG_FAST:-${SCRIPT_DIR}/../../../afl-clang-fast}"
+COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
+CARES_CACHE="${CARES_CACHE:-${SCRIPT_DIR}/.build/c-ares-c-ares-${CARES_TAG}}"
 
-echo "[cares/build] nix building target-cares-aflplusplus..."
-(
-  cd "$COQUI_REPO"
-  nix build '.#target-cares-aflplusplus' --out-link "$CPU_OUT_LINK"
+# afl-cc reads AFL_CC from the env to pick its backing clang; if it's set
+# to afl-clang-fast itself (a common mistake when callers reuse the name),
+# afl-cc recursively re-execs itself.  Always unset before invoking.
+unset AFL_CC AFL_CXX
+# Silence afl-cc's "Mistyped AFL environment variable: AFL_CLANG_FAST"
+# warning - our override name is intentional (see note above).
+export AFL_IGNORE_UNKNOWN_ENVS=1
+
+# Sanitizers matching legacy coqui (sanitizers.default: address + full UBSan).
+SANITIZE_FLAGS=(
+  "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
+  "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
 )
 
-[ -x "$CPU_OUT_LINK/$HARNESS" ] || {
-  echo "error: nix build did not produce $CPU_OUT_LINK/$HARNESS" >&2
-  exit 1
-}
+# --- Pre-flight -------------------------------------------------------------
+[[ -x "$AFL_CLANG_FAST" ]] || { echo "ERROR: afl-clang-fast not found at $AFL_CLANG_FAST" >&2; exit 1; }
+[[ -x "$COQUI_CC" ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
+[[ -f "$HARNESS_SRC" ]] || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
+[[ -f "$STUBS_SRC" ]]   || { echo "ERROR: stubs missing at $STUBS_SRC" >&2; exit 1; }
 
-# --- Step 2: Locate c-ares source + harness in the nix store -----------------
-# The CPU derivation pulls the source via fetchFromGitHub; walk the closure to
-# find its unpacked path so we can feed identical files to coqui-cc.
+# --- [1/4] Fetch upstream c-ares at pinned tag ------------------------------
+echo "=== [1/4] Fetch c-ares at pinned tag ${CARES_TAG} ==="
+mkdir -p "$(dirname "$CARES_CACHE")"
+# Marker check: presence of include/ares.h implies a successful prior clone.
+if [[ ! -f "$CARES_CACHE/include/ares.h" ]]; then
+  echo "  clone $CARES_REPO -> $CARES_CACHE"
+  rm -rf "$CARES_CACHE"
+  git clone --quiet --depth 1 --branch "$CARES_TAG" "$CARES_REPO" "$CARES_CACHE"
+fi
+[[ -f "$CARES_CACHE/include/ares.h" ]] \
+  || { echo "ERROR: c-ares fetch produced no include/ares.h in $CARES_CACHE" >&2; exit 1; }
+[[ -f "$CARES_CACHE/src/lib/record/ares_dns_parse.c" ]] \
+  || { echo "ERROR: c-ares fetch missing src/lib/record/ares_dns_parse.c" >&2; exit 1; }
+echo "  c-ares: $(du -sh "$CARES_CACHE" | cut -f1)"
 
-echo "[cares/build] resolving c-ares source in nix store..."
-CPU_STORE="$(readlink -f "$CPU_OUT_LINK")"
-CLOSURE="$(nix-store -q --references "$CPU_STORE")"
-
-CARES_SRC=""
-HARNESS_SRC=""
-for dep in $CLOSURE; do
-  if [ -z "$CARES_SRC" ] && [ -f "$dep/include/ares.h" ]; then
-    CARES_SRC="$dep"
-  fi
-  if [ -z "$HARNESS_SRC" ] && [ -f "$dep/cares_parse_reply_fuzzer.c" ]; then
-    HARNESS_SRC="$dep"
-  fi
-done
-
-[ -n "$CARES_SRC" ]   || { echo "error: could not locate c-ares source in nix store closure" >&2; exit 1; }
-[ -n "$HARNESS_SRC" ] || { echo "error: could not locate harness-targets in nix store closure" >&2; exit 1; }
-
-echo "[cares/build]   c-ares source: $CARES_SRC"
-echo "[cares/build]   harness src:   $HARNESS_SRC"
-
-# --- Step 3: Generate config headers (replicates nix preBuild) ---------------
-# c-ares normally produces these via autotools/cmake. The Coqui target writes
-# them by hand because we build without running configure.
-
-echo "[cares/build] generating config headers..."
+# --- [2/4] Generate config headers -----------------------------------------
+# c-ares normally produces these via autotools/cmake. Generate by hand to
+# avoid running configure. Content mirrors legacy coqui nix spec exactly.
+echo "=== [2/4] Generate config headers ==="
 mkdir -p generated
 
 cat > generated/ares_build.h << 'HEOF'
@@ -180,79 +185,121 @@ cat > generated/ares_config.h << 'HEOF'
 #endif
 HEOF
 
-# --- Step 4: Invoke coqui-cc to produce the GPU .cubin -----------------------
-# Source whitelist + include paths + defines mirror the nix spec exactly. The
-# DNS parsing code is self-contained: no networking, no resolver, no event loop.
+# --- Source whitelist -------------------------------------------------------
+# Exact same whitelist as the legacy nix spec: DNS parsing + dependencies,
+# no networking, no resolver, no event loop.
+S="${CARES_CACHE}/src/lib"
+CARES_SOURCES=(
+  "$S/record/ares_dns_parse.c"
+  "$S/record/ares_dns_record.c"
+  "$S/record/ares_dns_write.c"
+  "$S/record/ares_dns_mapping.c"
+  "$S/record/ares_dns_name.c"
+  "$S/record/ares_dns_multistring.c"
+  "$S/str/ares_buf.c"
+  "$S/str/ares_str.c"
+  "$S/str/ares_strsplit.c"
+  "$S/dsa/ares_array.c"
+  "$S/dsa/ares_htable.c"
+  "$S/dsa/ares_htable_asvp.c"
+  "$S/dsa/ares_htable_dict.c"
+  "$S/dsa/ares_htable_strvp.c"
+  "$S/dsa/ares_htable_szvp.c"
+  "$S/dsa/ares_htable_vpstr.c"
+  "$S/dsa/ares_htable_vpvp.c"
+  "$S/dsa/ares_llist.c"
+  "$S/dsa/ares_slist.c"
+  "$S/ares_library_init.c"
+  "$S/ares_free_string.c"
+  "$S/ares_free_hostent.c"
+  "$S/ares_data.c"
+  "$S/ares_strerror.c"
+  "$S/ares_version.c"
+  "$S/inet_ntop.c"
+  "$S/inet_net_pton.c"
+  "$S/ares_getenv.c"
+  "$S/util/ares_math.c"
+  "$S/util/ares_rand.c"
+  "$S/util/ares_timeval.c"
+  "$S/util/ares_threads.c"
+  "$S/util/ares_uri.c"
+)
 
-echo "[cares/build] compiling $HARNESS.cubin with coqui-cc..."
-S="$CARES_SRC/src/lib"
+# Verify each source exists (catches upstream layout changes at the pinned tag).
+for src in "${CARES_SOURCES[@]}"; do
+  [[ -f "$src" ]] || { echo "ERROR: missing c-ares source $src" >&2; exit 1; }
+done
 
-"$COQUI_CC" \
-  -arch "${ARCH}" \
-  --slab-pool-size 10737418240 \
-  -I "$CARES_SRC/include" \
-  -I "$CARES_SRC/src/lib" \
-  -I "$CARES_SRC/src/lib/include" \
+# --- [3/4] Build AFL++ CPU binary -------------------------------------------
+# CPU build matches cpu-target-specs.nix cares spec: -DCOQUI_CPU tells the
+# stubs file to skip strcasecmp/gettimeofday (libc provides them).
+#
+# Compile each .c -> .o separately: afl-clang-fast caps total CLI parameter
+# count at MAX_PARAMS_NUM (2048 after internal flag rewrites), and feeding
+# 34 sources in a single invocation exceeds that limit.
+echo "=== [3/4] Build AFL++ CPU binary with afl-clang-fast ==="
+CPU_OUT="${HARNESS_BASENAME}_cpu"
+OBJ_DIR="${SCRIPT_DIR}/.build/cpu-obj"
+rm -rf "$OBJ_DIR"
+mkdir -p "$OBJ_DIR"
+
+CPU_CFLAGS=(
+  -O2 -g
+  "${SANITIZE_FLAGS[@]}"
+  -I "${CARES_CACHE}/include"
+  -I "${CARES_CACHE}/src/lib"
+  -I "${CARES_CACHE}/src/lib/include"
+  -I generated
+  -D HAVE_CONFIG_H
+  -D COQUI_CPU
+)
+
+CPU_OBJS=()
+for src in "${CARES_SOURCES[@]}" "$STUBS_SRC" "$HARNESS_SRC"; do
+  base="$(basename "$src")"
+  obj="$OBJ_DIR/${base%.c}.o"
+  # Use a path-unique name for library files that share base names across dirs
+  # (ares_htable_*.c in dsa/ are unique, but be defensive).
+  if [[ -f "$obj" ]]; then
+    # Two .c files ended up with the same basename; dedupe by parent dir tag.
+    parent="$(basename "$(dirname "$src")")"
+    obj="$OBJ_DIR/${parent}-${base%.c}.o"
+  fi
+  "$AFL_CLANG_FAST" "${CPU_CFLAGS[@]}" -c "$src" -o "$obj"
+  CPU_OBJS+=("$obj")
+done
+
+# Link with -fsanitize=fuzzer so afl-clang-fast pulls in libAFLDriver.a.
+"$AFL_CLANG_FAST" -O2 -g \
+  "${SANITIZE_FLAGS[@]}" \
+  -fsanitize=fuzzer \
+  "${CPU_OBJS[@]}" \
+  -o "$CPU_OUT" \
+  -lm
+
+[[ -x "$CPU_OUT" ]] || { echo "ERROR: CPU binary not produced" >&2; exit 1; }
+
+# --- [4/4] Build GPU cubin via coqui-cc -------------------------------------
+# flock serializes coqui-cc with other parallel build.sh invocations; ptxas
+# at -O1 is memory-heavy (tens of GB), and concurrent builds will OOM.
+echo "=== [4/4] Build GPU cubin via coqui-cc (flock-serialized) ==="
+flock /tmp/coqui-cc.lock "$COQUI_CC" \
+  -arch "$ARCH" \
+  --slab-pool-size "$SLAB_POOL_SIZE" \
+  -I "${CARES_CACHE}/include" \
+  -I "${CARES_CACHE}/src/lib" \
+  -I "${CARES_CACHE}/src/lib/include" \
   -I generated \
   -D HAVE_CONFIG_H \
-  "$S/record/ares_dns_parse.c" \
-  "$S/record/ares_dns_record.c" \
-  "$S/record/ares_dns_write.c" \
-  "$S/record/ares_dns_mapping.c" \
-  "$S/record/ares_dns_name.c" \
-  "$S/record/ares_dns_multistring.c" \
-  "$S/str/ares_buf.c" \
-  "$S/str/ares_str.c" \
-  "$S/str/ares_strsplit.c" \
-  "$S/dsa/ares_array.c" \
-  "$S/dsa/ares_htable.c" \
-  "$S/dsa/ares_htable_asvp.c" \
-  "$S/dsa/ares_htable_dict.c" \
-  "$S/dsa/ares_htable_strvp.c" \
-  "$S/dsa/ares_htable_szvp.c" \
-  "$S/dsa/ares_htable_vpstr.c" \
-  "$S/dsa/ares_htable_vpvp.c" \
-  "$S/dsa/ares_llist.c" \
-  "$S/dsa/ares_slist.c" \
-  "$S/ares_library_init.c" \
-  "$S/ares_free_string.c" \
-  "$S/ares_free_hostent.c" \
-  "$S/ares_data.c" \
-  "$S/ares_strerror.c" \
-  "$S/ares_version.c" \
-  "$S/inet_ntop.c" \
-  "$S/inet_net_pton.c" \
-  "$S/ares_getenv.c" \
-  "$S/util/ares_math.c" \
-  "$S/util/ares_rand.c" \
-  "$S/util/ares_timeval.c" \
-  "$S/util/ares_threads.c" \
-  "$S/util/ares_uri.c" \
-  "$HARNESS_SRC/cares_stubs.c" \
-  "$HARNESS_SRC/cares_parse_reply_fuzzer.c" \
-  -o "$HARNESS"
+  "${CARES_SOURCES[@]}" \
+  "$STUBS_SRC" \
+  "$HARNESS_SRC" \
+  -o "$HARNESS_BASENAME"
 
-[ -f "$HARNESS.cubin" ] || { echo "error: coqui-cc did not produce $HARNESS.cubin" >&2; exit 1; }
-[ -f "$HARNESS.conf" ]  || echo "warning: $HARNESS.conf was not emitted (coqui mode may use defaults)" >&2
+[[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \
+  || { echo "ERROR: coqui-cc did not emit .cubin/.conf" >&2; exit 1; }
 
-# --- Step 5: Stage the CPU binary, seeds, and dict ---------------------------
-
-echo "[cares/build] staging CPU binary + seeds + dict..."
-ln -sfn "$CPU_OUT_LINK/$HARNESS" "./${HARNESS}_cpu"
-
-# Seeds: the nix derivation already ships a seeds/ dir as symlinks into the
-# c-ares source tree. Point at that directory wholesale.
-ln -sfn "$CPU_OUT_LINK/seeds" ./seeds
-
-# Dict: same treatment.
-ln -sfn "$CPU_OUT_LINK/dict" ./dict
-
-echo "[cares/build] done."
-echo ""
-echo "  cubin:   $HERE/$HARNESS.cubin"
-echo "  conf:    $HERE/$HARNESS.conf"
-echo "  cpu:     $HERE/${HARNESS}_cpu -> $CPU_OUT_LINK/$HARNESS"
-echo "  seeds:   $HERE/seeds ($(ls -1 "$CPU_OUT_LINK/seeds" | wc -l) files)"
-echo "  dict:    $HERE/dict"
-echo ""
-echo "Run: ./fuzz.sh [-- -V 60 ...]"
+echo
+echo "=== Build complete ==="
+ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
+echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"
