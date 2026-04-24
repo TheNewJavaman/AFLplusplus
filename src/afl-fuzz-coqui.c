@@ -318,6 +318,63 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
         slab_size, shadow_size, ctx->slab_block_budget);
   }
 
+  /* === task23: oracle-mode line-trace setup (gated by COQUI_ORACLE=1) ===
+   *
+   * When set, allocate per-thread trace buffer + count array and bind
+   * them to the cubin's __coqui_trace_buffer / __coqui_trace_count
+   * globals. If the cubin wasn't built with -coqui-line-trace,
+   * cuModuleGetGlobal returns CUDA_ERROR_NOT_FOUND — log a warning and
+   * leave oracle_enabled=0 so production runs against legacy cubins
+   * still work without a rebuild. */
+  ctx->oracle_enabled    = 0;
+  ctx->d_trace_buffer    = 0;
+  ctx->d_trace_count     = 0;
+  ctx->h_trace_t0_buf    = NULL;
+  ctx->h_trace_t0_count  = 0;
+  if (getenv("COQUI_ORACLE")) {
+    CUdeviceptr trace_buf_sym, trace_count_sym;
+    size_t      buf_sym_sz = 0, count_sym_sz = 0;
+    CUresult br1 = cuModuleGetGlobal(&trace_buf_sym, &buf_sym_sz, mod,
+                                     "__coqui_trace_buffer");
+    CUresult br2 = cuModuleGetGlobal(&trace_count_sym, &count_sym_sz, mod,
+                                     "__coqui_trace_count");
+    if (br1 != CUDA_SUCCESS || br2 != CUDA_SUCCESS) {
+      WARNF("COQUI_ORACLE=1 but cubin lacks __coqui_trace_buffer/count "
+            "symbols (built without -coqui-line-trace?); oracle disabled");
+    } else {
+      /* Allocate buffer: bs * COQUI_TRACE_BUFFER_BYTES.
+       * Allocate counts: bs * sizeof(u32). */
+      unsigned long long buf_bytes =
+          (unsigned long long)ctx->batch_size * COQUI_TRACE_BUFFER_BYTES;
+      unsigned long long count_bytes =
+          (unsigned long long)ctx->batch_size * sizeof(unsigned int);
+      CUdeviceptr d_buf, d_cnt;
+      CUCHECK(cuMemAlloc(&d_buf, buf_bytes));
+      CUCHECK(cuMemAlloc(&d_cnt, count_bytes));
+      ctx->d_trace_buffer = (unsigned long long)d_buf;
+      ctx->d_trace_count  = (unsigned long long)d_cnt;
+
+      /* Write the device-side pointer values into the cubin's symbols.
+       * Each symbol is a `unsigned int *` (8 bytes on the device). */
+      if (buf_sym_sz != sizeof(CUdeviceptr) ||
+          count_sym_sz != sizeof(CUdeviceptr)) {
+        FATAL("__coqui_trace_buffer/count symbol size mismatch "
+              "(buf=%zu, count=%zu, expected %zu)",
+              buf_sym_sz, count_sym_sz, sizeof(CUdeviceptr));
+      }
+      CUCHECK(cuMemcpyHtoD(trace_buf_sym, &d_buf, sizeof(CUdeviceptr)));
+      CUCHECK(cuMemcpyHtoD(trace_count_sym, &d_cnt, sizeof(CUdeviceptr)));
+
+      /* Host-side scratch for thread-0 readback. */
+      ctx->h_trace_t0_buf = ck_alloc(COQUI_TRACE_BUFFER_BYTES);
+      ctx->oracle_enabled = 1;
+      OKF("coqui oracle: trace buffer %llu B (%u threads × %u B), "
+          "counts %llu B; bound to __coqui_trace_buffer/count",
+          buf_bytes, ctx->batch_size, COQUI_TRACE_BUFFER_BYTES, count_bytes);
+    }
+  }
+  /* === end task23 block === */
+
   ctx->batch_timeout_us = getenv_u64("AFL_COQUI_TIMEOUT_US", 3000000);
   ctx->timeout_env_override = getenv("AFL_COQUI_TIMEOUT_US") ? 1 : 0;
   ctx->launch_count     = 0;
@@ -552,6 +609,19 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   if (ctx->d_slab_shadow && ctx->slab_pool_size) {
     CUCHECK(cuMemsetD8Async((CUdeviceptr)ctx->d_slab_shadow, 0xFA,
                              ctx->slab_pool_size / 8, s));
+  }
+
+  /* === task23: zero per-thread trace counters before each launch ===
+   * Trace buffer contents stay (they're overwritten by index, not
+   * appended), but the count array MUST start at zero so the first
+   * call to __coqui_trace_line writes to slot [0]. The buffer itself
+   * is left intact — the runtime only ever reads buf[idx] and writes
+   * buf[*cnt], so stale bytes past the count are invisible. */
+  if (ctx->oracle_enabled) {
+    unsigned long long count_bytes =
+        (unsigned long long)ctx->batch_size * sizeof(unsigned int);
+    CUCHECK(cuMemsetD8Async((CUdeviceptr)ctx->d_trace_count, 0,
+                             count_bytes, s));
   }
 
   unsigned long long _htod_t1;
@@ -882,6 +952,59 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
+  /* === task23: oracle-mode line-trace readback ===
+   *
+   * After a healthy batch, copy thread-0's count + trace stripe back to
+   * host scratch and print. Thread 0 is sufficient for end-to-end pass
+   * validation — every thread runs the same kernel against its own input,
+   * so traces differ only by input-driven branches; the user can choose
+   * a deterministic seed input (one that flows down a known path on the
+   * CPU build) and compare against an expected trace.
+   *
+   * Comparison-against-expected and full-batch readback are intentionally
+   * NOT implemented here: the user can tail the stderr stream while
+   * running a known-input through afl-fuzz, capture the recorded
+   * sequence, and diff against the host CPU build's expected trace
+   * separately. Wiring a flexible seed/expected-trace harness into core
+   * afl-fuzz is a separate piece of work; per task23 spec the readback
+   * path being functional is enough to validate the device side. */
+  if (ctx->oracle_enabled && ctx->h_trace_t0_buf && b->h_input_lens[0] > 0) {
+    /* DtoH thread-0 count first, then conditionally the buffer.
+     * Synchronous DtoH so the print below sees the values. */
+    unsigned int t0_count = 0;
+    CUCHECK(cuMemcpyDtoH(&t0_count, (CUdeviceptr)ctx->d_trace_count,
+                          sizeof(unsigned int)));
+    if (t0_count > COQUI_TRACE_MAX_ENTRIES)
+      t0_count = COQUI_TRACE_MAX_ENTRIES;
+    ctx->h_trace_t0_count = t0_count;
+
+    if (t0_count > 0) {
+      unsigned long long bytes =
+          (unsigned long long)t0_count * sizeof(unsigned int);
+      CUCHECK(cuMemcpyDtoH(ctx->h_trace_t0_buf,
+                            (CUdeviceptr)ctx->d_trace_buffer, bytes));
+
+      /* Print the recorded sequence to stderr. Capped at 64 entries to
+       * keep logs readable; full buffer remains in ctx->h_trace_t0_buf
+       * for any callers that hook in. Overflow signaled by the count
+       * pinning at COQUI_TRACE_MAX_ENTRIES. */
+      u32 cap = t0_count < 64 ? t0_count : 64;
+      fprintf(stderr, "[coqui-oracle] batch=%llu tid=0 trace_count=%u%s "
+                      "(first %u): ",
+              (unsigned long long)ctx->launch_count, t0_count,
+              t0_count >= COQUI_TRACE_MAX_ENTRIES ? " (OVERFLOW)" : "",
+              cap);
+      for (u32 j = 0; j < cap; j++)
+        fprintf(stderr, "%u ", ctx->h_trace_t0_buf[j]);
+      fprintf(stderr, "\n");
+    } else {
+      fprintf(stderr, "[coqui-oracle] batch=%llu tid=0 trace_count=0 "
+                      "(no traced lines reached)\n",
+              (unsigned long long)ctx->launch_count);
+    }
+  }
+  /* === end task23 block === */
+
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
     u32 bits = ((u32 *)b->h_novelty)[word_i];
@@ -1187,6 +1310,13 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_slab_shadow);
   if (ctx->d_slab_next)
     cuMemFree((CUdeviceptr)ctx->d_slab_next);
+  /* === task23: free oracle-mode line-trace buffers === */
+  if (ctx->d_trace_buffer)
+    cuMemFree((CUdeviceptr)ctx->d_trace_buffer);
+  if (ctx->d_trace_count)
+    cuMemFree((CUdeviceptr)ctx->d_trace_count);
+  if (ctx->h_trace_t0_buf)
+    ck_free(ctx->h_trace_t0_buf);
 
   /* Destroy streams, unload module, destroy context */
   if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);

@@ -226,7 +226,35 @@ typedef struct coqui_ctx {
   unsigned long long d_kernel_timing;  /* CUdeviceptr to the 5-u64 array */
   u64                k_cycles[5];      /* host-side accumulator, reset at print */
   u32                k_batch_count;    /* batches contributing to accumulator */
+
+  /* === task23: oracle-mode line-trace readback (gated by COQUI_ORACLE=1) ===
+   *
+   * When the env var COQUI_ORACLE is set at coqui_init time, the host
+   * allocates a per-thread trace buffer + counter array and binds them to
+   * the cubin's __coqui_trace_buffer / __coqui_trace_count globals via
+   * cuModuleGetGlobal + cuMemcpyHtoD (same wiring pattern as the slab
+   * pool). The cubin must have been built with `-coqui-line-trace`; if
+   * the symbols aren't exported coqui_init logs a warning and continues
+   * with oracle disabled (production runs are unaffected).
+   *
+   * After each kernel completes, we DtoH thread-0's count + buffer and
+   * print the recorded sequence to stderr. Comparing against an
+   * expected CPU-corpus trace is intentionally a separate follow-up;
+   * the buffer being readable from the host is enough to validate the
+   * device-side path end-to-end. */
+  u8                  oracle_enabled;       /* 1 when COQUI_ORACLE=1 + globals bound */
+  unsigned long long  d_trace_buffer;       /* CUdeviceptr — trace stripe pool */
+  unsigned long long  d_trace_count;        /* CUdeviceptr — per-thread counters */
+  u32                *h_trace_t0_buf;       /* host scratch for thread-0 readback */
+  u32                 h_trace_t0_count;     /* most-recent thread-0 count */
 } coqui_ctx_t;
+
+/* Per-thread trace stripe geometry. Must match
+ * coqui_mode/runtime/coqui_trace.c COQUI_TRACE_BUFFER_BYTES /
+ * COQUI_TRACE_MAX_ENTRIES — if the runtime constants change, update
+ * here so the host's cuMemAlloc and DtoH sizes track the device's. */
+#define COQUI_TRACE_BUFFER_BYTES 65536u
+#define COQUI_TRACE_MAX_ENTRIES  (COQUI_TRACE_BUFFER_BYTES / 4u)
 
 /* Adaptive batch-timeout tunables (B1). */
 #define COQUI_LAT_RING_SIZE     128
