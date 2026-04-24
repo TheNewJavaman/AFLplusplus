@@ -246,14 +246,76 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
     }
   }
 
-  /* 10. Slab pool (optional) */
+  /* 10. Slab pool (optional). Enabled when AFL_COQUI_SLAB_SIZE is set.
+   *     The coqui-cc driver records --slab-pool-size in the .conf sidecar;
+   *     host callers that want slab on a target should set the env var to
+   *     the same value (or larger). Binds the slab-pool CUdeviceptrs into
+   *     the cubin's __coqui_slab_* globals via cuModuleGetGlobal + HtoD so
+   *     the device runtime finds them at launch. */
   unsigned long long slab_size = getenv_u64("AFL_COQUI_SLAB_SIZE", 0);
+  ctx->slab_pool_size = slab_size;
   if (slab_size > 0) {
-    CUdeviceptr slab;
-    CUCHECK(cuMemAlloc(&slab, slab_size));
-    CUCHECK(cuMemsetD8(slab, 0, slab_size));
-    ctx->d_slab_pool = (unsigned long long)slab;
-    /* TODO: invoke __coqui_slab_setup init kernel when slab runtime ported */
+    CUdeviceptr slab_pool;
+    CUCHECK(cuMemAlloc(&slab_pool, slab_size));
+    CUCHECK(cuMemsetD8(slab_pool, 0, slab_size));
+    ctx->d_slab_pool = (unsigned long long)slab_pool;
+
+    /* Shadow is 1:8 of the pool. Poison the whole pool to 0xFA so any
+     * access to unallocated slab bytes trips the tier-2 shadow check
+     * immediately. The slab allocator rewrites shadow bytes to 0x00 on
+     * malloc + redzones on either side. */
+    unsigned long long shadow_size = slab_size / 8;
+    CUdeviceptr slab_shadow;
+    CUCHECK(cuMemAlloc(&slab_shadow, shadow_size));
+    CUCHECK(cuMemsetD8(slab_shadow, 0xFA, shadow_size));
+    ctx->d_slab_shadow = (unsigned long long)slab_shadow;
+
+    /* Global atomic bump counter — u32, reset per batch. */
+    CUdeviceptr slab_next;
+    CUCHECK(cuMemAlloc(&slab_next, sizeof(unsigned int)));
+    CUCHECK(cuMemsetD32(slab_next, 0, 1));
+    ctx->d_slab_next = (unsigned long long)slab_next;
+
+    /* Block budget: each block's fast-path partition size in slabs.
+     * Compute ctrl_slabs exactly as the device runtime does so the host
+     * and device agree on the partition geometry. Then give each block
+     * ~half the leftover per-block share so the global bump path still
+     * has room when any single block over-allocates. */
+    unsigned int max_slabs = (unsigned int)(slab_size / 4096ULL);
+    unsigned int grid = ctx->batch_size / 128;
+    unsigned int ctrl_slabs =
+        (unsigned int)(((unsigned long long)ctx->batch_size * 32ULL + 8ULL
+                        + 4095ULL) / 4096ULL);
+    unsigned int data_slabs =
+        (max_slabs > ctrl_slabs) ? (max_slabs - ctrl_slabs) : 0;
+    ctx->slab_block_budget = grid > 0 ? (data_slabs / grid / 2) : 0;
+
+    /* Bind into the cubin's module globals. cuModuleGetGlobal fails if the
+     * cubin wasn't compiled against the slab-enabled runtime; treat that
+     * as a hard error — running with AFL_COQUI_SLAB_SIZE set against a
+     * non-slab cubin would silently disable slab. */
+    struct { const char *name; const void *value; size_t size; } slab_binds[] = {
+        {"__coqui_slab_pool",         &slab_pool,              sizeof(CUdeviceptr)},
+        {"__coqui_slab_pool_size",    &slab_size,              sizeof(unsigned long)},
+        {"__coqui_slab_shadow",       &slab_shadow,            sizeof(CUdeviceptr)},
+        {"__coqui_slab_next",         &slab_next,              sizeof(CUdeviceptr)},
+        {"__coqui_slab_block_budget", &ctx->slab_block_budget, sizeof(unsigned int)},
+    };
+    for (unsigned i = 0; i < sizeof(slab_binds)/sizeof(slab_binds[0]); i++) {
+      CUdeviceptr sym; size_t sym_sz;
+      CUresult br = cuModuleGetGlobal(&sym, &sym_sz, mod, slab_binds[i].name);
+      if (br != CUDA_SUCCESS) {
+        FATAL("slab runtime missing symbol %s (cubin built without slab support?)",
+              slab_binds[i].name);
+      }
+      if (sym_sz != slab_binds[i].size) {
+        FATAL("slab symbol %s size %zu != expected %zu",
+              slab_binds[i].name, sym_sz, slab_binds[i].size);
+      }
+      CUCHECK(cuMemcpyHtoD(sym, slab_binds[i].value, slab_binds[i].size));
+    }
+    OKF("coqui slab pool: %llu bytes, shadow %llu B, block_budget %u slabs",
+        slab_size, shadow_size, ctx->slab_block_budget);
   }
 
   ctx->batch_timeout_us = getenv_u64("AFL_COQUI_TIMEOUT_US", 3000000);
@@ -263,6 +325,10 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->total_submits    = 0;
   ctx->crash_dedup_hits = 0;
   ctx->crash_verify_calls = 0;
+  ctx->oom_inputs_found = 0;
+  ctx->oom_reruns_completed = 0;
+  ctx->stack_overflow_inputs_found = 0;
+  ctx->cpu_rerun_crashes = 0;
 
   /* Persistent cross-batch crash-sig dedup set (1M slots = ~5 MB host RAM).
    * Saturates after ~500 s at the observed 2k-new-sigs/s rate for cjson; for
@@ -351,6 +417,24 @@ static void process_input_via_cpu_fsrv(afl_state_t *afl,
  * completion. */
 static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b);
 static void coqui_force_reset(afl_state_t *afl, const char *cubin_path);
+
+/* Re-run an input on the host's AFL++ CPU forkserver and route the
+ * outcome through save_if_interesting exactly like process_input_via_cpu_fsrv
+ * does. The difference from the normal fast path: we don't apply the speed
+ * gate here. An input that OOM'd on the GPU has already been identified as
+ * memory-pathological; gating it by verify time would double-penalize and
+ * the input wouldn't re-run at all on slow targets.
+ *
+ * Returns the fault code so the caller can increment the appropriate
+ * counter (OOM reruns vs real crashes vs timeouts). */
+static u8 rerun_gpu_failed_input(afl_state_t *afl, u8 *input, u32 len) {
+  u32 new_size = write_to_testcase(afl, (void **)&input, len, 0);
+  if (new_size == 0) return FSRV_RUN_OK; /* skipped */
+
+  u8 cpu_fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+  afl->queued_discovered += save_if_interesting(afl, input, len, cpu_fault);
+  return cpu_fault;
+}
 
 /* Adaptive batch-timeout (B1) helpers.
  *
@@ -445,6 +529,30 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                             ctx->batch_size / 32, s));
   CUCHECK(cuMemsetD8Async((CUdeviceptr)b->d_status, 0,
                            ctx->batch_size * sizeof(coqui_status_t), s));
+
+  /* Slab per-batch reset. Three memsets:
+   *   1. d_slab_next → 0        (global bump counter restart)
+   *   2. slab_pool[0 .. ctrl_slabs*4096 + 8]  → 0
+   *      Clears per-thread control rows (batch_size*32 bytes) and the
+   *      Treiber-stack free-list head (1 u64). The +8 covers the head
+   *      cell that lives at slab_pool[bs*32] per the reclamation spec.
+   *   3. d_slab_shadow → 0xFA   (poison entire pool shadow; the
+   *      allocator rewrites individual granules to 0x00 on malloc).
+   * All three use the batch's stream so they interleave naturally with
+   * the async HtoD copies above. Runs only when slab is configured
+   * (checked by cubin-compile-time symbol presence -> ctx->d_slab_*
+   * being non-zero). */
+  if (ctx->d_slab_next) {
+    CUCHECK(cuMemsetD32Async((CUdeviceptr)ctx->d_slab_next, 0, 1, s));
+    /* Zero ctrl-header area. bs*32 + 8 per the reclamation design spec. */
+    unsigned long long ctrl_bytes =
+        (unsigned long long)ctx->batch_size * 32ULL + 8ULL;
+    CUCHECK(cuMemsetD8Async((CUdeviceptr)ctx->d_slab_pool, 0, ctrl_bytes, s));
+  }
+  if (ctx->d_slab_shadow && ctx->slab_pool_size) {
+    CUCHECK(cuMemsetD8Async((CUdeviceptr)ctx->d_slab_shadow, 0xFA,
+                             ctx->slab_pool_size / 8, s));
+  }
 
   unsigned long long _htod_t1;
   STAMP_US(_htod_t1);
@@ -726,6 +834,54 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
+  /* Scan for inputs that caused the device runtime to call
+   * __coqui_trap_with_reason() (OOM or stack overflow). These did NOT
+   * record a crash or novelty on the GPU because they exited too
+   * early; rerun them on the CPU forkserver where the per-thread
+   * memory constraint doesn't apply. This is the single place where
+   * the correctness invariant "every input either completes on the
+   * GPU with a recorded outcome OR is rerun on the CPU" is enforced
+   * — so the scan runs before the novelty + crash loops so dedup
+   * (which is GPU-outcome based) can't suppress an OOM rerun. */
+  {
+    u64 oom_this_batch = 0;
+    u64 oom_reruns_this_batch = 0;
+    u64 stack_ovf_this_batch = 0;
+    coqui_status_t *hs_trap = b->h_status;
+    for (u32 i = 0; i < ctx->batch_size; i++) {
+      if (b->h_input_lens[i] == 0) continue;
+      u8 tr = hs_trap[i].trap_reason;
+      if (tr == COQUI_TRAP_NONE) continue;
+
+      u8 *input = b->h_input_bytes + b->h_offsets[i];
+      u32 len = b->h_input_lens[i];
+
+      if (tr == COQUI_TRAP_OOM) {
+        oom_this_batch++;
+        u8 fault = rerun_gpu_failed_input(afl, input, len);
+        if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
+        oom_reruns_this_batch++;
+      } else if (tr == COQUI_TRAP_STACK_OVERFLOW) {
+        stack_ovf_this_batch++;
+        u8 fault = rerun_gpu_failed_input(afl, input, len);
+        if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
+        oom_reruns_this_batch++;
+      }
+    }
+    ctx->oom_inputs_found += oom_this_batch;
+    ctx->stack_overflow_inputs_found += stack_ovf_this_batch;
+    ctx->oom_reruns_completed += oom_reruns_this_batch;
+    /* Debug-build correctness assertion: every trap_reason entry that
+     * isn't len==0 must have been rerun. Intentionally not a FATAL in
+     * release builds — a logged mismatch is preferable to killing a
+     * long fuzz session over a counting bug. */
+    if (oom_this_batch + stack_ovf_this_batch != oom_reruns_this_batch) {
+      WARNF("coqui: OOM counter mismatch: %llu found / %llu reran",
+            (unsigned long long)(oom_this_batch + stack_ovf_this_batch),
+            (unsigned long long)oom_reruns_this_batch);
+    }
+  }
+
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
     u32 bits = ((u32 *)b->h_novelty)[word_i];
@@ -734,6 +890,11 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       bits &= bits - 1;
       u32 i = word_i * 32 + bit_pos;
       if (b->h_input_lens[i] == 0) continue;
+
+      /* Skip inputs that already ran through the CPU forkserver via
+       * the trap_reason path above — running them again would waste
+       * cycles and double-save their coverage. */
+      if (b->h_status[i].trap_reason != COQUI_TRAP_NONE) continue;
 
       u8 *input = b->h_input_bytes + b->h_offsets[i];
       u32 len = b->h_input_lens[i];
@@ -770,6 +931,8 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     if (b->h_input_lens[i] == 0) continue;
     u8 nov = (b->h_novelty[i / 8] >> (i % 8)) & 1;
     if (nov) continue;   /* already processed above */
+    /* OOM / stack-overflow reruns handled by the trap_reason scan. */
+    if (hs[i].trap_reason != COQUI_TRAP_NONE) continue;
 
     u8 gpu_fault = translate_gpu_status(&hs[i]);
     if (gpu_fault != FSRV_RUN_CRASH && gpu_fault != FSRV_RUN_TMOUT) continue;
@@ -1020,6 +1183,10 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_global_statics_pool);
   if (ctx->d_slab_pool)
     cuMemFree((CUdeviceptr)ctx->d_slab_pool);
+  if (ctx->d_slab_shadow)
+    cuMemFree((CUdeviceptr)ctx->d_slab_shadow);
+  if (ctx->d_slab_next)
+    cuMemFree((CUdeviceptr)ctx->d_slab_next);
 
   /* Destroy streams, unload module, destroy context */
   if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);

@@ -48,8 +48,18 @@ typedef struct coqui_status {
                          7=unreachable, 8=load-invalid, 9=float-cast,
                          10=implicit-conv, 11=missing-return, 12=vla-bound,
                          13=nonnull-arg, 14=nonnull-return, 15=dynamic-type) */
-  u32 _reserved1;
+  u8  trap_reason;    /* COQUI_TRAP_* value (0=none, 11=OOM, 12=STACK_OVERFLOW, …) */
+  u8  _reserved_1;
+  u8  _reserved_2;
+  u8  _reserved_3;
 } coqui_status_t;     /* 16 bytes — DO NOT CHANGE without updating runtime header */
+
+/* Trap reason codes mirrored from coqui_mode/runtime/coqui_runtime.h. Host-
+ * side helpers (afl-fuzz-coqui.c) scan status[i].trap_reason after each
+ * batch to find threads that exited via __coqui_trap_with_reason(). */
+#define COQUI_TRAP_NONE          0
+#define COQUI_TRAP_OOM           11
+#define COQUI_TRAP_STACK_OVERFLOW 12
 
 /* One ping-pong half: packed input bytes + metadata + device mirrors. */
 typedef struct coqui_batch {
@@ -173,6 +183,16 @@ typedef struct coqui_ctx {
   unsigned long long d_virgin_map;
   unsigned long long d_global_statics_pool;
   unsigned long long d_slab_pool;
+  unsigned long long d_slab_shadow;
+  unsigned long long d_slab_next;
+  unsigned long long slab_pool_size;
+  unsigned int       slab_block_budget;
+
+  /* OOM rerun counters (set by the post-batch trap_reason scan). */
+  u64 oom_inputs_found;
+  u64 oom_reruns_completed;
+  u64 stack_overflow_inputs_found;
+  u64 cpu_rerun_crashes;
 
   /* Config from .conf sidecar */
   unsigned int real_stack_size;
