@@ -1,98 +1,139 @@
 #!/usr/bin/env bash
-# build.sh — build bzip2 coqui mode evaluation target.
+# build.sh — build bzip2 coqui mode evaluation target (nix-free).
 #
 # Produces in the current directory:
-#   bzip2_fuzzer.cubin — GPU kernel (sm_75)
+#   bzip2_fuzzer.cubin — GPU kernel (configurable via ARCH env, default sm_75)
 #   bzip2_fuzzer.conf  — companion config emitted by coqui-cc
-#   bzip2_fuzzer_cpu   — AFL++ instrumented CPU binary (symlink to nix store)
-#   seeds/             — initial seed corpus (symlink to nix store)
-#   dict/              — fuzzing dictionary (symlink to nix store)
+#   bzip2_fuzzer_cpu   — AFL++ instrumented CPU binary
+#   seeds/min.bz2      — minimal bzip2 stream (generated in-place if missing)
+#   .build/            — cached upstream source tree (libarchive/bzip2)
 #
-# Mirrors coqui's nix spec: the `bzip2` target in the legacy coqui codebase
+# No external dependencies beyond afl-clang-fast (from this repo), coqui-cc
+# (/usr/local/bin), git, and bzip2 (for generating the seed). Libbzip2 sources
+# are cloned from github.com/libarchive/bzip2 at tag bzip2-1.0.8.
 #
-# Note: the nix spec passes `--heap-size 524288` and `--batch-size 32768` to
-# coqui; coqui mode's coqui-cc does NOT accept those flags. The coqui mode runtime
-# derives heap at startup and reads batch size from AFL_COQUI_BATCH_SIZE.
+# Note: the legacy coqui nix spec passes `--heap-size 524288` and
+# `--batch-size 32768` to coqui; coqui mode's coqui-cc does NOT accept those
+# flags. The coqui mode runtime derives heap at startup and reads batch size
+# from AFL_COQUI_BATCH_SIZE.
+#
+# Overrides:
+#   ARCH          GPU compute capability (default sm_75)
+#   AFL_CC        path to afl-clang-fast (default: this repo's own afl-clang-fast)
+#   COQUI_CC      path to coqui-cc (default /usr/local/bin/coqui-cc)
+#   BZ2_CACHE     path to cache the cloned bzip2 sources (default .build/libarchive-bzip2-<short>)
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
-COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/coqui-bzip2-cpu"
-HARNESS_DIR="${COQUI_REPO}/harness/targets"
+# --- Config -----------------------------------------------------------------
+HARNESS_BASENAME="bzip2_fuzzer"
+HARNESS_SRC="${SCRIPT_DIR}/harness.c"
+ASSERT_STUB_SRC="${SCRIPT_DIR}/bz2_assert_stub.c"
 ARCH="${ARCH:-sm_75}"
-SLAB_POOL_SIZE=2147483648   # 2 GiB — from bzip2.nix
-STACK_SIZE=32768            # coqui-cc default (bzip2.nix does not override)
+STACK_SIZE=32768            # coqui-cc default (bzip2 target does not override)
+SLAB_POOL_SIZE=2147483648   # 2 GiB — bzip2 DState + allocations exceed 64KB heap
 
-echo "=== [1/4] Build AFL++ CPU binary via nix ==="
-# Idempotent: `nix build` is a no-op if the derivation is already realised.
-cd "${COQUI_REPO}"
-nix build '.#target-bzip2-aflplusplus' --out-link "${CPU_OUT_LINK}"
-cd "${SCRIPT_DIR}"
+# libarchive/bzip2 upstream pin (tag bzip2-1.0.8)
+BZ2_COMMIT="6a8690fc8d26c815e798c588f796eabe9d684cf0"
+BZ2_SHORT="${BZ2_COMMIT:0:8}"
+BZ2_URL="https://github.com/libarchive/bzip2.git"
 
-if [[ ! -x "${CPU_OUT_LINK}/bzip2_decompress_fuzzer" ]]; then
-  echo "ERROR: CPU binary not found at ${CPU_OUT_LINK}/bzip2_decompress_fuzzer" >&2
-  exit 1
+# Tools
+AFL_CC="${AFL_CC:-${SCRIPT_DIR}/../../../afl-clang-fast}"
+COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
+BZ2_CACHE="${BZ2_CACHE:-${SCRIPT_DIR}/.build/libarchive-bzip2-${BZ2_SHORT}}"
+
+# Sanitizers matching legacy coqui `sanitizers.default` (address + full UBSan).
+SANITIZE_FLAGS=(
+  "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
+  "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+  "-fno-stack-protector"
+)
+
+BZ2_SOURCES=(
+  "${BZ2_CACHE}/blocksort.c"
+  "${BZ2_CACHE}/huffman.c"
+  "${BZ2_CACHE}/crctable.c"
+  "${BZ2_CACHE}/randtable.c"
+  "${BZ2_CACHE}/compress.c"
+  "${BZ2_CACHE}/decompress.c"
+  "${BZ2_CACHE}/bzlib.c"
+)
+
+# --- Pre-flight -------------------------------------------------------------
+[[ -x "$AFL_CC" ]]   || { echo "ERROR: afl-clang-fast not found at $AFL_CC" >&2; exit 1; }
+[[ -x "$COQUI_CC" ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
+[[ -f "$HARNESS_SRC" ]] || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
+[[ -f "$ASSERT_STUB_SRC" ]] || { echo "ERROR: bz2_assert_stub.c missing at $ASSERT_STUB_SRC" >&2; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "ERROR: git not found in PATH" >&2; exit 1; }
+command -v bzip2 >/dev/null 2>&1 || { echo "ERROR: bzip2 not found in PATH (needed for seed)" >&2; exit 1; }
+
+# --- [1/4] Fetch upstream bzip2 sources -------------------------------------
+echo "=== [1/4] Fetch libarchive/bzip2 at pinned commit ==="
+mkdir -p "$(dirname "$BZ2_CACHE")"
+if [[ ! -f "${BZ2_CACHE}/bzlib.h" ]]; then
+  echo "  git clone $BZ2_URL -> $BZ2_CACHE"
+  rm -rf "$BZ2_CACHE"
+  git clone --quiet "$BZ2_URL" "$BZ2_CACHE"
+  git -C "$BZ2_CACHE" checkout --quiet "$BZ2_COMMIT"
 fi
+# Integrity check: required .c files must all exist.
+for src in "${BZ2_SOURCES[@]}" "${BZ2_CACHE}/bzlib.h"; do
+  [[ -f "$src" ]] || { echo "ERROR: missing $src after fetch" >&2; exit 1; }
+done
+echo "  bzip2 sources: $(wc -c <"${BZ2_CACHE}/bzlib.c") bytes in bzlib.c"
 
-echo "=== [2/4] Resolve libbzip2 source path ==="
-# The libarchive bzip2 tarball is the only `-source` derivation in the closure
-# of the CPU build. Avoids hardcoding a /nix/store hash.
-BZ2_SRC=$(nix-store -qR "${CPU_OUT_LINK}" | grep -E -- '-source$' | head -n1)
-if [[ -z "${BZ2_SRC}" || ! -f "${BZ2_SRC}/blocksort.c" ]]; then
-  echo "ERROR: could not resolve libbzip2 source (expected blocksort.c in ${BZ2_SRC:-<empty>})" >&2
-  exit 1
+# --- [2/4] Generate minimal seed --------------------------------------------
+echo "=== [2/4] Generate minimal bzip2 seed ==="
+mkdir -p "${SCRIPT_DIR}/seeds"
+if [[ ! -s "${SCRIPT_DIR}/seeds/min.bz2" ]]; then
+  printf 'a' | bzip2 -9 >"${SCRIPT_DIR}/seeds/min.bz2"
 fi
-echo "  libbzip2 source: ${BZ2_SRC}"
+echo "  seeds/min.bz2: $(wc -c <"${SCRIPT_DIR}/seeds/min.bz2") bytes"
 
-echo "=== [3/4] Build GPU cubin via coqui-cc ==="
-# Flags mirror the `bzip2` target in the legacy coqui codebase:
+# --- [3/4] Build AFL++ CPU binary -------------------------------------------
+echo "=== [3/4] Build AFL++ CPU binary with afl-clang-fast ==="
+CPU_OUT="${HARNESS_BASENAME}_cpu"
+"$AFL_CC" -O2 -g \
+  "${SANITIZE_FLAGS[@]}" \
+  -fsanitize=fuzzer \
+  -D BZ_NO_STDIO \
+  -I "$BZ2_CACHE" \
+  "${BZ2_SOURCES[@]}" \
+  "$ASSERT_STUB_SRC" \
+  "$HARNESS_SRC" \
+  -o "$CPU_OUT" \
+  -lm
+
+[[ -x "$CPU_OUT" ]] || { echo "ERROR: CPU binary not produced" >&2; exit 1; }
+
+# --- [4/4] Build GPU cubin via coqui-cc -------------------------------------
+echo "=== [4/4] Build GPU cubin via coqui-cc (flock-serialized) ==="
+# Flags mirror the legacy bzip2 target:
 #   -D BZ_NO_STDIO           — disable bzlib's stdio reliance
 #   -I <libbzip2 source>     — bzlib.h + bzlib_private.h
 #   --slab-pool-size 2 GiB   — bzip2 DState + allocations exceed 64KB heap
-# Source list matches the nix spec, except we use a local bz2_assert_stub.c
-# that routes bz_internal_error() to __coqui_trap() instead of libc abort()
+# Source list includes the in-tree bz2_assert_stub.c that routes
+# bz_internal_error() to __coqui_trap() instead of libc abort()
 # (ExternalSymbolGatekeeper rejects `abort` — only __coqui_*/__llvm_* pass).
-"${COQUI_CC}" \
+flock /tmp/coqui-cc.lock "${COQUI_CC}" \
   -arch "${ARCH}" \
   --stack-size "${STACK_SIZE}" \
   --slab-pool-size "${SLAB_POOL_SIZE}" \
   -D BZ_NO_STDIO \
-  -I "${BZ2_SRC}" \
-  "${BZ2_SRC}/blocksort.c" \
-  "${BZ2_SRC}/huffman.c" \
-  "${BZ2_SRC}/crctable.c" \
-  "${BZ2_SRC}/randtable.c" \
-  "${BZ2_SRC}/compress.c" \
-  "${BZ2_SRC}/decompress.c" \
-  "${BZ2_SRC}/bzlib.c" \
-  "${SCRIPT_DIR}/bz2_assert_stub.c" \
-  "${HARNESS_DIR}/bzip2_decompress_target.c" \
-  -o bzip2_fuzzer
+  -I "$BZ2_CACHE" \
+  "${BZ2_SOURCES[@]}" \
+  "$ASSERT_STUB_SRC" \
+  "$HARNESS_SRC" \
+  -o "$HARNESS_BASENAME"
 
-if [[ ! -f bzip2_fuzzer.cubin || ! -f bzip2_fuzzer.conf ]]; then
-  echo "ERROR: coqui-cc did not emit bzip2_fuzzer.cubin / bzip2_fuzzer.conf" >&2
-  exit 1
-fi
-
-echo "=== [4/4] Link CPU binary + seeds + dict ==="
-ln -sfn "${CPU_OUT_LINK}/bzip2_decompress_fuzzer" bzip2_fuzzer_cpu
-
-# Seeds: AFL reads its input dir with lstat() + S_ISREG, which fails for
-# symlinks. The nix `seeds/` dir itself is a real dir, but each seed inside
-# it is a symlink into /nix/store (`rf1s3acb...-bzip2-seeds`). Copy the
-# resolved files into a local seeds/ directory so AFL's S_ISREG check passes.
-rm -rf seeds
-mkdir -p seeds
-cp -L "${CPU_OUT_LINK}/seeds/"*.seed seeds/
-chmod u+rw seeds seeds/*.seed
-
-# Dict is a single file, fine as a symlink directory.
-ln -sfn "${CPU_OUT_LINK}/dict" dict
+[[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \
+  || { echo "ERROR: coqui-cc did not emit .cubin/.conf" >&2; exit 1; }
 
 echo
 echo "=== Build complete ==="
-ls -ld bzip2_fuzzer.cubin bzip2_fuzzer.conf bzip2_fuzzer_cpu seeds dict
-echo "  seeds/ contains $(ls seeds | wc -l) files"
+ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
+echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"
