@@ -50,6 +50,14 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runComplex(M);            /* rewrite C99 _Complex math -> __coqui_c* runtime calls */
     Changed |= coqui::runReloc(M);              /* break cyclic global init deps (NVPTX AsmPrinter can't handle) */
     Changed |= coqui::runStaticGlobals(M);
+    /* === task25: GlobalCtors block ===
+     * Run AFTER StaticGlobals so ctor function bodies see accessor calls
+     * for any pooled writable globals (StaticGlobals replaces instruction
+     * uses with __coqui_global_X() accessors before this pass walks
+     * @llvm.global_ctors). Run AFTER FuzzEntry so __coqui_fuzz_kernel
+     * exists for ensureGlobalInitCalled to attach to. */
+    Changed |= coqui::runGlobalCtors(M);
+    /* === end task25 === */
     Changed |= coqui::runMemoryLayout(M);
     Changed |= coqui::runCoverage(M);
     /* === task23: LineTrace block ===

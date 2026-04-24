@@ -53,6 +53,12 @@ bool runReloc(llvm::Module &M);
 bool runMath(llvm::Module &M);
 bool runComplex(llvm::Module &M);
 bool runStaticGlobals(llvm::Module &M);
+/* === task25: GlobalCtors block === */
+/* runGlobalCtors lowers @llvm.global_ctors into __coqui_global_init() and
+ * wires a call into __coqui_fuzz_kernel right before the user harness. No-op
+ * for modules without ctors (the runtime's weak fallback resolves cleanly). */
+bool runGlobalCtors(llvm::Module &M);
+/* === end task25 === */
 bool runMemoryLayout(llvm::Module &M);
 bool runCoverage(llvm::Module &M);
 bool runAsanGlobals(llvm::Module &M);
