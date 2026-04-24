@@ -8,6 +8,8 @@
  *      into global red zones via __coqui_asan_globals[] linear scan.
  *   2. RAUW allocators: __coqui_malloc  -> __coqui_asan_malloc
  *                       __coqui_free    -> __coqui_asan_free
+ *                       __coqui_calloc  -> __coqui_asan_calloc
+ *                       __coqui_realloc -> __coqui_asan_realloc
  *   3. Instrument loads/stores: insert __coqui_asan_check_load_N /
  *      __coqui_asan_check_store_N (N = 1/2/4/8) before each heap access.
  *
@@ -28,8 +30,10 @@
  * This is a known v1 simplification (conservative — may miss the last few
  * bytes of large unaligned accesses, but never over-reads the shadow).
  *
- * RAUW scope (v1): only __coqui_malloc and __coqui_free.  Calloc/realloc
- * are left for a follow-up task; they are rare in fuzz target code.
+ * RAUW scope: __coqui_malloc, __coqui_free, __coqui_calloc, __coqui_realloc.
+ * The ASan wrappers for calloc/realloc live in coqui_asan.c and layer on
+ * top of __coqui_asan_malloc / __coqui_asan_free so they participate in
+ * the same per-thread-heap → slab-pool → OOM-trap fall-through.
  *
  * Ported from /coqui/src/AsanTransform.cpp with LLVM 18 opaque-pointer
  * adjustments.
@@ -784,6 +788,8 @@ bool runAsan(Module &M) {
   static const char *kAsanInternal[] = {
       "__coqui_asan_malloc",
       "__coqui_asan_free",
+      "__coqui_asan_calloc",
+      "__coqui_asan_realloc",
       "__coqui_asan_check_fast_load_1",
       "__coqui_asan_check_fast_load_2",
       "__coqui_asan_check_fast_load_4",
@@ -839,9 +845,19 @@ bool runAsan(Module &M) {
   redirectInternalCalls("__coqui_free",   "__coqui_free_raw");
 
   bool AllocChanged = false;
-  AllocChanged |= rawReplace(M, "__coqui_malloc", "__coqui_asan_malloc");
-  AllocChanged |= rawReplace(M, "__coqui_free",   "__coqui_asan_free");
-  // __coqui_calloc / __coqui_realloc: left for a follow-up task (v1 scope).
+  AllocChanged |= rawReplace(M, "__coqui_malloc",  "__coqui_asan_malloc");
+  AllocChanged |= rawReplace(M, "__coqui_free",    "__coqui_asan_free");
+  // calloc/realloc: route user-code calls (Libc.cpp rewrote them from
+  // calloc/realloc → __coqui_calloc/__coqui_realloc) through ASan wrappers.
+  // The wrappers in coqui_asan.c only call __coqui_asan_malloc /
+  // __coqui_asan_free internally — neither __coqui_malloc nor __coqui_free
+  // appears in their bodies — so the kAsanInternal-scoped redirect above
+  // (__coqui_malloc → __coqui_malloc_raw) has nothing to touch inside
+  // them, and the bulk RAUW below has no chance to re-wrap their internal
+  // __coqui_asan_malloc call (RAUW only rewrites __coqui_malloc /
+  // __coqui_free / __coqui_calloc / __coqui_realloc sites).
+  AllocChanged |= rawReplace(M, "__coqui_calloc",  "__coqui_asan_calloc");
+  AllocChanged |= rawReplace(M, "__coqui_realloc", "__coqui_asan_realloc");
 
   return (LoadCount > 0 || StoreCount > 0 || AllocChanged);
 }

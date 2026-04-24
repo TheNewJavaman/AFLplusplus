@@ -717,6 +717,118 @@ void __coqui_asan_free(void *ptr) {
     __coqui_free(raw);
 }
 
+/* Internal byte-wise copy/set for the realloc/calloc paths.
+ * We do NOT call __coqui_memcpy / __coqui_memset via external decls because
+ * those live in coqui_libc.c and would be subject to ASan load/store
+ * instrumentation. Keeping these static local mirrors coqui_memory.c:150. */
+static void asan_memset_u8(void *dst, int c, unsigned long n) {
+    u8 *d = (u8 *)dst;
+    for (unsigned long i = 0; i < n; i++) d[i] = (u8)c;
+}
+
+static void asan_memcpy_u8(void *dst, const void *src, unsigned long n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (unsigned long i = 0; i < n; i++) d[i] = s[i];
+}
+
+/*
+ * __coqui_asan_calloc — calloc() with red zones.
+ *
+ * Computes nmemb * size with overflow-safe saturation (NULL on overflow),
+ * delegates to __coqui_asan_malloc so the result participates in the usual
+ * cross-tier fall-through (heap → slab → OOM trap), then zero-fills only
+ * the user region. Red zones stay poisoned (asan_*malloc already set them
+ * to ASAN_REDZONE_POISON for both tiers).
+ */
+void *__coqui_asan_calloc(unsigned long nmemb, unsigned long size) {
+    unsigned long total;
+    if (__builtin_umull_overflow(nmemb, size, &total))
+        return (void *)0;
+
+    void *ptr = __coqui_asan_malloc(total);
+    if (!ptr) return (void *)0;
+
+    /* Zero ONLY the user region — red zones were poisoned in the shadow
+     * by __coqui_asan_malloc and must remain untouched. */
+    asan_memset_u8(ptr, 0, total);
+    return ptr;
+}
+
+/*
+ * __coqui_asan_realloc — realloc() with cross-tier routing.
+ *
+ * Algorithm mirrors the reference coqui runtime and the shared-slab-pool
+ * design doc (search "ASan-Wrapped Slab Realloc"):
+ *
+ *   ptr == NULL          → __coqui_asan_malloc(new_size)
+ *   new_size == 0        → __coqui_asan_free(ptr); return NULL
+ *   ptr in heap range    → read old_size from [raw - BLOCK_HDR_SIZE] u32,
+ *                          subtract header + 2*red_zones; malloc + copy + free
+ *   ptr in slab range    → read old_size from [raw - 8] u32 (slab block size
+ *                          header sits 8B before raw, which is 24B before the
+ *                          user pointer), subtract header + 2*red_zones;
+ *                          malloc + copy + free
+ *   otherwise            → NULL (invalid pointer)
+ *
+ * No in-place extension: we always malloc-new + memcpy + free-old. This is
+ * simpler and lets the new allocation take whichever tier it can —
+ * matching the coqui reference semantics for cross-tier reallocs (see
+ * ~/coqui/runtime/coqui_fuzz_asan.c and
+ * ~/coqui/docs/superpowers/specs/2026-03-25-shared-slab-pool-allocator-design.md).
+ */
+void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
+    if (!ptr) return __coqui_asan_malloc(new_size);
+    if (new_size == 0) {
+        __coqui_asan_free(ptr);
+        return (void *)0;
+    }
+
+    u8 *user = (u8 *)ptr;
+    u8 *raw  = user - ASAN_LEFT_REDZONE;
+
+    unsigned long old_size;
+
+    /* Slab-pool routing first: the slab block header lives 8B before raw.
+     * Match __coqui_asan_free's slab-range check (see line 680). */
+    u8 *sp_lo = (u8 *)__coqui_slab_pool;
+    u8 *sp_hi = sp_lo + (__coqui_slab_pool ? __coqui_slab_pool_size : 0);
+    if (__coqui_slab_pool && __coqui_slab_pool_size &&
+        user >= sp_lo && user < sp_hi) {
+        /* Slab block layout handed out by __coqui_asan_slab_malloc /
+         * __coqui_asan_malloc's tier-2 fall-through:
+         *   [slab hdr: u32 = 8 + total_aligned] [left_rz (16)] [user] [right_rz (16)]
+         * where total_aligned = aligned(size) + LEFT_RZ + RIGHT_RZ is the
+         * total payload the slab allocator tracks (excluding its 8B header).
+         * So user_size_aligned = (blk - 8) - LEFT_RZ - RIGHT_RZ. */
+        u8 *slab_hdr = raw - 8;
+        if (slab_hdr < sp_lo || slab_hdr >= sp_hi) return (void *)0;
+        u32 blk = *(u32 *)slab_hdr;
+        if (blk < 8u + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE) return (void *)0;
+        old_size = (unsigned long)blk - 8u
+                   - ASAN_LEFT_REDZONE - ASAN_RIGHT_REDZONE;
+    } else {
+        /* Per-thread heap: mirror __coqui_asan_free's header read (line 709). */
+        u8 *block = raw - BLOCK_HDR_SIZE;
+        u8 *heap_lo = __coqui_heap_base();
+        u8 *heap_hi = heap_lo + __coqui_heap_size();
+        if (block < heap_lo || block >= heap_hi) return (void *)0;
+        u32 full_sz = *(u32 *)block;
+        if (full_sz < BLOCK_HDR_SIZE + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE)
+            return (void *)0;
+        old_size = (unsigned long)(full_sz - BLOCK_HDR_SIZE)
+                   - ASAN_LEFT_REDZONE - ASAN_RIGHT_REDZONE;
+    }
+
+    void *new_ptr = __coqui_asan_malloc(new_size);
+    if (!new_ptr) return (void *)0;
+
+    unsigned long copy_size = (old_size < new_size) ? old_size : new_size;
+    asan_memcpy_u8(new_ptr, ptr, copy_size);
+    __coqui_asan_free(ptr);
+    return new_ptr;
+}
+
 /* ===-------------------------------------------------------------------===
  * Slab-pool ASan wrappers
  *
