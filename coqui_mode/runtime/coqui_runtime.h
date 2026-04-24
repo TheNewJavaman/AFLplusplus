@@ -53,9 +53,14 @@ typedef struct coqui_status {
     u8  phase;
     u8  signal;        /* POSIX signal number or 0 */
     u8  asan_error;    /* non-zero if ASan check tripped */
-    u8  ubsan_fatal;   /* non-zero if non-recoverable UBSan (future) */
+    u8  ubsan_fatal;   /* non-zero if a non-recoverable UBSan check fired */
     u32 crash_sig;     /* FNV-1a hash of classified cov_map; 0 if not crashed */
-    u64 _reserved1;
+    u32 ubsan_error;   /* UBSan error code (0=none, 1=overflow, 2=div-zero,
+                          3=shift, 4=type-mismatch, 5=oob, 6=ptr-overflow,
+                          7=unreachable, 8=load-invalid, 9=float-cast,
+                          10=implicit-conv, 11=missing-return, 12=vla-bound,
+                          13=nonnull-arg, 14=nonnull-return, 15=dynamic-type) */
+    u32 _reserved1;
 } coqui_status_t;       /* 16 bytes */
 
 /* -- Device-side helpers (implemented in runtime .c files) -- */
