@@ -153,7 +153,16 @@ static void emitRelocInit(Module &M, const SmallVectorImpl<RelocEntry> &Relocs) 
    * Only one thread per warp needs to run this, but the stores are idempotent
    * so having every thread run them is correct (just redundant). A proper
    * "thread 0 only" guard would require reading laneid/ctaid, which isn't
-   * worth the code churn for at-most-a-dozen stores per kernel launch. */
+   * worth the code churn for at-most-a-dozen stores per kernel launch.
+   *
+   * Initializer order: this pass breaks CYCLIC dependencies only; non-cyclic
+   * initializers are unaffected. Within __coqui_reloc_init each store targets
+   * a different slot of a different global, so there are no RAW hazards —
+   * emit order doesn't matter. Values being stored are ConstantExprs
+   * (typically ptrtoint of a sibling global), which resolve at link time
+   * without reading any global's initializer at runtime. So when the kernel
+   * starts executing, all previously-cyclic slots hold their correct values
+   * regardless of the order the writes landed. */
   Function *Kernel = M.getFunction("__coqui_fuzz_kernel");
   if (Kernel && !Kernel->isDeclaration()) {
     BasicBlock &Entry = Kernel->getEntryBlock();

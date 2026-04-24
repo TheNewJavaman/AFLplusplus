@@ -22,8 +22,15 @@
 #   * coqui-cc does NOT accept --heap-size, --batch-size, --ignore-signal=,
 #     or -fsanitize=. The coqui mode runtime derives heap at startup and reads
 #     batch size from AFL_COQUI_BATCH_SIZE.
-#   * Sanitizers are not applied at the GPU build; coqui mode relies on AFL++
-#     (CPU) for crash verification.
+#   * Sanitizers on the GPU build are not selected via -fsanitize= at
+#     compile time. Instead:
+#       - ASan is instrumented by coqui_mode/passes/Asan.cpp (outlined
+#         fast-path helpers + heap shadow; enabled by default for every
+#         cubin this driver builds).
+#       - UBSan is NOT yet ported on the GPU side (no Ubsan.cpp pass).
+#         CPU crash verification via afl-fuzz catches the UBSan-class
+#         bugs post-hoc using the AFL++-instrumented CPU binary.
+#       - CFI, MSan, TSan: not applicable for this fuzz surface.
 
 set -euo pipefail
 

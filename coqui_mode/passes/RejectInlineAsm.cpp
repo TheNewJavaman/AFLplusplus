@@ -24,7 +24,19 @@ using namespace llvm;
 namespace coqui {
 
 static bool isBenign(StringRef asmStr, StringRef constraints) {
-  /* Empty or whitespace-only asm with memory clobber is a compiler barrier. */
+  /* Empty or whitespace-only asm with memory clobber is a compiler barrier
+   * — typically __asm__ volatile("" ::: "memory") used to prevent load/store
+   * reordering across the sequence point.
+   *
+   * Erasing it DOES remove the barrier. On NVPTX this is a safe approximation
+   * in practice: (a) our GPU fuzz targets are per-thread single-threaded with
+   * no CPU-style cache coherence concerns, (b) cross-thread ordering is the
+   * job of CUDA __threadfence / atomics (emitted as separate NVPTX intrinsics
+   * by clang, not as inline asm), (c) the barrier was almost always inserted
+   * by musl or libc headers for x86_64 semantics that don't apply on the
+   * device. If a future target DOES depend on a compile-time reorder barrier
+   * we'd need to either preserve it (lower to an `@llvm.memory.barrier` or a
+   * fence.sc NVPTX intrinsic) or hard-fail. So far none have. */
   std::string trimmed = asmStr.trim().str();
   if (trimmed.empty() && constraints.contains("memory")) return true;
   return false;

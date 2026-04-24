@@ -48,7 +48,7 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
 
 } // anonymous namespace
 
-extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+extern "C" PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {
     LLVM_PLUGIN_API_VERSION,
