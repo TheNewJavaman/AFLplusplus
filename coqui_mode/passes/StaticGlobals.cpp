@@ -246,8 +246,16 @@ bool runStaticGlobals(Module &M) {
 
   // ── Phase 2: Compute per-thread pool layout ────────────────────────────
   //
-  // Layout: [var0_padding][var0][var1_padding][var1]...
+  // Layout: [var0_padding][var0][red_zone][var1_padding][var1][red_zone]...
   // Each variable is placed at its natural alignment (minimum 8 bytes).
+  // After every variable a kAsanGlobalRedZone-byte trailing gap is reserved
+  // so runAsanGlobals can register { beg = pool + tid*stride + offset,
+  // user_size, total_size = user_size + kAsanGlobalRedZone } pool-kind
+  // descriptors without the next variable's alignment padding ever shrinking
+  // the gap to less than the shared red-zone constant. Alignment padding for
+  // the next entry is added on top of the red zone (never subtracted from it),
+  // so the gap between two adjacent pooled entries is at least
+  // kAsanGlobalRedZone bytes of dedicated poison space.
 
   uint64_t CurOffset = 0;
   for (auto &Info : Candidates) {
@@ -257,11 +265,17 @@ bool runStaticGlobals(Module &M) {
     CurOffset = alignTo(CurOffset, A);
     Info.Offset = CurOffset;
     CurOffset += Info.Size;
+    // Reserve the trailing red zone. Next entry's alignment padding is
+    // computed on top of this, so the red zone stays intact.
+    CurOffset += kAsanGlobalRedZone;
   }
+  // Round to 8 to keep the per-thread slab size 8-byte aligned for the
+  // cuMemAlloc / cuMemsetD8 path in afl-fuzz-coqui.c.
   uint64_t TotalSize = alignTo(CurOffset, 8);
 
   errs() << "[coqui-statics] pooling " << Candidates.size()
-         << " globals, " << TotalSize << " bytes/thread\n";
+         << " globals, " << TotalSize << " bytes/thread (red zone "
+         << kAsanGlobalRedZone << "B per entry)\n";
   for (const auto &Info : Candidates)
     errs() << "  " << Info.GV->getName() << ": " << Info.Size << "B @ +"
            << Info.Offset << "\n";
@@ -442,6 +456,46 @@ bool runStaticGlobals(Module &M) {
   SizeGlobal->setAlignment(Align(4));
 
   (void)SizeGlobal; // suppress unused-variable warning if asserts are off
+
+  // ── Phase 8: Emit ASan sidecar for pool entries ───────────────────────
+  //
+  // runAsanGlobals (which runs after us) reads these two globals and emits
+  // pool-kind descriptors { beg = NULL, user_size, total_size, pool_offset,
+  // pool_stride = per_thread_size } into the unified
+  // __coqui_asan_global_descriptors table. The runtime's asan_check_global()
+  // detects pool-kind descriptors (pool_stride > 0) and computes the real
+  // address as pool_base + tid * pool_stride + pool_offset for comparison.
+  //
+  // The sidecar is internal + constant so it can be DCE'd after consumption,
+  // but we keep it around — runAsanGlobals is the only consumer, and it
+  // explicitly erases the sidecar once it has lifted the entries into the
+  // unified descriptor table. The count global is emitted in case any
+  // downstream pass wants a quick no-array-walk way to gate sidecar lookup.
+  auto *PoolEntryTy = StructType::get(C, {I64Ty, I64Ty});
+  SmallVector<Constant *, 16> PoolEntries;
+  for (const auto &Info : Candidates) {
+    PoolEntries.push_back(ConstantStruct::get(
+        PoolEntryTy,
+        {ConstantInt::get(I64Ty, Info.Offset),
+         ConstantInt::get(I64Ty, Info.Size)}));
+  }
+  auto *PoolArrTy = ArrayType::get(PoolEntryTy, PoolEntries.size());
+  auto *PoolArr = new GlobalVariable(
+      M, PoolArrTy, /*isConstant=*/true,
+      GlobalValue::InternalLinkage,
+      ConstantArray::get(PoolArrTy, PoolEntries),
+      kAsanPoolEntriesSymbol);
+  PoolArr->setAlignment(Align(8));
+
+  auto *PoolCountG = new GlobalVariable(
+      M, I64Ty, /*isConstant=*/true,
+      GlobalValue::InternalLinkage,
+      ConstantInt::get(I64Ty, PoolEntries.size()),
+      kAsanPoolEntryCountSymbol);
+  PoolCountG->setAlignment(Align(8));
+
+  (void)PoolArr;
+  (void)PoolCountG;
 
   return true;
 }
