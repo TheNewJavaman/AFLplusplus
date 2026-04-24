@@ -1,19 +1,18 @@
-# Build artifacts
-cjson_fuzzer
-cjson_fuzzer.cubin
-cjson_fuzzer.conf
-cjson_fuzzer.ptx
-.cjson_fuzzer.build/
-
-# Symlinks pointing into /tmp/coqui-cjson-cpu or /nix/store
+# Build outputs
+*.cubin
+*.conf
 cjson_fuzzer_cpu
-seeds
-dict
 
-# afl-fuzz runtime output
-out/
-out-*/
+# Upstream source cache (fetched by build.sh at pinned commit)
+/.build/
 
-# Editor/OS junk
-*.swp
-.DS_Store
+# coqui-cc intermediate build dir (.harness.build/)
+/.*_fuzzer.build/
+
+# afl-fuzz output
+/out/
+
+# Bench artifacts / logs
+build.log
+*.log
+/seed_min/
