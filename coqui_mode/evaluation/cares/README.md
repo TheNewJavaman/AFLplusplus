@@ -1,103 +1,70 @@
-# coqui mode evaluation target: `cares`
+# coqui mode cares evaluation target
 
-Fuzzes the [c-ares](https://c-ares.org/) DNS parser (v1.34.4) via the
-oss-fuzz-adapted `ares_dns_parse` harness, running the hot parsing code
-on the GPU under coqui mode's `coqui_mode`.
+Adapts the [c-ares](https://c-ares.org/) DNS parser's oss-fuzz-style
+`ares_dns_parse` harness so it can be driven with coqui mode's
+`afl-fuzz --coqui`.
 
-Mirrors the `cares` target in the legacy coqui nix codebase — same
-source whitelist, same config-header generation, same
-`--slab-pool-size 10 GiB` — but self-contained: no `nix`/`COQUI_REPO`
-dependency, sources fetched directly from GitHub at a pinned tag.
+- Upstream: https://github.com/c-ares/c-ares (pinned to tag `v1.34.4`)
+- Harness: `harness.c` (libFuzzer-style; caps input size to 512 bytes
+  and total RR count to 32 to bound DNS name-decompression blowup)
 
-## Build
-
-```
-./build.sh
-```
-
-Steps performed:
-
-1. Fetches `c-ares/c-ares` at tag `v1.34.4` via `git clone --depth 1`
-   into `.build/c-ares-c-ares-v1.34.4/` (cached — subsequent runs skip
-   the clone).
-2. Generates `generated/ares_build.h` and `generated/ares_config.h`
-   inline via heredoc (normally produced by c-ares's autotools/cmake).
-3. Compiles each whitelisted `.c` to `.o` with `afl-clang-fast`
-   (`-fsanitize=address` + full UBSan), then links with
-   `-fsanitize=fuzzer` to produce `cares_parse_reply_fuzzer_cpu`.
-   Per-file compile avoids afl-cc's MAX_PARAMS_NUM limit.
-4. Invokes `coqui-cc -arch sm_75 --slab-pool-size 10737418240` over
-   the library whitelist + harness + `cares_stubs.c` to produce
-   `cares_parse_reply_fuzzer.cubin` + `.conf`. Serialized via
-   `flock /tmp/coqui-cc.lock` to avoid ptxas OOM when multiple
-   targets build concurrently.
-
-### Build environment overrides
-
-- `ARCH` — GPU compute capability (default `sm_75`)
-- `AFL_CLANG_FAST` — path to `afl-clang-fast`
-  (default `../../../afl-clang-fast` relative to this directory).
-  **Do not use `AFL_CC` as the override name** — afl-cc reserves that
-  env var to override its backing clang; setting it to afl-clang-fast
-  causes afl-cc to recursively re-exec until `MAX_PARAMS_NUM` is hit.
-- `COQUI_CC` — path to `coqui-cc` (default `/usr/local/bin/coqui-cc`)
-- `CARES_CACHE` — where to cache the cloned c-ares source
-  (default `.build/c-ares-c-ares-v1.34.4`)
-
-## Fuzz
+## Build / run
 
 ```
-./fuzz.sh
+./build.sh   # fetches c-ares + builds .cubin + CPU binary
+./fuzz.sh    # prints launch commands for Main/Secondary/Coqui
 ```
 
-Prints suggested `afl-fuzz` commands (Main / Secondary / Coqui). Pick
-one per terminal and export the recommended env vars:
+`build.sh` is self-contained: no external dependencies beyond
+`afl-clang-fast` (this repo) and `coqui-cc` (at `/usr/local/bin`). It
+clones c-ares from GitHub into `.build/`, synthesizes
+`ares_build.h` / `ares_config.h` inline (normally produced by c-ares's
+autotools/cmake), compiles the CPU binary with this repo's own
+`afl-clang-fast` (per-TU to avoid afl-cc's `MAX_PARAMS_NUM` cap), and
+builds the GPU cubin via `coqui-cc` under a `/tmp/coqui-cc.lock` flock
+so ptxas can serialize with any parallel target builds.
 
-```
-AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
-AFL_SKIP_CPUFREQ=1
-AFL_SKIP_BIN_CHECK=1
-AFL_NO_UI=1
-AFL_COQUI_CUBIN=$PWD/cares_parse_reply_fuzzer.cubin
-AFL_COQUI_DEVICE=$AFL_COQUI_DEVICE   # 0..3
-```
+## Layout
 
-## Target-specific quirks
+- `build.sh` / `fuzz.sh` — entry points (set -euo pipefail).
+- `harness.c` — in-tree libFuzzer-style `ares_dns_parse` harness.
+- `cares_stubs.c` — GPU-side stubs for the DNS-only source whitelist
+  (networking paths the parser references but never calls; also
+  `strcasecmp`/`strncasecmp`/`gettimeofday` on GPU — CPU build passes
+  `-DCOQUI_CPU` to skip).
+- `seeds/min.dns` — single minimal 12-byte DNS header.
+- `.gitignore` — excludes build artifacts + `.build/` cache +
+  `generated/`.
+- `.build/` (ignored) — cached c-ares source clone + per-TU `.o` files.
+- `generated/` (ignored) — `ares_build.h`, `ares_config.h` synthesized
+  by `build.sh`.
+- After a successful build:
+  - `cares_parse_reply_fuzzer.cubin`, `cares_parse_reply_fuzzer.conf`
+    (from `coqui-cc`)
+  - `cares_parse_reply_fuzzer_cpu` (AFL++-instrumented binary)
+  - `out/` — created by `fuzz.sh`; AFL output dir
 
-- **Stack size**: coqui-cc default (32768) is sufficient; not overridden.
-- **Slab pool = 10 GiB**: DNS name-decompression can blow up heap via
-  crafted pointer loops. The harness caps input size to 512 bytes and
-  total RR count to 32 to keep this bounded.
-- **Sanitizers**: ASan + full UBSan (matches
-  `nix/cpu-sanitizer-flags.nix` `sanitizers.default`).
-- **`cares_stubs.c`**: committed in-tree. Provides GPU-side stubs for
-  networking paths the parser references but the DNS-only whitelist
-  never calls. Also provides `strcasecmp`/`strncasecmp`/`gettimeofday`
-  on GPU (not on CPU — CPU build passes `-DCOQUI_CPU` to skip).
-- **ptxas resource use is unusually high.** The DNS record-accessor
-  code generates a large switch table, making ptxas both CPU- and
-  memory-hungry. Concurrent cubin builds will OOM the box, which is
-  why step 4 is serialized via `flock /tmp/coqui-cc.lock`.
+## Notes
 
-## Files
-
-- `build.sh` — self-contained build (no nix).
-- `fuzz.sh` — workspace prep + suggested launch commands.
-- `harness.c` — oss-fuzz-adapted `ares_dns_parse` harness (in-tree).
-- `cares_stubs.c` — GPU stubs for excluded source files (in-tree).
-- `seeds/min.dns` — single 12-byte minimal DNS header.
-- `.gitignore` — excludes `.build/`, `generated/`, cubin/conf,
-  CPU binary, `out/`, logs.
-
-After a successful build the directory also contains:
-
-```
-.build/c-ares-c-ares-v1.34.4/         cloned upstream source
-.build/cpu-obj/                       per-source .o files
-.cares_parse_reply_fuzzer.build/      coqui-cc intermediate bitcode
-generated/ares_build.h                generated config header
-generated/ares_config.h               generated config header
-cares_parse_reply_fuzzer_cpu          AFL++ instrumented CPU binary
-cares_parse_reply_fuzzer.cubin        GPU kernel
-cares_parse_reply_fuzzer.conf         runtime config for the cubin
-```
+- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
+  Override with `ARCH=sm_XX ./build.sh`.
+- Stack size: coqui-cc default (32768) — not overridden.
+- `--slab-pool-size 10737418240` (10 GiB) — DNS name-decompression can
+  blow up heap via crafted pointer loops. The harness caps input to
+  512 bytes and RR count to 32 to keep this bounded; the slab pool
+  absorbs worst-case allocations.
+- Sanitizers (CPU): full ASan + UBSan set. GPU build drops
+  `-fsanitize=…` because `coqui-cc` does not accept those flags
+  (device-side ASan is injected by `CoquiPassPlugin.so`).
+- **Do not use `AFL_CC` as the override name.** `AFL_CLANG_FAST` is
+  the env var for overriding `afl-clang-fast` here. `afl-cc` reserves
+  `AFL_CC` to override its backing clang; setting it to
+  `afl-clang-fast` causes afl-cc to recursively re-exec until
+  `MAX_PARAMS_NUM` is hit.
+- ptxas resource use is unusually high. The DNS record-accessor code
+  generates a large switch table. Concurrent cubin builds will OOM
+  the box — `build.sh` uses `flock /tmp/coqui-cc.lock`.
+- `fuzz.sh` sets `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`,
+  `AFL_SKIP_CPUFREQ=1`, `AFL_SKIP_BIN_CHECK=1`, `AFL_NO_UI=1` per the
+  project convention; override by exporting them yourself. GPU device
+  index is controlled by `AFL_COQUI_DEVICE` (default 0).
