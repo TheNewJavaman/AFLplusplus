@@ -105,7 +105,7 @@ packVariadicArgs(IRBuilder<> &Builder, CallBase *CI, unsigned VarArgStart) {
       else
         Val64 = Builder.CreateTrunc(Arg, I64Ty);
     } else {
-      errs() << "[coqui] WARNING: sprintf variadic argument of type "
+      errs() << "[coqui-sprintf] warning: sprintf variadic argument of type "
              << *Arg->getType()
              << " replaced with zero (unsupported on NVPTX)\n";
       Val64 = ConstantInt::get(I64Ty, 0);
@@ -164,7 +164,7 @@ static bool rewriteVariadicCalls(Module &M, const char *OldName,
   if (CallSites.empty())
     return false;
 
-  errs() << "[coqui] Rewriting " << CallSites.size() << " calls to "
+  errs() << "[coqui-sprintf] rewriting " << CallSites.size() << " calls to "
          << OldName << " -> " << ImplName << "\n";
 
   for (CallBase *CB : CallSites) {
@@ -269,7 +269,7 @@ static bool rewriteFortifiedWrappers(Module &M) {
     if (CallSites.empty())
       continue;
 
-    errs() << "[coqui] Rewriting " << CallSites.size()
+    errs() << "[coqui-sprintf] rewriting " << CallSites.size()
            << " fortified calls via " << Wrapper->getName() << " -> "
            << ImplName << "\n";
 

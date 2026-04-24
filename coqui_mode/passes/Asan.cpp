@@ -255,7 +255,7 @@ static bool rawReplace(Module &M, StringRef OldName, StringRef NewName) {
   // Remove the old declaration so it doesn't linger as an unused symbol.
   OldF->eraseFromParent();
 
-  errs() << "[coqui-asan] RAUW " << OldName << " -> " << NewName << "\n";
+  errs() << "[coqui-asan] rauw " << OldName << " -> " << NewName << "\n";
   return true;
 }
 
@@ -404,7 +404,7 @@ bool runAsan(Module &M) {
   }
 
   if (LoadCount > 0 || StoreCount > 0)
-    errs() << "[coqui-asan] Instrumented " << LoadCount << " load(s) and "
+    errs() << "[coqui-asan] instrumented " << LoadCount << " load(s) and "
            << StoreCount << " store(s) (" << SkipCount << " skipped, "
            << (LoadCount + StoreCount) << " via outlined fast path)\n";
 
