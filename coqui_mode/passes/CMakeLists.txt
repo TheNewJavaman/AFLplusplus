@@ -27,6 +27,7 @@ set(COQUI_PASS_SOURCES
     Math.cpp
     Complex.cpp
     StaticGlobals.cpp
+    GlobalCtors.cpp
     MemoryLayout.cpp
     Coverage.cpp
     Asan.cpp
