@@ -110,8 +110,96 @@ bool runFuzzEntry(Module &M) {
       Constant::getNullValue(i8p), "__coqui_status_array");
   }
 
+  /* 5b. Slab infrastructure — only emitted when the runtime module exports
+   *     __coqui_slab_setup. The build_coqui_support.sh script always links
+   *     coqui_slab.c into the runtime bitcode, so this is effectively a
+   *     "slab runtime present" gate. Without the gate, targets that haven't
+   *     been rebuilt with the new runtime would fail to find the symbol.
+   *
+   *     All 13 buckets share a single 104-byte __shared__ strip per block
+   *     (13 * 8B = 104). The init runs only on threadIdx.x == 0 followed by
+   *     a __syncthreads() barrier so every thread in the block sees the
+   *     zeroed buckets before the first malloc.
+   */
+  bool SlabEnabled = M.getFunction("__coqui_slab_setup") != nullptr;
+  if (SlabEnabled) {
+    /* __shared__ bucket strip (addrspace 3). 13 buckets * 8B = 104B. */
+    ArrayType *BucketArrayTy = ArrayType::get(i8, 13 * 8);
+    GlobalVariable *SharedBuckets =
+        M.getGlobalVariable("__coqui_slab_shared_buckets", true);
+    if (!SharedBuckets) {
+      SharedBuckets = new GlobalVariable(
+          M, BucketArrayTy, /*isConstant=*/false,
+          GlobalValue::ExternalLinkage,
+          UndefValue::get(BucketArrayTy),
+          "__coqui_slab_shared_buckets",
+          /*InsertBefore=*/nullptr,
+          GlobalValue::NotThreadLocal,
+          /*AddressSpace=*/3);
+    }
+    SharedBuckets->setAlignment(Align(8));
+
+    /* __shared__ per-block allocation counter (addrspace 3). 4B. */
+    GlobalVariable *SharedBlockNext =
+        M.getGlobalVariable("__coqui_slab_shared_block_next", true);
+    if (!SharedBlockNext) {
+      SharedBlockNext = new GlobalVariable(
+          M, i32, /*isConstant=*/false,
+          GlobalValue::ExternalLinkage,
+          UndefValue::get(i32),
+          "__coqui_slab_shared_block_next",
+          /*InsertBefore=*/nullptr,
+          GlobalValue::NotThreadLocal,
+          /*AddressSpace=*/3);
+    }
+    SharedBlockNext->setAlignment(Align(4));
+
+    /* __coqui_slab_bucket_base() — returns a generic-space pointer to the
+     * per-block shared bucket strip. noinline prevents the NVPTX backend
+     * from constant-folding the addrspacecast across blocks. The strip is
+     * per-block via the .shared memory semantics, not per-call.
+     *
+     * The runtime's coqui_slab.c declares this `extern` so it already
+     * exists as a declaration at pass time. We attach a body if it doesn't
+     * have one yet; callers within the runtime resolve to our definition. */
+    {
+      FunctionType *FnTy = FunctionType::get(i8p, false);
+      Function *F = cast<Function>(
+          M.getOrInsertFunction("__coqui_slab_bucket_base", FnTy).getCallee());
+      if (F->isDeclaration()) {
+        F->setLinkage(GlobalValue::InternalLinkage);
+        F->addFnAttr(Attribute::NoInline);
+        F->setDoesNotThrow();
+        BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+        IRBuilder<> B(BB);
+        B.CreateRet(B.CreateAddrSpaceCast(SharedBuckets, i8p, "buckets_gen"));
+      }
+    }
+
+    /* __coqui_slab_block_next() — same pattern for the per-block counter. */
+    {
+      FunctionType *FnTy = FunctionType::get(i8p, false);
+      Function *F = cast<Function>(
+          M.getOrInsertFunction("__coqui_slab_block_next", FnTy).getCallee());
+      if (F->isDeclaration()) {
+        F->setLinkage(GlobalValue::InternalLinkage);
+        F->addFnAttr(Attribute::NoInline);
+        F->setDoesNotThrow();
+        BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+        IRBuilder<> B(BB);
+        B.CreateRet(B.CreateAddrSpaceCast(SharedBlockNext, i8p, "block_next_gen"));
+      }
+    }
+  }
+
   /* 6. Emit kernel body */
   BasicBlock *EntryBB = BasicBlock::Create(C, "entry", Kernel);
+  BasicBlock *SlabInitBB = SlabEnabled
+      ? BasicBlock::Create(C, "slab_init", Kernel)
+      : nullptr;
+  BasicBlock *SlabBarrierBB = SlabEnabled
+      ? BasicBlock::Create(C, "slab_barrier", Kernel)
+      : nullptr;
   BasicBlock *RunBB   = BasicBlock::Create(C, "run",   Kernel);
   BasicBlock *ExitBB  = BasicBlock::Create(C, "exit",  Kernel);
 
@@ -120,7 +208,45 @@ bool runFuzzEntry(Module &M) {
   /* Store status pointer into global so runtime can find it */
   Builder.CreateStore(statusArg, StatusArrayPtr);
 
-  /* tid = __coqui_fuzz_tid() */
+  if (SlabEnabled) {
+    /* Slab setup: every thread calls it (idempotent; writes trivially
+     * idempotent globals — ctrl_slabs is the same value for all threads
+     * and the asan register call sets two function pointers). Do this
+     * BEFORE the barrier so __coqui_asan_register_slab has run before
+     * any ASan heap allocation hits the slab fall-through path. */
+    FunctionCallee SlabSetup =
+        M.getOrInsertFunction("__coqui_slab_setup", VoidNoArg);
+    Builder.CreateCall(SlabSetup, {});
+
+    /* if (threadIdx.x == 0) __coqui_slab_init_block() */
+    FunctionCallee TidXFn = M.getOrInsertFunction(
+        "llvm.nvvm.read.ptx.sreg.tid.x",
+        FunctionType::get(i32, false));
+    Value *TidX = Builder.CreateCall(TidXFn, {}, "tidx");
+    Value *IsT0 = Builder.CreateICmpEQ(TidX, ConstantInt::get(i32, 0), "is_t0");
+    Builder.CreateCondBr(IsT0, SlabInitBB, SlabBarrierBB);
+
+    Builder.SetInsertPoint(SlabInitBB);
+    FunctionCallee SlabInit =
+        M.getOrInsertFunction("__coqui_slab_init_block", VoidNoArg);
+    Builder.CreateCall(SlabInit, {});
+    Builder.CreateBr(SlabBarrierBB);
+
+    /* __syncthreads() on the merge block. All 128 threads per block must
+     * reach this barrier (see 2026-03-25-shared-slab-pool-allocator-design.md
+     * §"Bucket Initialization and Barrier Placement") — placed BEFORE the
+     * per-thread len==0 early-exit so partial-block exits don't deadlock. */
+    Builder.SetInsertPoint(SlabBarrierBB);
+    FunctionCallee Barrier =
+        M.getOrInsertFunction("llvm.nvvm.barrier0", VoidNoArg);
+    Builder.CreateCall(Barrier, {});
+  }
+
+  /* tid = __coqui_fuzz_tid(). When slab init ran, IRBuilder is still
+   * pointing at SlabBarrierBB (post-syncthreads); when it didn't, we're
+   * in EntryBB. Either way, all threads converge to this point so the
+   * len==0 early-exit runs AFTER the syncthreads barrier — avoiding the
+   * partial-block-exit deadlock documented in the slab design spec. */
   Value *tid = Builder.CreateCall(GetTid, {}, "tid");
 
   /* len = lens[tid]  — GEP into i32 array at index tid */

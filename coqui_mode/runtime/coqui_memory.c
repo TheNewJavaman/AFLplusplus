@@ -68,10 +68,12 @@ void *__coqui_malloc_raw(unsigned long size) {
         cur = *prev_next;
     }
 
-    /* Bump allocate */
+    /* Bump allocate. On exhaustion, return NULL -- callers (asan_malloc,
+     * calloc, realloc) handle NULL by falling through to the shared slab
+     * pool (if configured) or stamping trap_reason = COQUI_TRAP_OOM. The
+     * previous behavior (trap here) blocked slab fall-through entirely. */
     u32 heap_sz = __coqui_heap_size();
     if (hdr->bump_top + need > heap_sz) {
-        __coqui_trap();   /* OOM: trap per spec §4.6 */
         return (void *)0;
     }
 
@@ -81,8 +83,30 @@ void *__coqui_malloc_raw(unsigned long size) {
     return block + BLOCK_HDR_SIZE;
 }
 
+/* Slab pool globals -- defined in coqui_slab.c when linked; weak decls
+ * here so the raw heap free can route slab-pool pointers to the slab
+ * free path without hard-depending on the slab runtime being linked.
+ * When the slab runtime is absent, __coqui_slab_pool stays NULL and the
+ * range check falls through to the normal heap path. */
+extern char *__coqui_slab_pool __attribute__((weak));
+extern unsigned long __coqui_slab_pool_size __attribute__((weak));
+__attribute__((weak)) void __coqui_slab_free(void *ptr);
+
 void __coqui_free_raw(void *ptr) {
     if (!ptr) return;
+
+    /* Route slab-pool pointers to the slab free path. The range check
+     * precedes the heap-header dereference so we never scribble over
+     * a slab pointer's first 8 bytes treating them as the heap block
+     * header. */
+    if (__coqui_slab_pool && __coqui_slab_pool_size) {
+        u8 *sp_lo = (u8 *)__coqui_slab_pool;
+        u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
+        if ((u8 *)ptr >= sp_lo && (u8 *)ptr < sp_hi) {
+            __coqui_slab_free(ptr);
+            return;
+        }
+    }
 
     u8 *block = (u8 *)ptr - BLOCK_HDR_SIZE;
 
@@ -146,6 +170,31 @@ void *__coqui_calloc(unsigned long nmemb, unsigned long size) {
 void *__coqui_realloc(void *ptr, unsigned long size) {
     if (!ptr) return __coqui_malloc(size);
     if (size == 0) { __coqui_free(ptr); return (void *)0; }
+
+    /* Slab-pool pointers always take the malloc+copy+free path (no in-place
+     * shrink). We cannot safely read a slab allocation's original size from
+     * the caller's input buffer: the 8-byte header is BEFORE ptr (at ptr-8),
+     * and the slab free path handles the range check itself. This is also
+     * how the legacy coqui realloc routes cross-tier reallocs (see
+     * runtime/coqui_fuzz_asan.c). */
+    if (__coqui_slab_pool && __coqui_slab_pool_size) {
+        u8 *sp_lo = (u8 *)__coqui_slab_pool;
+        u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
+        if ((u8 *)ptr >= sp_lo && (u8 *)ptr < sp_hi) {
+            /* Slab blocks store [size:u32][next:u64] with user data at
+             * block+8 (see coqui_slab.c). We read the stored block size
+             * and subtract the 8B header to get the user-visible size. */
+            u8 *sb = (u8 *)ptr - 8;
+            u32 old_block = *(u32 *)sb;
+            u32 old_size = (old_block > 8u) ? (old_block - 8u) : 0u;
+            unsigned long copy = (old_size < size) ? old_size : (u32)size;
+            void *new_ptr = __coqui_malloc(size);
+            if (!new_ptr) return (void *)0;
+            memcpy_u8(new_ptr, ptr, copy);
+            __coqui_free(ptr);
+            return new_ptr;
+        }
+    }
 
     u8 *block = (u8 *)ptr - BLOCK_HDR_SIZE;
     u32 old_size = *(u32 *)block - BLOCK_HDR_SIZE;

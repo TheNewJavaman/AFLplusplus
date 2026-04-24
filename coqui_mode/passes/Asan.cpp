@@ -185,6 +185,8 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
 
   BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", F);
   BasicBlock *ShadowBB = BasicBlock::Create(Ctx, "shadow", F);
+  BasicBlock *SlabCheckBB = BasicBlock::Create(Ctx, "slab_check", F);
+  BasicBlock *SlabShadowBB = BasicBlock::Create(Ctx, "slab_shadow", F);
   BasicBlock *SlowBB = BasicBlock::Create(Ctx, "slow", F);
   BasicBlock *OkBB = BasicBlock::Create(Ctx, "ok", F);
 
@@ -192,12 +194,11 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   MDNode *CleanW = createBranchWeightMD(Ctx, 99, 1);
 
   // --- entry: range check ---
-  // Previously: out-of-heap returned clean via OkBB. Now we defer to
-  // SlowBB so globals (which live outside the per-thread heap) get
-  // checked against the descriptor table runAsanGlobals registered.
-  // This adds a call cost to out-of-heap accesses but they're rare in
-  // practice (stack/global accesses already carry their own skip at
-  // instrumentation time in the main runAsan loop).
+  // Tier 1 (per-thread heap) branches to ShadowBB on hit; miss falls
+  // through to the slab check before finally deferring to the slow path
+  // for global descriptor matching. The slab tier is cheap enough to
+  // emit inline (two loads + one compare + one load) that it pays back
+  // over the slow-path call in realistic workloads.
   IRBuilder<> B(EntryBB);
   Value *HeapBaseI64 = F->getArg(1);
   Value *ShadowBaseI64 = F->getArg(2);
@@ -206,10 +207,10 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Value *AddrI64 = B.CreatePtrToInt(F->getArg(0), I64Ty, "addr.i64");
   Value *Rel = B.CreateSub(AddrI64, HeapBaseI64, "rel");
   Value *InHeap = B.CreateICmpULT(Rel, Usable, "inheap");
-  auto *HeapBr = B.CreateCondBr(InHeap, ShadowBB, SlowBB);
+  auto *HeapBr = B.CreateCondBr(InHeap, ShadowBB, SlabCheckBB);
   HeapBr->setMetadata(LLVMContext::MD_prof, InHeapW);
 
-  // --- shadow: load shadow byte ---
+  // --- shadow: load tier-1 heap shadow byte ---
   B.SetInsertPoint(ShadowBB);
   Value *ShadowIdx = B.CreateLShr(Rel, ConstantInt::get(I64Ty, 3), "sidx");
   Value *ShadowAddrI64 = B.CreateAdd(ShadowBaseI64, ShadowIdx, "saddr.i64");
@@ -218,6 +219,63 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Value *Clean = B.CreateICmpEQ(ShadowByte, ConstantInt::get(I8Ty, 0), "clean");
   auto *CleanBr = B.CreateCondBr(Clean, OkBB, SlowBB);
   CleanBr->setMetadata(LLVMContext::MD_prof, CleanW);
+
+  // --- slab_check: tier-2 range check against the shared slab pool ---
+  // The runtime declares the three slab globals (pool ptr, pool size,
+  // shadow ptr) unconditionally. On non-slab targets they stay NULL/0 so
+  // ULT(addr - 0, 0) is trivially false and this block falls through to
+  // SlowBB — zero functional change vs. the pre-slab helper. With a slab
+  // linked, an in-range access checks the slab shadow byte in the next
+  // block; out-of-range accesses defer to the slow path.
+  B.SetInsertPoint(SlabCheckBB);
+  GlobalVariable *SlabPoolGV = M.getGlobalVariable("__coqui_slab_pool", true);
+  if (!SlabPoolGV) {
+    SlabPoolGV = new GlobalVariable(
+        M, PtrTy, /*isConstant=*/false, GlobalValue::ExternalLinkage,
+        Constant::getNullValue(PtrTy), "__coqui_slab_pool");
+  }
+  GlobalVariable *SlabPoolSizeGV =
+      M.getGlobalVariable("__coqui_slab_pool_size", true);
+  if (!SlabPoolSizeGV) {
+    SlabPoolSizeGV = new GlobalVariable(
+        M, I64Ty, /*isConstant=*/false, GlobalValue::ExternalLinkage,
+        ConstantInt::get(I64Ty, 0), "__coqui_slab_pool_size");
+  }
+  GlobalVariable *SlabShadowGV =
+      M.getGlobalVariable("__coqui_slab_shadow", true);
+  if (!SlabShadowGV) {
+    SlabShadowGV = new GlobalVariable(
+        M, PtrTy, /*isConstant=*/false, GlobalValue::ExternalLinkage,
+        Constant::getNullValue(PtrTy), "__coqui_slab_shadow");
+  }
+  Value *SlabBasePtr = B.CreateLoad(PtrTy, SlabPoolGV, "slab_base");
+  Value *SlabBaseI64 = B.CreatePtrToInt(SlabBasePtr, I64Ty, "slab_base.i64");
+  Value *SlabSize = B.CreateLoad(I64Ty, SlabPoolSizeGV, "slab_size");
+  Value *SlabRel = B.CreateSub(AddrI64, SlabBaseI64, "slab_rel");
+  Value *InSlab = B.CreateICmpULT(SlabRel, SlabSize, "inslab");
+  // 5/95 branch weight: most accesses are to the per-thread heap, so the
+  // slab check is mostly the fall-through path to SlowBB.
+  auto *SlabBr = B.CreateCondBr(InSlab, SlabShadowBB, SlowBB);
+  SlabBr->setMetadata(LLVMContext::MD_prof,
+                      createBranchWeightMD(Ctx, 5, 95));
+
+  // --- slab_shadow: check slab shadow byte ---
+  B.SetInsertPoint(SlabShadowBB);
+  Value *SlabShadowBase = B.CreateLoad(PtrTy, SlabShadowGV, "slab_shadow_base");
+  Value *SlabShadowBaseI64 =
+      B.CreatePtrToInt(SlabShadowBase, I64Ty, "slab_shadow_base.i64");
+  Value *SlabShadowIdx =
+      B.CreateLShr(SlabRel, ConstantInt::get(I64Ty, 3), "slab_sidx");
+  Value *SlabShadowAddrI64 =
+      B.CreateAdd(SlabShadowBaseI64, SlabShadowIdx, "slab_saddr.i64");
+  Value *SlabShadowPtr =
+      B.CreateIntToPtr(SlabShadowAddrI64, PtrTy, "slab_sptr");
+  Value *SlabShadowByte =
+      B.CreateLoad(I8Ty, SlabShadowPtr, "slab_sbyte");
+  Value *SlabClean =
+      B.CreateICmpEQ(SlabShadowByte, ConstantInt::get(I8Ty, 0), "slab_clean");
+  auto *SlabCleanBr = B.CreateCondBr(SlabClean, OkBB, SlowBB);
+  SlabCleanBr->setMetadata(LLVMContext::MD_prof, CleanW);
 
   // --- slow: call slowpath (size baked into slowpath name) ---
   B.SetInsertPoint(SlowBB);
@@ -734,6 +792,18 @@ bool runAsan(Module &M) {
       "__coqui_asan_check_fast_store_2",
       "__coqui_asan_check_fast_store_4",
       "__coqui_asan_check_fast_store_8",
+      // Slab allocator internals: these manipulate the per-thread
+      // control rows, per-block shared bucket strip, and the Treiber
+      // stack directly. Routing their own accesses through the ASan
+      // fast-path helpers would trigger infinite recursion (the slab
+      // malloc path is where ASan's heap-OOM fall-through lands) and
+      // also false-positive on the ctrl-row reads which are deliberately
+      // outside any red-zone-tracked range.
+      "__coqui_slab_malloc",
+      "__coqui_slab_free",
+      "__coqui_slab_init_block",
+      "__coqui_slab_release_thread",
+      "__coqui_slab_setup",
   };
 
   // For each allocator we'll RAUW: declare the _raw alias as a separate

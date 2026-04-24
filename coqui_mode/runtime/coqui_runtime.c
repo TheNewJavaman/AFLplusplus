@@ -48,6 +48,33 @@ void __coqui_exit(void) {
     __asm__ volatile("exit;");
 }
 
+/* Weak fallback for __coqui_slab_release_thread so targets built without
+ * the slab runtime linked still resolve this symbol. When coqui_slab.c
+ * is linked in, its strong definition wins; otherwise this no-op is used. */
+__attribute__((weak))
+void __coqui_slab_release_thread(void) {
+    /* no slab runtime linked — nothing to release */
+}
+
+/* Signalled-exit variant. Stamps the trap reason so the host can
+ * distinguish OOM / stack overflow / other categorized traps from a
+ * generic crash. Uses __coqui_exit() (not __coqui_trap) so the kernel
+ * itself doesn't abort — peer threads keep running. Releases any slab
+ * allocations this thread holds so the reclaimed ranges become
+ * available to other threads. */
+void __coqui_trap_with_reason(u8 reason) {
+    __coqui_slab_release_thread();
+    u32 tid = __coqui_fuzz_tid();
+    if (__coqui_status_array) {
+        __coqui_status_array[tid].trap_reason = reason;
+    }
+    /* sys-wide fence so the status write is visible to the host when the
+     * thread's writes retire, then clean per-thread exit. */
+    __asm__ volatile("membar.sys;");
+    __coqui_exit();
+    __builtin_unreachable();
+}
+
 /* Status writer */
 void __coqui_status_set_phase(u32 tid, u8 phase) {
     __coqui_status_array[tid].phase = phase;
