@@ -53,9 +53,9 @@ namespace coqui {
  *
  *   NoOpSignal           — sigaction/sigprocmask/sigemptyset/... (warn)
  *   TrapKill/Fork/Exec   — runtime trap with category reason (no warn)
- *   DeterministicTime    — fixed epoch (no warn for now; see Thread 3)
- *   NoOpEnv              — env not on GPU (no warn for now; see Thread 3)
- *   DeterministicProc    — fixed pid/uid (no warn for now; see Thread 3)
+ *   DeterministicTime    — fixed epoch (warn — clock doesn't exist on GPU)
+ *   NoOpEnv              — env not on GPU (warn)
+ *   DeterministicProc    — fixed pid/uid (warn — no processes on GPU)
  */
 enum class StubClass {
     NoOpSignal,
@@ -78,6 +78,17 @@ static const char *warnHint(StubClass C) {
     case StubClass::NoOpSignal:
         return "signal delivery is not supported on NVPTX (no signals on "
                "device); handler install/mask calls are silently no-op'd";
+    case StubClass::DeterministicTime:
+        return "wall-clock time is not available on NVPTX; the stub returns "
+               "a fixed zero epoch so target control-flow stays deterministic "
+               "across fuzz runs (deadline/elapsed loops will not progress)";
+    case StubClass::NoOpEnv:
+        return "process environment is not available on NVPTX (no env block "
+               "on device); reads return NULL and writes silently succeed";
+    case StubClass::DeterministicProc:
+        return "process / user identity is not meaningful on NVPTX; the stub "
+               "returns a fixed non-zero value so root-check branches take "
+               "the unprivileged path deterministically";
     default:
         return nullptr;
     }
