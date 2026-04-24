@@ -41,6 +41,11 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runStaticGlobals(M);
     Changed |= coqui::runMemoryLayout(M);
     Changed |= coqui::runCoverage(M);
+    /* Pad user globals with red zones and register them in a descriptor
+     * table BEFORE runAsan so the load/store instrumentation sees the
+     * padded struct types and its slow path can detect OOB via the
+     * descriptor scan (asan_check_global in coqui_asan.c). */
+    Changed |= coqui::runAsanGlobals(M);
     Changed |= coqui::runAsan(M);
     Changed |= coqui::runExternalSymbolGatekeeper(M);
 

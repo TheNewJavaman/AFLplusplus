@@ -39,8 +39,14 @@
 #define BLOCK_HDR_SIZE       8u
 
 /* Error codes */
-#define ASAN_ERROR_HEAP_OVERFLOW  1
-#define ASAN_ERROR_USE_AFTER_FREE 2
+#define ASAN_ERROR_HEAP_OVERFLOW    1
+#define ASAN_ERROR_USE_AFTER_FREE   2
+#define ASAN_ERROR_GLOBAL_OVERFLOW  3
+
+/* Maximum globals we can track. cJSON uses ~10; a TSan-scale target
+ * uses a few hundred. 1024 is the same ceiling the reference runtime
+ * uses and comfortably covers all evaluation targets. */
+#define ASAN_MAX_GLOBALS 1024
 
 /* Global pool allocator function pointers (set by slab runtime if linked).
    Day-1: always NULL. */
@@ -134,6 +140,64 @@ static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
     /* Partial last granule: first `partial` bytes accessible, rest poisoned. */
     if (partial)
         shadow[full_end] = (u8)partial;
+}
+
+/* ===-------------------------------------------------------------------===
+ * Global variable red-zone tracking
+ *
+ * The IR pass (coqui::runAsanGlobals) replaces each qualifying global
+ * `T g;` with a padded struct `{ T orig; u8 rz[32]; }` so there is a
+ * physical gap after the user bytes. It then emits a descriptor table
+ * and a one-shot call to __coqui_asan_register_globals() inside
+ * __coqui_fuzz_kernel. The descriptor records where each global's user
+ * region ends and where its red zone ends, so we can detect an access
+ * that lands in [user_end, total_end).
+ *
+ * We cannot rely on the existing heap shadow: globals live in NVPTX
+ * .global memory, outside any per-thread heap. Instead, the outlined
+ * fast-path helper now routes out-of-heap accesses to the slow path
+ * (instead of returning clean) so we can check the global table here.
+ * ===-------------------------------------------------------------------=== */
+
+static struct __coqui_asan_global_desc
+    __coqui_asan_globals[ASAN_MAX_GLOBALS];
+static unsigned long __coqui_asan_num_globals;
+
+void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
+                                    unsigned long count) {
+    /* All GPU threads call this concurrently with identical arguments,
+     * so straightforward per-index copies are idempotent — no atomics. */
+    unsigned long n = count < ASAN_MAX_GLOBALS ? count : ASAN_MAX_GLOBALS;
+    for (unsigned long i = 0; i < n; i++)
+        __coqui_asan_globals[i] = descs[i];
+    __coqui_asan_num_globals = n;
+}
+
+/*
+ * asan_check_global — returns 1 if the access [addr, addr+size) overlaps
+ * any registered global's red zone, 0 otherwise.
+ *
+ * We flag two cases:
+ *   (a) the access starts inside the red zone [user_end, total_end),
+ *   (b) the access starts inside the user region but extends past
+ *       user_end (partial overflow).
+ *
+ * Linear scan is fine: typical targets register well under 100 globals,
+ * and the slow path only runs on shadow misses / out-of-heap addresses.
+ */
+static int asan_check_global(unsigned long addr, unsigned long size) {
+    unsigned long n = __coqui_asan_num_globals;
+    for (unsigned long i = 0; i < n; i++) {
+        unsigned long beg       = (unsigned long)__coqui_asan_globals[i].beg;
+        unsigned long user_end  = beg + __coqui_asan_globals[i].user_size;
+        unsigned long total_end = beg + __coqui_asan_globals[i].total_size;
+
+        if (addr >= user_end && addr < total_end)
+            return 1;
+        if (addr >= beg && addr < user_end && (addr + size) > user_end)
+            return 1;
+    }
+    return 0;
 }
 
 /* ===-------------------------------------------------------------------===
@@ -263,16 +327,31 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
     return 1;
 }
 
+/*
+ * Slow-path wrappers. The fast-path helper calls into here when:
+ *   - the access is in the heap region AND the shadow byte is nonzero, or
+ *   - the access is outside the heap (global / other addrspace(0) data).
+ *
+ * For in-heap shadow hits, asan_check_access walks the granules and
+ * reports heap-buffer-overflow / use-after-free. For out-of-heap
+ * accesses, it returns 0 — in that case we fall back to scanning the
+ * global-variable descriptor table so OOB into global red zones gets
+ * caught.
+ */
 #define SLOWPATH_IMPL(N)                                                \
     __attribute__((noinline))                                            \
     void __coqui_asan_slowpath_load_##N(void *ptr) {                     \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
+        if (asan_check_global((unsigned long)ptr, (u8)(N)))              \
+            asan_report(ASAN_ERROR_GLOBAL_OVERFLOW);                     \
     }                                                                    \
     __attribute__((noinline))                                            \
     void __coqui_asan_slowpath_store_##N(void *ptr) {                    \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
+        if (asan_check_global((unsigned long)ptr, (u8)(N)))              \
+            asan_report(ASAN_ERROR_GLOBAL_OVERFLOW);                     \
     }
 
 SLOWPATH_IMPL(1)

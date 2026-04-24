@@ -27,6 +27,7 @@ bool runComplex(llvm::Module &M);
 bool runStaticGlobals(llvm::Module &M);
 bool runMemoryLayout(llvm::Module &M);
 bool runCoverage(llvm::Module &M);
+bool runAsanGlobals(llvm::Module &M);
 bool runAsan(llvm::Module &M);
 bool runExternalSymbolGatekeeper(llvm::Module &M);
 

@@ -1,10 +1,14 @@
 /*
- * Asan.cpp --- heap-only ASan instrumentation pass.
+ * Asan.cpp --- ASan instrumentation pass for heap + globals.
  *
- * Two responsibilities:
- *   1. RAUW allocators: __coqui_malloc  -> __coqui_asan_malloc
+ * Three responsibilities:
+ *   1. runAsanGlobals: pad writable user globals with a 32-byte right red
+ *      zone, emit a descriptor table, and inject a register call at
+ *      __coqui_fuzz_kernel entry so the runtime slow path can detect OOB
+ *      into global red zones via __coqui_asan_globals[] linear scan.
+ *   2. RAUW allocators: __coqui_malloc  -> __coqui_asan_malloc
  *                       __coqui_free    -> __coqui_asan_free
- *   2. Instrument loads/stores: insert __coqui_asan_check_load_N /
+ *   3. Instrument loads/stores: insert __coqui_asan_check_load_N /
  *      __coqui_asan_check_store_N (N = 1/2/4/8) before each heap access.
  *
  * Skips:
@@ -12,8 +16,9 @@
  *     self-instrumented).
  *   - Accesses where the stripped-base pointer is an AllocaInst (stack;
  *     not tracked by the heap shadow).
- *   - Accesses where the stripped-base pointer is a GlobalVariable (static
- *     data; not heap).
+ *   - Accesses rooted at a coqui-injected global (cov/virgin/status/
+ *     thread-slot pools). User globals DO get instrumented — their
+ *     padded red zones are caught by the slow-path descriptor scan.
  *   - Loads/stores in non-default address spaces (e.g., NVPTX .shared /
  *     .const memory).
  *   - Atomic loads/stores (skipped for v1; add AtomicRMW if needed).
@@ -44,7 +49,9 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -66,11 +73,24 @@ static bool isStackDerived(const Value *V) {
   return isa<AllocaInst>(Base);
 }
 
-/// Return true if the root of the pointer chain is a GlobalVariable.
-/// Globals live in static data sections, not the heap shadow.
-static bool isGlobalDerived(const Value *V) {
+/// Return true if the root of the pointer chain is a __coqui_* internal
+/// GlobalVariable that should not be instrumented. User globals now DO
+/// get instrumented (runAsanGlobals padded them with a red zone) and
+/// their accesses flow through the fast-path helper — the slow path
+/// scans the descriptor table to catch global-buffer-overflow.
+///
+/// Coqui-injected globals (__coqui_cov_map, __coqui_virgin_map,
+/// __coqui_thread_slots, __coqui_status_array, __coqui_kernel_timing, ...)
+/// are skipped to avoid per-access slow-path calls they never need.
+static bool isCoquiInternalGlobal(const Value *V) {
   const Value *Base = V->stripInBoundsOffsets();
-  return isa<GlobalVariable>(Base);
+  const auto *GV = dyn_cast<GlobalVariable>(Base);
+  if (!GV)
+    return false;
+  StringRef Name = GV->getName();
+  return Name.starts_with("__coqui_") || Name.starts_with("llvm.") ||
+         Name.starts_with("__ubsan_") || Name.starts_with("__sanitizer_") ||
+         Name.starts_with("__asan_");
 }
 
 /// Map an access byte count to 1/2/4/8 for the helper suffix.
@@ -172,6 +192,12 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   MDNode *CleanW = createBranchWeightMD(Ctx, 99, 1);
 
   // --- entry: range check ---
+  // Previously: out-of-heap returned clean via OkBB. Now we defer to
+  // SlowBB so globals (which live outside the per-thread heap) get
+  // checked against the descriptor table runAsanGlobals registered.
+  // This adds a call cost to out-of-heap accesses but they're rare in
+  // practice (stack/global accesses already carry their own skip at
+  // instrumentation time in the main runAsan loop).
   IRBuilder<> B(EntryBB);
   Value *HeapBaseI64 = F->getArg(1);
   Value *ShadowBaseI64 = F->getArg(2);
@@ -180,7 +206,7 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Value *AddrI64 = B.CreatePtrToInt(F->getArg(0), I64Ty, "addr.i64");
   Value *Rel = B.CreateSub(AddrI64, HeapBaseI64, "rel");
   Value *InHeap = B.CreateICmpULT(Rel, Usable, "inheap");
-  auto *HeapBr = B.CreateCondBr(InHeap, ShadowBB, OkBB);
+  auto *HeapBr = B.CreateCondBr(InHeap, ShadowBB, SlowBB);
   HeapBr->setMetadata(LLVMContext::MD_prof, InHeapW);
 
   // --- shadow: load shadow byte ---
@@ -256,6 +282,189 @@ static bool rawReplace(Module &M, StringRef OldName, StringRef NewName) {
   OldF->eraseFromParent();
 
   errs() << "[coqui-asan] rauw " << OldName << " -> " << NewName << "\n";
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// runAsanGlobals --- pad user globals with red zones and register them
+// with the runtime so the slow-path can detect OOB accesses.
+//
+// What happens:
+//   1. Enumerate eligible globals in M: writable or constant, with an
+//      initializer, default addrspace(0), NOT a __coqui_/llvm./sanitizer
+//      internal, not externally initialized, not in a special section.
+//   2. For each, wrap the type in { OrigTy, [RZ x i8] } so the original
+//      bytes still start at offset 0. With opaque pointers, RAUW is a
+//      drop-in replacement since loads/stores/GEPs already compute
+//      byte offsets.
+//   3. Build an internal descriptor table __coqui_asan_global_descriptors
+//      listing { ptr, user_size, total_size } triples.
+//   4. In __coqui_fuzz_kernel, inject a one-shot call to
+//      __coqui_asan_register_globals(descriptors, count) so the runtime
+//      can linear-scan this table from the slow path.
+//
+// Ordering: this must run BEFORE runAsan() so the padded globals show up
+// in the module before the load/store instrumentation loop decides what
+// is global-derived.
+//
+// Notes:
+//  - Right-side red zone only (no left). With opaque pointers, appending
+//    padding preserves RAUW correctness — offset 0 is still user data.
+//  - The red zone is unpoisoned in any shadow map (globals don't live in
+//    the per-thread heap). Detection is purely via the descriptor table
+//    consulted in the slow path.
+//  - llvm.global_ctors referencing these globals keep working because
+//    the replacement uses takeName + RAUW; the initializer list only
+//    stores a pointer that remains valid.
+// ---------------------------------------------------------------------------
+bool runAsanGlobals(Module &M) {
+  LLVMContext &C = M.getContext();
+  const DataLayout &DL = M.getDataLayout();
+  Type *I8Ty   = Type::getInt8Ty(C);
+  Type *I64Ty  = Type::getInt64Ty(C);
+  Type *VoidTy = Type::getVoidTy(C);
+  Type *PtrTy  = PointerType::get(C, 0);
+
+  /* Right red zone size in bytes. 32 bytes = 4 shadow granules. Matches
+   * the reference coqui implementation and large enough to catch the
+   * common "off-by-one / off-by-a-few" patterns without massively
+   * inflating .global memory use on large targets. */
+  constexpr uint64_t kRedZone = 32;
+
+  /* Descriptor struct matches coqui_runtime.h. */
+  auto *DescTy = StructType::get(C, {PtrTy, I64Ty, I64Ty});
+
+  struct Candidate { GlobalVariable *GV; uint64_t UserSize; };
+  SmallVector<Candidate, 16> Candidates;
+
+  /* Snapshot the globals list because we'll splice in replacements
+   * during the mutation loop. */
+  SmallVector<GlobalVariable *, 32> AllGlobals;
+  for (GlobalVariable &GV : M.globals())
+    AllGlobals.push_back(&GV);
+
+  for (GlobalVariable *GV : AllGlobals) {
+    StringRef Name = GV->getName();
+    /* Skip coqui-injected globals. Broader than "__coqui_" because some
+     * passes emit globals like __coqui_global_* accessors and
+     * __coqui_cov_map/__coqui_virgin_map that must not be padded. */
+    if (Name.starts_with("__coqui_"))
+      continue;
+    /* Skip LLVM / sanitizer internals. */
+    if (Name.starts_with("llvm."))
+      continue;
+    if (Name.starts_with("__ubsan_") || Name.starts_with("__sanitizer_") ||
+        Name.starts_with("__asan_"))
+      continue;
+    /* Skip externally-supplied globals. */
+    if (!GV->hasInitializer() || GV->isDeclaration())
+      continue;
+    if (GV->isExternallyInitialized())
+      continue;
+    /* Skip globals with section attributes (e.g., nvvm annotations). */
+    if (GV->hasSection())
+      continue;
+    /* Only default addrspace. NVPTX non-default spaces (constant,
+     * shared, local) are out of scope — padding them with struct types
+     * produces bitcode the NVPTX backend can't handle. */
+    if (GV->getAddressSpace() != 0)
+      continue;
+    /* Need a known fixed size. */
+    Type *Ty = GV->getValueType();
+    if (!Ty->isSized())
+      continue;
+    TypeSize TS = DL.getTypeAllocSize(Ty);
+    if (TS.isScalable() || TS.isZero())
+      continue;
+    uint64_t UserSize = TS.getFixedValue();
+    /* Very small globals are rarely the target of buffer-overflow style
+     * bugs and not worth the per-global .global memory footprint. */
+    if (UserSize < 4)
+      continue;
+
+    Candidates.push_back({GV, UserSize});
+  }
+
+  if (Candidates.empty())
+    return false;
+
+  /* Phase 1: pad each global by wrapping its type with a trailing
+   * red zone. With opaque pointers, all existing users (GEPs, loads,
+   * stores) continue to work after RAUW because the original data is
+   * still at byte offset 0. */
+  struct Descriptor { GlobalVariable *GV; uint64_t UserSize; };
+  SmallVector<Descriptor, 16> Descriptors;
+
+  for (auto &Cand : Candidates) {
+    GlobalVariable *GV = Cand.GV;
+    Type *OrigTy = GV->getValueType();
+
+    auto *PadTy = ArrayType::get(I8Ty, kRedZone);
+    auto *NewTy = StructType::get(C, {OrigTy, PadTy});
+
+    Constant *OrigInit = GV->getInitializer();
+    Constant *PadInit  = ConstantAggregateZero::get(PadTy);
+    Constant *NewInit  = ConstantStruct::get(NewTy, {OrigInit, PadInit});
+
+    /* Create the replacement BEFORE the old one so link order is
+     * preserved. Use the old global's linkage, tls, addrspace, and
+     * constness. */
+    auto *NewGV = new GlobalVariable(
+        M, NewTy, GV->isConstant(), GV->getLinkage(), NewInit, "", GV,
+        GV->getThreadLocalMode(), GV->getAddressSpace());
+    NewGV->setAlignment(GV->getAlign());
+    NewGV->takeName(GV);
+
+    /* Opaque pointer RAUW: user data starts at offset 0 so every GEP /
+     * load / store on the old pointer is valid on the new one. */
+    GV->replaceAllUsesWith(NewGV);
+    GV->eraseFromParent();
+
+    Descriptors.push_back({NewGV, Cand.UserSize});
+  }
+
+  /* Phase 2: build the descriptor table [{ptr beg, i64 user, i64 total}]. */
+  SmallVector<Constant *, 16> Entries;
+  for (auto &D : Descriptors) {
+    uint64_t TotalSize = DL.getTypeAllocSize(D.GV->getValueType()).getFixedValue();
+    Constant *Entry = ConstantStruct::get(
+        DescTy,
+        {D.GV, ConstantInt::get(I64Ty, D.UserSize),
+         ConstantInt::get(I64Ty, TotalSize)});
+    Entries.push_back(Entry);
+  }
+  auto *TableTy = ArrayType::get(DescTy, Entries.size());
+  auto *Table = new GlobalVariable(
+      M, TableTy, /*isConstant=*/true,
+      GlobalValue::InternalLinkage, ConstantArray::get(TableTy, Entries),
+      "__coqui_asan_global_descriptors");
+
+  /* Phase 3: emit a call to __coqui_asan_register_globals(table, count)
+   * at the start of __coqui_fuzz_kernel so the runtime has the table
+   * before any user code runs. The call is idempotent (all threads
+   * write identical descriptors at identical indices), so we can just
+   * inject it unconditionally — no tid==0 gate required. */
+  Function *Kernel = M.getFunction("__coqui_fuzz_kernel");
+  if (!Kernel || Kernel->isDeclaration()) {
+    errs() << "[coqui-asan-globals] no __coqui_fuzz_kernel; "
+           << Descriptors.size() << " global(s) padded but unregistered\n";
+    return true;
+  }
+
+  auto *RegTy = FunctionType::get(VoidTy, {PtrTy, I64Ty}, false);
+  FunctionCallee RegFn =
+      M.getOrInsertFunction("__coqui_asan_register_globals", RegTy);
+
+  /* Insert as the very first instruction of the kernel entry block so
+   * the descriptor table is populated before MemoryInit, before any
+   * user code. */
+  Instruction *InsertPt = &*Kernel->getEntryBlock().getFirstInsertionPt();
+  IRBuilder<> B(InsertPt);
+  B.CreateCall(RegFn, {Table, ConstantInt::get(I64Ty, Entries.size())});
+
+  errs() << "[coqui-asan-globals] padded " << Descriptors.size()
+         << " global(s) with " << kRedZone << "-byte right red zones\n";
+
   return true;
 }
 
@@ -361,8 +570,11 @@ bool runAsan(Module &M) {
         // Skip stack-derived accesses — alloca memory is not in the heap.
         if (isStackDerived(Ptr)) { ++SkipCount; continue; }
 
-        // Skip global-derived accesses — static data is not heap.
-        if (isGlobalDerived(Ptr)) { ++SkipCount; continue; }
+        // Skip accesses rooted in a coqui-injected global (cov map,
+        // virgin map, thread slots, etc.). User globals DO get
+        // instrumented — runAsanGlobals padded them with red zones and
+        // the slow path scans the descriptor table to detect global OOB.
+        if (isCoquiInternalGlobal(Ptr)) { ++SkipCount; continue; }
 
         ToInstrument.push_back(&I);
       }

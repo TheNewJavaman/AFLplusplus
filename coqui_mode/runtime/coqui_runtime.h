@@ -120,6 +120,23 @@ void  __coqui_asan_check_store_2(void *ptr);
 void  __coqui_asan_check_store_4(void *ptr);
 void  __coqui_asan_check_store_8(void *ptr);
 
+/* ASan global-variable red-zone descriptor (matches IR-emitted table).
+ *   beg        : base address of the padded global (inner + outer red zone)
+ *   user_size  : bytes the original (pre-instrumentation) global occupied
+ *   total_size : user_size + right red zone in bytes
+ * The runtime linearly scans __coqui_asan_globals[] from the slow path to
+ * detect out-of-bounds accesses that land inside the red zone. */
+struct __coqui_asan_global_desc {
+    const void   *beg;
+    unsigned long user_size;
+    unsigned long total_size;
+};
+
+/* Invoked once per kernel launch (all threads write the same descriptors,
+ * which is idempotent). The IR pass emits the table + this call. */
+void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
+                                    unsigned long count);
+
 /* Libc replacements (coqui_libc.c) */
 unsigned long __coqui_strlen(const char *s);
 int  __coqui_strcmp(const char *a, const char *b);
