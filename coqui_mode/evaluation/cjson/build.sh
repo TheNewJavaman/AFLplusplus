@@ -43,6 +43,7 @@ CJSON_CACHE="${CJSON_CACHE:-${SCRIPT_DIR}/.build/cJSON-${CJSON_SHORT}}"
 SANITIZE_FLAGS=(
   "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
   "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+  "-fno-stack-protector"
 )
 
 # --- Pre-flight -------------------------------------------------------------
