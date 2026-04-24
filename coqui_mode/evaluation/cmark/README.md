@@ -14,12 +14,13 @@ driven with coqui mode's `afl-fuzz --coqui`.
 ./fuzz.sh    # prints launch commands for Main/Secondary/Coqui
 ```
 
-`build.sh` is self-contained: no nix, no external COQUI_REPO. It clones
-cmark from GitHub into `.build/`, synthesizes the cmark config headers
-inline (cmark's upstream build is CMake; we skip that), compiles the
-CPU binary with this repo's own `afl-clang-fast`, and builds the GPU
-cubin via `coqui-cc` under a `/tmp/coqui-cc.lock` flock so ptxas can
-serialize with any parallel target builds.
+`build.sh` is self-contained: no external dependencies beyond
+`afl-clang-fast` (this repo) and `coqui-cc` (at `/usr/local/bin`). It
+clones cmark from GitHub into `.build/`, synthesizes the cmark config
+headers inline (cmark's upstream build is CMake; we skip that),
+compiles the CPU binary with this repo's own `afl-clang-fast`, and
+builds the GPU cubin via `coqui-cc` under a `/tmp/coqui-cc.lock` flock
+so ptxas can serialize with any parallel target builds.
 
 ## Layout
 
@@ -37,8 +38,8 @@ serialize with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - CPU build compiles each translation unit separately to `.o` before
   linking. One-shot compile overflows afl-cc's 2048-parameter cap with
   the full sanitizer list and 19 cmark TUs; see the inline comment in
