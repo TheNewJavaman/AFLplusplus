@@ -27,12 +27,13 @@
 #   - libyaml.nix does NOT set --stack-size or --slab-pool-size, so we use
 #     coqui-cc defaults (32768 stack; 0 slab pool).
 #   - libyaml's api.c/scanner.c use assert() (from <assert.h>), which expands
-#     to __assert_fail on NVPTX. coqui mode's coqui-cc only runs coqui-link +
-#     always-inline (no LibcTransform), so the ExternalSymbolGatekeeper
-#     rejects __assert_fail. We pass -D NDEBUG to make assert() a no-op.
-#     GPU asserts become non-fatal; the CPU AFL++ binary still honors them.
-#   - strdup/memcpy/memmove/memset are not exported by coqui mode's runtime.bc,
-#     so libyaml_stubs.c provides them (see that file's comment).
+#     to __assert_fail on NVPTX. The Libc.cpp pass rewrites __assert_fail to
+#     __coqui_assert_fail, but we still pass -D NDEBUG to make assert() a
+#     no-op so GPU asserts become non-fatal (reachable data-dependent paths);
+#     the CPU AFL++ binary still honors them.
+#   - strdup/memcpy/memmove/memset call sites are rewritten by the Libc.cpp
+#     pass to their __coqui_* equivalents provided by the runtime, so no
+#     local libc shim is needed.
 
 set -euo pipefail
 
@@ -42,7 +43,6 @@ cd "${SCRIPT_DIR}"
 # --- Config -----------------------------------------------------------------
 HARNESS_BASENAME="libyaml_parser_fuzzer"
 HARNESS_SRC="${SCRIPT_DIR}/harness.c"
-STUBS_SRC="${SCRIPT_DIR}/libyaml_stubs.c"
 ARCH="${ARCH:-sm_75}"
 
 # libyaml upstream pin (matches legacy coqui fetch at rev 0.2.5).
@@ -69,7 +69,6 @@ SANITIZE_FLAGS=(
 [[ -x "$AFL_CC" ]]   || { echo "ERROR: afl-clang-fast not found at $AFL_CC" >&2; exit 1; }
 [[ -x "$COQUI_CC" ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
 [[ -f "$HARNESS_SRC" ]] || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
-[[ -f "$STUBS_SRC" ]]   || { echo "ERROR: stubs missing at $STUBS_SRC" >&2; exit 1; }
 
 # --- [1/4] Fetch upstream libyaml at pinned tag -----------------------------
 echo "=== [1/4] Fetch libyaml at tag ${LIBYAML_REV} ==="
@@ -152,7 +151,6 @@ flock /tmp/coqui-cc.lock \
   libyaml_src/parser.c \
   libyaml_src/loader.c \
   "$HARNESS_SRC" \
-  "$STUBS_SRC" \
   -o "$HARNESS_BASENAME"
 
 [[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \

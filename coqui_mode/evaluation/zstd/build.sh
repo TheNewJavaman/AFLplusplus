@@ -30,7 +30,6 @@ cd "${SCRIPT_DIR}"
 # --- Config -----------------------------------------------------------------
 HARNESS_BASENAME="zstd_simple_decompress_fuzzer"
 HARNESS_SRC="${SCRIPT_DIR}/harness.c"
-ABORT_STUB="${SCRIPT_DIR}/zstd_abort_stub.c"
 ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768        # coqui-cc default (legacy zstd.nix does not override)
 SLAB_POOL_SIZE=0        # legacy zstd.nix does not configure a slab pool
@@ -59,7 +58,6 @@ SANITIZE_FLAGS=(
 [[ -x "$CLANG_FAST" ]]     || { echo "ERROR: afl-clang-fast not found at $CLANG_FAST" >&2; exit 1; }
 [[ -x "$COQUI_CC" ]]      || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
 [[ -f "$HARNESS_SRC" ]]   || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
-[[ -f "$ABORT_STUB" ]]    || { echo "ERROR: abort stub missing at $ABORT_STUB" >&2; exit 1; }
 
 # --- [1/3] Fetch upstream zstd at pinned commit -----------------------------
 echo "=== [1/3] Fetch ${ZSTD_OWNER}/${ZSTD_REPO} @ ${ZSTD_COMMIT} ==="
@@ -151,7 +149,6 @@ flock /tmp/coqui-cc.lock \
     "${ZSTD_INCLUDES[@]}" \
     "${ZSTD_DEFINES[@]}" \
     "${ZSTD_SOURCES[@]}" \
-    "$ABORT_STUB" \
     "$HARNESS_SRC" \
     -o "$HARNESS_BASENAME"
 
