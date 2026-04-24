@@ -42,14 +42,26 @@
 #define ASAN_ERROR_HEAP_OVERFLOW    1
 #define ASAN_ERROR_USE_AFTER_FREE   2
 #define ASAN_ERROR_GLOBAL_OVERFLOW  3
+#define ASAN_ERROR_SLAB_OVERFLOW    4
 
 /* Maximum globals we can track. cJSON uses ~10; a TSan-scale target
  * uses a few hundred. 1024 is the same ceiling the reference runtime
  * uses and comfortably covers all evaluation targets. */
 #define ASAN_MAX_GLOBALS 1024
 
-/* Global pool allocator function pointers (set by slab runtime if linked).
-   Day-1: always NULL. */
+/* Maximum live slab allocations tracked at once. Slots are append-only
+ * (free poisons entry to a sentinel; index is not recycled), so this is
+ * a cumulative-allocation ceiling across the kernel run, not a snapshot
+ * of live blocks. 4096 covers every evaluation harness observed so far:
+ * bzip2/libxml2/libpng with 2 GiB slab pools routinely cap at ~1-2k
+ * allocations per kernel launch. */
+#define ASAN_MAX_SLAB_DESCS 4096
+
+/* Slab pool allocator function pointers (set by slab runtime if linked).
+ * Day-1: always NULL — no device-side slab runtime is linked yet in
+ * coqui_mode (the host allocates the slab buffer via cuMemAlloc but no
+ * kernel-side allocator owns it). When a future slab runtime registers,
+ * the ASan wrappers below become active. */
 static void *(*g_slab_malloc)(unsigned long) = (void *)0;
 static void  (*g_slab_free)(void *)          = (void *)0;
 
@@ -191,6 +203,95 @@ static int asan_check_global(unsigned long addr, unsigned long size) {
         unsigned long beg       = (unsigned long)__coqui_asan_globals[i].beg;
         unsigned long user_end  = beg + __coqui_asan_globals[i].user_size;
         unsigned long total_end = beg + __coqui_asan_globals[i].total_size;
+
+        if (addr >= user_end && addr < total_end)
+            return 1;
+        if (addr >= beg && addr < user_end && (addr + size) > user_end)
+            return 1;
+    }
+    return 0;
+}
+
+/* ===-------------------------------------------------------------------===
+ * Slab-pool red-zone tracking
+ *
+ * The slab pool is a host-allocated region shared by all GPU threads; no
+ * per-thread shadow exists for it (unlike the heap, where shadow is a
+ * suffix of each thread's heap slice). Instead, every
+ * __coqui_asan_slab_malloc appends a descriptor to a kernel-wide table
+ * and the slowpath linearly scans the table after global-checks miss.
+ *
+ * The table is append-only: __coqui_asan_slab_free poisons the `beg`
+ * field to NULL (slowpath skips NULL rows). Slot indices are never
+ * recycled so lookups remain branch-free and immune to ABA races.
+ *
+ * Concurrency: __coqui_asan_slab_num_descs is updated via a generic-space
+ * atomic add (matches every other coqui device counter). Each thread that
+ * grabs a slot writes the payload into its private row — no CAS loop
+ * needed because the index is unique per winner.
+ * ===-------------------------------------------------------------------=== */
+
+static struct __coqui_asan_slab_desc
+    __coqui_asan_slab_descs[ASAN_MAX_SLAB_DESCS];
+static unsigned int __coqui_asan_num_slab_descs;
+
+/* atomic add on generic pointer — matches every other coqui counter. */
+static unsigned int asan_atom_add_gen(volatile unsigned int *addr,
+                                       unsigned int val) {
+    unsigned int old;
+    __asm__ volatile("atom.add.u32 %0, [%1], %2;"
+                     : "=r"(old) : "l"(addr), "r"(val));
+    return old;
+}
+
+/*
+ * asan_slab_register — called from __coqui_asan_slab_malloc. Returns slot
+ * index if the descriptor table has room, ASAN_MAX_SLAB_DESCS otherwise
+ * (ASan gracefully degrades: a slab alloc beyond the ceiling still
+ * succeeds, just without detection).
+ */
+static unsigned int asan_slab_register(const void *beg,
+                                        unsigned long user_size,
+                                        unsigned long total_size) {
+    unsigned int idx = asan_atom_add_gen(&__coqui_asan_num_slab_descs, 1u);
+    if (idx >= ASAN_MAX_SLAB_DESCS) return ASAN_MAX_SLAB_DESCS;
+    __coqui_asan_slab_descs[idx].beg        = beg;
+    __coqui_asan_slab_descs[idx].user_size  = user_size;
+    __coqui_asan_slab_descs[idx].total_size = total_size;
+    return idx;
+}
+
+/*
+ * asan_slab_lookup — find the slab descriptor whose [beg, beg+total_size)
+ * contains `addr`. Returns the row index or ASAN_MAX_SLAB_DESCS if not
+ * found. Linear scan: typical slab-pool-enabled runs register low-hundreds
+ * of descriptors and the slowpath only runs on shadow misses.
+ */
+static unsigned int asan_slab_lookup(unsigned long addr) {
+    unsigned int n = __coqui_asan_num_slab_descs;
+    if (n > ASAN_MAX_SLAB_DESCS) n = ASAN_MAX_SLAB_DESCS;
+    for (unsigned int i = 0; i < n; i++) {
+        unsigned long beg = (unsigned long)__coqui_asan_slab_descs[i].beg;
+        if (beg == 0) continue;   /* freed slot */
+        unsigned long tend = beg + __coqui_asan_slab_descs[i].total_size;
+        if (addr >= beg && addr < tend) return i;
+    }
+    return ASAN_MAX_SLAB_DESCS;
+}
+
+/*
+ * asan_check_slab — returns 1 if [addr, addr+size) overlaps any slab
+ * descriptor's red zone (equivalently, any byte past user_end within
+ * total_size). Matches the two-case logic used by asan_check_global.
+ */
+static int asan_check_slab(unsigned long addr, unsigned long size) {
+    unsigned int n = __coqui_asan_num_slab_descs;
+    if (n > ASAN_MAX_SLAB_DESCS) n = ASAN_MAX_SLAB_DESCS;
+    for (unsigned int i = 0; i < n; i++) {
+        unsigned long beg = (unsigned long)__coqui_asan_slab_descs[i].beg;
+        if (beg == 0) continue;  /* freed slot */
+        unsigned long user_end  = beg + __coqui_asan_slab_descs[i].user_size;
+        unsigned long total_end = beg + __coqui_asan_slab_descs[i].total_size;
 
         if (addr >= user_end && addr < total_end)
             return 1;
@@ -345,6 +446,8 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
         if (asan_check_global((unsigned long)ptr, (u8)(N)))              \
             asan_report(ASAN_ERROR_GLOBAL_OVERFLOW);                     \
+        if (asan_check_slab((unsigned long)ptr, (u8)(N)))                \
+            asan_report(ASAN_ERROR_SLAB_OVERFLOW);                       \
     }                                                                    \
     __attribute__((noinline))                                            \
     void __coqui_asan_slowpath_store_##N(void *ptr) {                    \
@@ -352,6 +455,8 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
         if (asan_check_global((unsigned long)ptr, (u8)(N)))              \
             asan_report(ASAN_ERROR_GLOBAL_OVERFLOW);                     \
+        if (asan_check_slab((unsigned long)ptr, (u8)(N)))                \
+            asan_report(ASAN_ERROR_SLAB_OVERFLOW);                       \
     }
 
 SLOWPATH_IMPL(1)
@@ -438,4 +543,88 @@ void __coqui_asan_free(void *ptr) {
     asan_poison_range(raw_off, payload, ASAN_FREED);
 
     __coqui_free(raw);
+}
+
+/* ===-------------------------------------------------------------------===
+ * Slab-pool ASan wrappers
+ *
+ * Physical layout handed out to the caller:
+ *   [left redzone (16)] [user data (size)] [right redzone (16)]
+ * The leading red zone doubles as a descriptor back-pointer: the first
+ * 4 bytes store `slot + 1` (zero = untracked) so __coqui_asan_slab_free
+ * can invalidate the descriptor without re-scanning the table.
+ *
+ * If no slab runtime has registered (g_slab_malloc == NULL — the current
+ * default in coqui_mode), these return NULL / no-op, matching the
+ * behavior of the built-in slab hook stubs.
+ * ===-------------------------------------------------------------------=== */
+
+/* Offset to the user pointer is 16B (ASAN_LEFT_REDZONE). The back-pointer
+ * lives in the first 4B of the leading red zone. */
+void *__coqui_asan_slab_malloc(unsigned long size) {
+    if (!g_slab_malloc) return (void *)0;
+    if (size == 0) size = 1;
+
+    /* Align user size up to 8 bytes so right-redzone starts on a boundary. */
+    unsigned long user_aligned = (size + 7UL) & ~7UL;
+    unsigned long total        = ASAN_LEFT_REDZONE + user_aligned + ASAN_RIGHT_REDZONE;
+
+    u8 *raw = (u8 *)g_slab_malloc(total);
+    if (!raw) return (void *)0;
+
+    u8 *user = raw + ASAN_LEFT_REDZONE;
+
+    /* Register descriptor. total_size is measured from user-beg, so
+     * [user_end, user_end + right_redzone) is the detectable red zone. */
+    unsigned int slot = asan_slab_register((const void *)user,
+                                            size,
+                                            user_aligned + ASAN_RIGHT_REDZONE);
+
+    /* Stash (slot + 1) in the first 4 bytes of the leading red zone for
+     * O(1) teardown. 0 sentinel = "registration overflowed", free will
+     * fall back to a linear lookup. */
+    unsigned int tag = (slot < ASAN_MAX_SLAB_DESCS) ? (slot + 1u) : 0u;
+    *(unsigned int *)raw = tag;
+
+    return (void *)user;
+}
+
+void __coqui_asan_slab_free(void *ptr) {
+    if (!ptr) return;
+    if (!g_slab_free) return;
+
+    u8 *user = (u8 *)ptr;
+    u8 *raw  = user - ASAN_LEFT_REDZONE;
+
+    /* Reject pointers that are not in the slab pool: no descriptor exists
+     * for them, and calling g_slab_free with a heap/global pointer would
+     * corrupt the slab allocator. */
+    unsigned int hot_slot = *(unsigned int *)raw;
+    if (hot_slot > 0u && hot_slot <= ASAN_MAX_SLAB_DESCS) {
+        /* Fast path: clear the descriptor slot the hot-tag points to, and
+         * verify the beg matches (guards against stale tags if the caller
+         * hands us a random pointer). */
+        unsigned int idx = hot_slot - 1u;
+        if (__coqui_asan_slab_descs[idx].beg == (const void *)user) {
+            __coqui_asan_slab_descs[idx].beg        = (void *)0;
+            __coqui_asan_slab_descs[idx].user_size  = 0;
+            __coqui_asan_slab_descs[idx].total_size = 0;
+        }
+    } else {
+        /* Slow path: tag was 0 (registration overflow) or garbage. Scan
+         * the table; if we find the user beg, clear it. */
+        unsigned int idx = asan_slab_lookup((unsigned long)user);
+        if (idx < ASAN_MAX_SLAB_DESCS &&
+            __coqui_asan_slab_descs[idx].beg == (const void *)user) {
+            __coqui_asan_slab_descs[idx].beg        = (void *)0;
+            __coqui_asan_slab_descs[idx].user_size  = 0;
+            __coqui_asan_slab_descs[idx].total_size = 0;
+        }
+    }
+
+    /* Clear the hot tag so a subsequent use-after-free on this pointer
+     * doesn't re-hit the fast path and mis-interpret a stale index. */
+    *(unsigned int *)raw = 0u;
+
+    g_slab_free((void *)raw);
 }

@@ -137,6 +137,39 @@ struct __coqui_asan_global_desc {
 void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
                                     unsigned long count);
 
+/* ASan slab-pool red-zone descriptor.
+ *
+ * One entry per live slab allocation. The runtime maintains a shared
+ * bounded table (ASAN_MAX_SLAB_DESCS) that all threads append to
+ * atomically in __coqui_asan_slab_malloc and clear in
+ * __coqui_asan_slab_free. Layout mirrors __coqui_asan_global_desc so the
+ * slowpath lookup reads the same fields:
+ *   beg        : base address of the user buffer (past the leading red zone)
+ *   user_size  : bytes the caller originally requested
+ *   total_size : user_size + right red zone in bytes (from beg)
+ * beg == NULL marks a freed/empty slot. Slot allocation is monotonic:
+ * __coqui_asan_slab_free poisons the entry but the slot index is not
+ * recycled, which keeps the slowpath lookup branch-free. */
+struct __coqui_asan_slab_desc {
+    const void   *beg;
+    unsigned long user_size;
+    unsigned long total_size;
+};
+
+/* Slab-pool allocator hook registration. A future device-side slab runtime
+ * (not yet linked in coqui_mode) calls this once from its setup kernel to
+ * hand its raw malloc/free pair to the ASan wrapper. Until then,
+ * __coqui_asan_slab_malloc returns NULL and __coqui_asan_slab_free is a
+ * no-op — so targets without slab support emit identical PTX. */
+void __coqui_asan_register_slab(void *(*m)(unsigned long), void (*f)(void *));
+
+/* ASan-aware slab allocator wrappers. The pass redirects user-level
+ * slab allocations to these; they call the registered raw allocator
+ * with size + 2*red_zone bytes and return a pointer past the leading
+ * red zone. */
+void *__coqui_asan_slab_malloc(unsigned long size);
+void  __coqui_asan_slab_free(void *ptr);
+
 /* Libc replacements (coqui_libc.c) */
 unsigned long __coqui_strlen(const char *s);
 int  __coqui_strcmp(const char *a, const char *b);
