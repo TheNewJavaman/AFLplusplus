@@ -6034,7 +6034,6 @@ pacemaker_fuzzing:
 
            ++afl->stage_cur) { */
 
-    
       new_hit_cnt = afl->queued_items + afl->saved_crashes;
 
       if (MOpt_globals.is_pilot_mode) {
@@ -6139,7 +6138,6 @@ pacemaker_fuzzing:
 
       ret_val = 0;
 
-    
     abandon_entry:
     abandon_entry_puppet:
 
