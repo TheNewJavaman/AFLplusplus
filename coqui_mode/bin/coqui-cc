@@ -168,9 +168,13 @@ def main():
     ptxas_opt = os.environ.get("COQUI_PTXAS_OPT", "-O1")
     ptxas_ofc = os.environ.get("COQUI_PTXAS_OFC", "").strip()
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
-    ptxas_cmd = ["ptxas", f"-arch={arch}", ptxas_opt]
+    ptxas_cmd = ["ptxas", f"-arch={arch}"]
+    # ptxas rejects -O<n> combined with --Ofast-compile=<level>; the OFC
+    # flag replaces the opt-level entirely. Pass only one of them.
     if ptxas_ofc and ptxas_ofc != "0":
         ptxas_cmd.append(f"--Ofast-compile={ptxas_ofc}")
+    else:
+        ptxas_cmd.append(ptxas_opt)
     ptxas_cmd.extend([str(ptx_path), "-o", str(cubin)])
     run(ptxas_cmd)
 
