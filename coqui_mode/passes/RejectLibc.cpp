@@ -10,11 +10,15 @@
  *   - signal()/raise()/kill() (process signaling)
  *   - fork()/exec() (process control)
  *
- * Ported from /coqui/src/LibcTransform.cpp (rejection half).
+ * Only call/invoke uses trigger fatal errors — declaration-only
+ * references are ignored because internalize+globaldce prune them.
+ *
+ * Ported from /coqui/src/LibcTransform.cpp (rejection half, lines ~322-378).
  */
 
 #include "Transforms.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -30,7 +34,7 @@ static const std::set<std::string> &blocklist() {
   static const std::set<std::string> list = {
     /* setjmp family */
     "setjmp", "_setjmp", "__setjmp",
-    "longjmp", "_longjmp", "__longjmp",
+    "longjmp", "_longjmp", "__longjmp", "__longjmp_chk",
     "sigsetjmp", "siglongjmp",
     "__sigsetjmp",
     /* pthread — except pthread_once (stubbed in coqui_runtime.c) */
@@ -52,6 +56,27 @@ static const std::set<std::string> &blocklist() {
   return list;
 }
 
+/* Pick a sensible -D<guard> hint for the error message.  These match
+ * common upstream build-time flags for disabling the offending feature. */
+static const char *guardHint(const std::string &name) {
+  if (name == "setjmp" || name == "_setjmp" || name == "__setjmp" ||
+      name == "longjmp" || name == "_longjmp" || name == "__longjmp" ||
+      name == "__longjmp_chk" ||
+      name == "sigsetjmp" || name == "siglongjmp" || name == "__sigsetjmp")
+    return "PNG_NO_SETJMP";          /* libpng-style */
+  if (name.rfind("pthread_", 0) == 0)
+    return "CMS_NO_PTHREADS";        /* lcms/zstd-style; see also ZSTD_MULTITHREAD=0 */
+  if (name == "fork" || name == "vfork" ||
+      name.rfind("exec", 0) == 0)
+    return "NO_PROCESS_CONTROL";
+  if (name == "signal" || name == "sigaction" || name == "raise" ||
+      name == "kill" || name == "sigprocmask")
+    return "NO_SIGNAL_HANDLING";
+  if (name.rfind("thrd_", 0) == 0 || name.rfind("mtx_", 0) == 0)
+    return "NO_C11_THREADS";
+  return "TARGET_NO_HOST_ONLY";
+}
+
 bool runRejectLibc(Module &M) {
   for (Function &F : M) {
     if (!F.isDeclaration()) continue;   /* only care about external refs */
@@ -59,13 +84,22 @@ bool runRejectLibc(Module &M) {
     std::string name = F.getName().str();
     if (!blocklist().count(name)) continue;
 
-    if (F.use_empty()) continue;
+    /* Count only call/invoke uses. Declaration-only references (address-
+     * taken, unused decls imported from headers) get pruned by
+     * internalize+globaldce and should not fatal. Mirrors coqui's
+     * LibcTransform pattern. */
+    unsigned CallUses = 0;
+    for (User *U : F.users()) {
+      if (auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledFunction() == &F)
+        ++CallUses;
+    }
+    if (CallUses == 0) continue;
 
     std::string msg;
     raw_string_ostream os(msg);
-    os << "[coqui-cc] RejectLibc: '" << name
-       << "' is not supported on GPU; disable this feature at build time "
-       << "(e.g., -DTARGET_NO_PTHREADS, -DPNG_NO_SETJMP).";
+    os << "[coqui-cc] RejectLibc: target uses " << name
+       << " — NVPTX unsupported. Compile library with -D"
+       << guardHint(name) << " to disable.";
     report_fatal_error(os.str().c_str());
   }
   return false;
