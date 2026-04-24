@@ -43,8 +43,8 @@ with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - `--stack-size 32768` (coqui-cc default).
 - `--slab-pool-size 2147483648` (2 GiB) — bzip2's DState (~60 KB)
   plus the smallest ll16/ll4 buffer don't fit in the default 64 KB
@@ -54,9 +54,10 @@ with any parallel target builds.
   `bz2_assert_stub.c`, `harness.c`. `-D BZ_NO_STDIO` is set on both
   CPU and GPU builds.
 - coqui-cc does NOT accept `--heap-size` or `--batch-size`. Heap is
-  derived at runtime from the per-thread stack budget (142 KB on RTX
-  Titan with 32 KB stack); batch size is read from
-  `AFL_COQUI_BATCH_SIZE` at fuzz time (default 8192).
+  derived at runtime from the per-thread stack budget (the runtime
+  prints the resolved `stack=/heap=/total=` triple at startup); batch
+  size is read from `AFL_COQUI_BATCH_SIZE` at fuzz time (default
+  8192).
 - `fuzz.sh` sets `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`,
   `AFL_SKIP_CPUFREQ=1`, `AFL_SKIP_BIN_CHECK=1`, `AFL_NO_UI=1` per the
   project convention; override by exporting them yourself. GPU device

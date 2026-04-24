@@ -48,8 +48,8 @@ with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - `--stack-size 32768` — libpng+zlib call chains
   (`png_read_image` → … → `inflate_fast`) exceed the default 8 KB
   stack.

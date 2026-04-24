@@ -46,8 +46,8 @@ so ptxas can serialize with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - Stack size: coqui-cc default (32768) — not overridden.
 - `--slab-pool-size 10737418240` (10 GiB) — DNS name-decompression can
   blow up heap via crafted pointer loops. The harness caps input to

@@ -38,8 +38,8 @@ so ptxas can serialize with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - CPU build compiles each translation unit separately to `.o` before
   linking. One-shot compile overflows afl-cc's 2048-parameter cap with
   the full sanitizer list and 19 cmark TUs; see the inline comment in

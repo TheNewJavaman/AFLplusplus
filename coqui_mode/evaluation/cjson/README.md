@@ -38,8 +38,8 @@ so ptxas can serialize with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - `--stack-size 32768`, `--slab-pool-size 0`. cJSON's parse + print
   paths fit inside the default per-thread 64 KB heap; no slab pool
   needed.

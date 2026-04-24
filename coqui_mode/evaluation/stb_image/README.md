@@ -38,8 +38,8 @@ builds the GPU cubin via `coqui-cc`.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - `--stack-size 65536` (double the coqui-cc default) — the multi-format
   decoder has deep call chains (e.g. `stbi__jpeg_decode_block`).
 - `--slab-pool-size 0` — no slab pool.

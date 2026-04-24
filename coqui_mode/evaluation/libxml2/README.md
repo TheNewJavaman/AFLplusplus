@@ -45,8 +45,8 @@ target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - `--stack-size 32768` — needed for deep parser recursion + xpath
   evaluator.
 - `--slab-pool-size 2147483648` (2 GiB) — the per-thread 64 KB heap

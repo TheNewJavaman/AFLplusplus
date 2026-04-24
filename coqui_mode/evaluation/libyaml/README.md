@@ -46,8 +46,8 @@ with any parallel target builds.
 
 ## Notes
 
-- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
-  Override with `ARCH=sm_XX ./build.sh`.
+- `--arch sm_75` is the `build.sh` default (override with
+  `ARCH=sm_XX ./build.sh` to target a different GPU).
 - No `--stack-size` / `--slab-pool-size` override — libyaml fits
   under coqui-cc defaults (32 KB stack, no slab pool) once the buffer
   shrink is applied.
