@@ -1420,7 +1420,7 @@ abort_trimming:
 u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
                                           u32 len) {
 
-  if (unlikely(afl->gpu_mode)) {
+  if (unlikely(afl->coqui_mode)) {
 
     return coqui_submit_input(afl, out_buf, len);
 

@@ -1086,7 +1086,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
         afl->sync_id            = ck_strdup(optarg);
         afl->is_secondary_node  = 1;
-        afl->gpu_mode           = 1;
+        afl->coqui_mode         = 1;
         afl->fsrv.coqui_mode    = 1;
         afl->skip_deterministic = 1;  /* det stages gated off under --coqui */
 
@@ -1699,7 +1699,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  if (afl->gpu_mode) {
+  if (afl->coqui_mode) {
     if (optind >= argc) {
       FATAL("--coqui requires a target ELF path after '--'");
     }
@@ -4059,7 +4059,7 @@ stop_fuzzing:
 
   }
 
-  if (afl->gpu_mode) {
+  if (afl->coqui_mode) {
     coqui_shutdown(afl);
   }
 
