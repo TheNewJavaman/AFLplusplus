@@ -91,7 +91,7 @@ static Value *packArgs(IRBuilder<> &Builder, CallBase *CI,
     } else if (ArgTy->isPointerTy()) {
       Packed = Builder.CreatePtrToInt(Arg, I64Ty);
     } else {
-      errs() << "[coqui] WARNING: variadic argument of type "
+      errs() << "[coqui-variadic] warning: variadic argument of type "
              << *Arg->getType()
              << " replaced with zero (unsupported on NVPTX)\n";
       Packed = ConstantInt::get(I64Ty, 0);
@@ -292,7 +292,7 @@ bool runVariadic(Module &M) {
             else
               Result = Raw;
           } else {
-            errs() << "[coqui] WARNING: va_arg of unsupported type "
+            errs() << "[coqui-variadic] warning: va_arg of unsupported type "
                    << *TargetTy << " replaced with zero\n";
             Result = Constant::getNullValue(TargetTy);
           }
@@ -306,7 +306,7 @@ bool runVariadic(Module &M) {
           VA->eraseFromParent();
         }
 
-        errs() << "[coqui] Lowered " << VaArgs.size()
+        errs() << "[coqui-variadic] lowered " << VaArgs.size()
                << " va_arg intrinsic(s) in " << NewF->getName() << "\n";
       }
     }
@@ -354,7 +354,7 @@ bool runVariadic(Module &M) {
     /* Declarations: leave as-is (linker resolves, or post-link stripping
      * handles any remaining variadic declarations). */
 
-    errs() << "[coqui] Transformed variadic: " << OldName
+    errs() << "[coqui-variadic] transformed: " << OldName
            << (HasBody ? " (definition" : " (declaration")
            << ", " << DirectCalls.size() << " call sites)\n";
     Changed = true;

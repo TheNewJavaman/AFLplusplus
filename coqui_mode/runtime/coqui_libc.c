@@ -318,6 +318,28 @@ float __coqui_exp2f(float x)    { (void)x; return 1.0f; }
 float __coqui_sinf(float x)     { (void)x; return 0.0f; }
 float __coqui_cosf(float x)     { (void)x; return 1.0f; }
 
+/* fmod: x - floor(x/y)*y via repeated subtraction on magnitudes.
+ * Called from the frem lowering pass (coqui_mode/passes/Math.cpp) since
+ * NVPTX has no hardware fmod and llc cannot auto-select a libcall.
+ * Uses __builtin_* for isnan/isinf/fabs/floor — clang lowers these to
+ * NVPTX intrinsics the backend can emit natively. */
+double __coqui_fmod(double x, double y) {
+    if (y == 0.0 || __builtin_isnan(x) || __builtin_isnan(y) ||
+        __builtin_isinf(x))
+        return __builtin_nan("");
+    if (__builtin_isinf(y)) return x;
+    int neg = (x < 0.0);
+    double ax = __builtin_fabs(x);
+    double ay = __builtin_fabs(y);
+    if (ax < ay) return x;
+    double q = __builtin_floor(ax / ay);
+    double r = ax - q * ay;
+    return neg ? -r : r;
+}
+float __coqui_fmodf(float x, float y) {
+    return (float)__coqui_fmod((double)x, (double)y);
+}
+
 /* ----- file descriptor stubs ---------------------------------------------
  * No real file I/O on GPU. Targets that check_open/read a file get -1/EBADF
  * semantics.

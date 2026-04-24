@@ -1,150 +1,164 @@
 #!/usr/bin/env bash
-# build.sh — build the coqui mode zstd fuzz target.
+# build.sh — build zstd coqui mode evaluation target (nix-free).
 #
-# Produces in this directory:
-#   zstd_simple_decompress_fuzzer.cubin — GPU kernel (sm_75), compiled by
-#                                         coqui-cc from the zstd decompress
-#                                         library sources + harness.
-#   zstd_simple_decompress_fuzzer.conf  — coqui-cc companion config
-#                                         (records stack_size / slab_pool_size /
-#                                         arch).
-#   zstd_simple_decompress_fuzzer_cpu   — AFL++-instrumented host binary built
-#                                         via the coqui nix flake
-#                                         (symlinked from the nix out).
-#   seeds/                              — symlink to the upstream zstd fuzz
-#                                         seed corpus shipped by the
-#                                         aflplusplus target.
-#   dict/                               — symlink to the upstream zstd
-#                                         dictionary.
+# Produces in the current directory:
+#   zstd_simple_decompress_fuzzer.cubin — GPU kernel (configurable via ARCH env, default sm_75)
+#   zstd_simple_decompress_fuzzer.conf  — companion config emitted by coqui-cc
+#   zstd_simple_decompress_fuzzer_cpu   — AFL++ instrumented CPU binary
+#   .build/                             — cached upstream source checkout
 #
-# Mirrors the `zstd` target in the legacy coqui codebase exactly for the GPU sources,
-# -I, -D. The CPU binary is supplied by the `target-zstd-aflplusplus` package
-# from the coqui flake.
+# No external dependencies beyond afl-clang-fast (from this repo) and
+# coqui-cc (installed to /usr/local/bin). The zstd source tree is fetched
+# from github.com/facebook/zstd at a pinned commit (v1.5.6).
 #
-# Run from this directory:
-#   ./build.sh
-#
-# Reruns are idempotent: existing nix out-links are reused and the cubin is
-# regenerated every time (coqui-cc is fast and has no stale-cache mode).
+# Overrides:
+#   ARCH          GPU compute capability (default sm_75)
+#   CLANG_FAST    path to afl-clang-fast (default: this repo's own afl-clang-fast).
+#                 NOTE: named CLANG_FAST (no AFL_ prefix) because afl-cc
+#                 itself reads $AFL_CC as the underlying compiler to delegate
+#                 to (recursive self-call blows past MAX_PARAMS_NUM), and
+#                 any unknown AFL_*  env var triggers a 2s sleep per compile
+#                 via afl-common's "Mistyped AFL environment variable" check.
+#   COQUI_CC      path to coqui-cc (default /usr/local/bin/coqui-cc)
+#   ZSTD_SRC      path to a pre-fetched zstd source tree (default .build/<owner-repo-sha>)
+
 set -euo pipefail
 
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "${HERE}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-# --- Fixed paths --------------------------------------------------------
-COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
-COQUI_CC="/usr/local/bin/coqui-cc"
+# --- Config -----------------------------------------------------------------
+HARNESS_BASENAME="zstd_simple_decompress_fuzzer"
+HARNESS_SRC="${SCRIPT_DIR}/harness.c"
+ABORT_STUB="${SCRIPT_DIR}/zstd_abort_stub.c"
 ARCH="${ARCH:-sm_75}"
-STACK_SIZE=32768        # coqui-cc default (zstd.nix does not override)
-SLAB_POOL_SIZE=0        # zstd.nix does not set a slab pool
+STACK_SIZE=32768        # coqui-cc default (legacy zstd.nix does not override)
+SLAB_POOL_SIZE=0        # legacy zstd.nix does not configure a slab pool
 
-CPU_OUT_LINK="/tmp/coqui-zstd-cpu"
-CPU_BINARY_NAME="zstd_simple_decompress_fuzzer"  # harnessName in cpu-target-specs.nix
-HARNESS_NAME="zstd_simple_decompress_fuzzer"     # == CPU_BINARY_NAME for zstd
+# zstd upstream pin (facebook/zstd v1.5.6)
+ZSTD_OWNER="facebook"
+ZSTD_REPO="zstd"
+ZSTD_COMMIT="35016bc1c0b9a2f7121b7ecc312100aad7d9f2ad"   # tag v1.5.6
+ZSTD_SHORT="${ZSTD_COMMIT:0:12}"
+ZSTD_TARBALL_URL="https://github.com/${ZSTD_OWNER}/${ZSTD_REPO}/archive/${ZSTD_COMMIT}.tar.gz"
 
-# --- Pre-flight ---------------------------------------------------------
-test -x "${COQUI_CC}"             || { echo "[build] missing ${COQUI_CC}" >&2; exit 1; }
-test -d "${COQUI_REPO}"           || { echo "[build] missing ${COQUI_REPO}" >&2; exit 1; }
-test -f "${COQUI_REPO}/flake.nix" || { echo "[build] ${COQUI_REPO} is not a flake" >&2; exit 1; }
+# Tools
+CLANG_FAST="${CLANG_FAST:-${SCRIPT_DIR}/../../../afl-clang-fast}"
+COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
+ZSTD_SRC="${ZSTD_SRC:-${SCRIPT_DIR}/.build/${ZSTD_OWNER}-${ZSTD_REPO}-${ZSTD_SHORT}}"
 
-# --- Step 1: build the CPU (AFL++) binary via nix -----------------------
-# target-zstd-aflplusplus ships: harness binary + seeds/ + dict/.
-echo "=== [1/4] nix build target-zstd-aflplusplus -> ${CPU_OUT_LINK} ==="
-( cd "${COQUI_REPO}" && nix build '.#target-zstd-aflplusplus' \
-    --out-link "${CPU_OUT_LINK}" )
+# Sanitizers matching legacy coqui (address + full UBSan incl. object-size).
+# zstd uses `sanitizers.default` in cpu-target-specs.nix.
+SANITIZE_FLAGS=(
+  "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
+  "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+  "-fno-stack-protector"
+)
 
-if [[ ! -x "${CPU_OUT_LINK}/${CPU_BINARY_NAME}" ]]; then
-  echo "[build] nix result missing ${CPU_BINARY_NAME} at ${CPU_OUT_LINK}" >&2
-  exit 1
+# --- Pre-flight -------------------------------------------------------------
+[[ -x "$CLANG_FAST" ]]     || { echo "ERROR: afl-clang-fast not found at $CLANG_FAST" >&2; exit 1; }
+[[ -x "$COQUI_CC" ]]      || { echo "ERROR: coqui-cc not found at $COQUI_CC" >&2; exit 1; }
+[[ -f "$HARNESS_SRC" ]]   || { echo "ERROR: harness missing at $HARNESS_SRC" >&2; exit 1; }
+[[ -f "$ABORT_STUB" ]]    || { echo "ERROR: abort stub missing at $ABORT_STUB" >&2; exit 1; }
+
+# --- [1/3] Fetch upstream zstd at pinned commit -----------------------------
+echo "=== [1/3] Fetch ${ZSTD_OWNER}/${ZSTD_REPO} @ ${ZSTD_COMMIT} ==="
+mkdir -p "$(dirname "$ZSTD_SRC")"
+# Marker file: lib/zstd.h at the root of the extracted tree.
+if [[ ! -f "${ZSTD_SRC}/lib/zstd.h" ]]; then
+  echo "  fetching ${ZSTD_TARBALL_URL}"
+  tmp_tar="$(mktemp -t zstd-src-XXXXXX.tar.gz)"
+  trap 'rm -f "$tmp_tar"' EXIT
+  curl -fsSL "$ZSTD_TARBALL_URL" -o "$tmp_tar"
+  # GitHub archive extracts to <repo>-<full-sha>/, so strip it into ZSTD_SRC.
+  rm -rf "$ZSTD_SRC"
+  mkdir -p "$ZSTD_SRC"
+  tar -xzf "$tmp_tar" --strip-components=1 -C "$ZSTD_SRC"
+  rm -f "$tmp_tar"
+  trap - EXIT
 fi
+[[ -f "${ZSTD_SRC}/lib/zstd.h" ]] \
+  || { echo "ERROR: ${ZSTD_SRC}/lib/zstd.h missing after fetch" >&2; exit 1; }
+echo "  zstd source at: $ZSTD_SRC"
 
-# --- Step 2: resolve zstd source path -----------------------------------
-# The facebook/zstd v1.5.6 tarball is the zstd-flavoured `-source` derivation
-# in the closure of the CPU build. Pick the one that contains lib/zstd.h.
-echo "=== [2/4] Resolve zstd source path ==="
-ZSTD_SRC=$(nix-store -qR "${CPU_OUT_LINK}" \
-  | grep -E '/nix/store/[^/]+-source$' \
-  | xargs -I{} sh -c '[ -f "{}/lib/zstd.h" ] && echo "{}"' \
-  | head -n1)
+# --- Common compile args (shared between CPU + GPU builds) ------------------
+ZSTD_INCLUDES=(
+  -I "${ZSTD_SRC}/lib"
+  -I "${ZSTD_SRC}/lib/common"
+  -I "${ZSTD_SRC}/lib/decompress"
+)
+ZSTD_DEFINES=(
+  -D ZSTD_NO_INTRINSICS=1
+  -D ZSTD_DISABLE_ASM=1
+  -D XXHASH_NAMESPACE=ZSTD_
+  -D FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+  -D ZSTD_NO_TRACE=1
+  -D ZSTD_DECODER_INTERNAL_BUFFER=4096
+)
+ZSTD_SOURCES=(
+  "${ZSTD_SRC}/lib/common/debug.c"
+  "${ZSTD_SRC}/lib/common/entropy_common.c"
+  "${ZSTD_SRC}/lib/common/error_private.c"
+  "${ZSTD_SRC}/lib/common/fse_decompress.c"
+  "${ZSTD_SRC}/lib/common/xxhash.c"
+  "${ZSTD_SRC}/lib/common/zstd_common.c"
+  "${ZSTD_SRC}/lib/decompress/huf_decompress.c"
+  "${ZSTD_SRC}/lib/decompress/zstd_ddict.c"
+  "${ZSTD_SRC}/lib/decompress/zstd_decompress.c"
+  "${ZSTD_SRC}/lib/decompress/zstd_decompress_block.c"
+)
 
-if [[ -z "${ZSTD_SRC}" || ! -f "${ZSTD_SRC}/lib/zstd.h" ]]; then
-  echo "[build] unable to locate zstd source (expected lib/zstd.h in a -source derivation)" >&2
-  exit 1
-fi
-echo "  zstd source: ${ZSTD_SRC}"
+# --- [2/3] Build AFL++ CPU binary -------------------------------------------
+# Compile zstd library .c files to .o individually, then link with the
+# harness. afl-cc expands each -fsanitize=... option into many clang flags,
+# so passing 10+ .c files in a single invocation blows past afl-cc's
+# MAX_PARAMS_NUM=2048 limit. Per-file compile keeps each argv manageable.
+echo "=== [2/3] Build AFL++ CPU binary with afl-clang-fast ==="
+CPU_OUT="${HARNESS_BASENAME}_cpu"
+OBJ_DIR="${SCRIPT_DIR}/.build/cpu-objs"
+mkdir -p "$OBJ_DIR"
+CPU_OBJS=()
+for src in "${ZSTD_SOURCES[@]}" "$HARNESS_SRC"; do
+  obj="${OBJ_DIR}/$(basename "${src}" .c).o"
+  echo "  cc -c $(basename "$src")"
+  "$CLANG_FAST" -O2 -g -c \
+    "${SANITIZE_FLAGS[@]}" \
+    "${ZSTD_INCLUDES[@]}" \
+    "${ZSTD_DEFINES[@]}" \
+    "$src" \
+    -o "$obj"
+  CPU_OBJS+=("$obj")
+done
 
-# --- Step 3: resolve the harness source ---------------------------------
-HARNESS="${COQUI_REPO}/harness/targets/${HARNESS_NAME}.c"
-if [[ ! -f "${HARNESS}" ]]; then
-  echo "[build] missing harness: ${HARNESS}" >&2
-  exit 1
-fi
+echo "  link -> $CPU_OUT"
+"$CLANG_FAST" -O2 -g \
+  "${SANITIZE_FLAGS[@]}" \
+  -fsanitize=fuzzer \
+  "${CPU_OBJS[@]}" \
+  -o "$CPU_OUT"
 
-# Local device-side stub for `abort()` — see zstd_abort_stub.c.
-ABORT_STUB="${HERE}/zstd_abort_stub.c"
-if [[ ! -f "${ABORT_STUB}" ]]; then
-  echo "[build] missing abort stub: ${ABORT_STUB}" >&2
-  exit 1
-fi
+[[ -x "$CPU_OUT" ]] || { echo "ERROR: CPU binary not produced" >&2; exit 1; }
 
-# --- Step 4: compile the GPU cubin via coqui-cc -------------------------
-# Flags mirror the `zstd` target in the legacy coqui codebase:
-#   -I <zstd src>/lib                   — zstd.h, zstd_errors.h
-#   -I <zstd src>/lib/common            — error_private.h, mem.h, etc.
-#   -I <zstd src>/lib/decompress        — zstd_decompress_internal.h
-#   -D ZSTD_NO_INTRINSICS=1             — disable __builtin prefetches etc.
-#   -D ZSTD_DISABLE_ASM=1               — no inline asm on GPU
-#   -D XXHASH_NAMESPACE=ZSTD_           — avoid xxhash symbol conflicts
-#   -D FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION — upstream fuzz hooks
-#   -D ZSTD_NO_TRACE=1                  — trace macros off
-#   -D ZSTD_DECODER_INTERNAL_BUFFER=4096 — shrink DCtx to ~34KB so it fits
-#                                         in the 58KB usable heap.
-# Source list matches the nix spec exactly.
-echo "=== [3/4] coqui-cc -> ${HARNESS_NAME}.cubin + .conf ==="
-"${COQUI_CC}" \
-  -arch "${ARCH}" \
-  --stack-size "${STACK_SIZE}" \
-  --slab-pool-size "${SLAB_POOL_SIZE}" \
-  -I "${ZSTD_SRC}/lib" \
-  -I "${ZSTD_SRC}/lib/common" \
-  -I "${ZSTD_SRC}/lib/decompress" \
-  -D ZSTD_NO_INTRINSICS=1 \
-  -D ZSTD_DISABLE_ASM=1 \
-  -D XXHASH_NAMESPACE=ZSTD_ \
-  -D FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION \
-  -D ZSTD_NO_TRACE=1 \
-  -D ZSTD_DECODER_INTERNAL_BUFFER=4096 \
-  "${ZSTD_SRC}/lib/common/debug.c" \
-  "${ZSTD_SRC}/lib/common/entropy_common.c" \
-  "${ZSTD_SRC}/lib/common/error_private.c" \
-  "${ZSTD_SRC}/lib/common/fse_decompress.c" \
-  "${ZSTD_SRC}/lib/common/xxhash.c" \
-  "${ZSTD_SRC}/lib/common/zstd_common.c" \
-  "${ZSTD_SRC}/lib/decompress/huf_decompress.c" \
-  "${ZSTD_SRC}/lib/decompress/zstd_ddict.c" \
-  "${ZSTD_SRC}/lib/decompress/zstd_decompress.c" \
-  "${ZSTD_SRC}/lib/decompress/zstd_decompress_block.c" \
-  "${ABORT_STUB}" \
-  "${HARNESS}" \
-  -o "${HERE}/${HARNESS_NAME}"
+# --- [3/3] Build GPU cubin via coqui-cc -------------------------------------
+# flock: ptxas at -O1 is memory-heavy (tens of GB); serialise with any other
+# parallel coqui-cc invocations on this host so we don't OOM.
+echo "=== [3/3] Build GPU cubin via coqui-cc (flock /tmp/coqui-cc.lock) ==="
+flock /tmp/coqui-cc.lock \
+  "$COQUI_CC" \
+    -arch "$ARCH" \
+    --stack-size "$STACK_SIZE" \
+    --slab-pool-size "$SLAB_POOL_SIZE" \
+    "${ZSTD_INCLUDES[@]}" \
+    "${ZSTD_DEFINES[@]}" \
+    "${ZSTD_SOURCES[@]}" \
+    "$ABORT_STUB" \
+    "$HARNESS_SRC" \
+    -o "$HARNESS_BASENAME"
 
-if [[ ! -f "${HARNESS_NAME}.cubin" || ! -f "${HARNESS_NAME}.conf" ]]; then
-  echo "[build] coqui-cc did not emit ${HARNESS_NAME}.cubin / .conf" >&2
-  exit 1
-fi
+[[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \
+  || { echo "ERROR: coqui-cc did not emit .cubin/.conf" >&2; exit 1; }
 
-# --- Step 5: link CPU binary + seeds + dict -----------------------------
-echo "=== [4/4] Link CPU binary + seeds + dict ==="
-ln -sfn "${CPU_OUT_LINK}/${CPU_BINARY_NAME}" "${HERE}/${HARNESS_NAME}_cpu"
-ln -sfn "${CPU_OUT_LINK}/seeds"              "${HERE}/seeds"
-if [[ -d "${CPU_OUT_LINK}/dict" ]]; then
-  ln -sfn "${CPU_OUT_LINK}/dict"              "${HERE}/dict"
-fi
-
-# --- Summary ------------------------------------------------------------
 echo
-echo "=== coqui mode zstd build complete ==="
-ls -la "${HERE}/${HARNESS_NAME}.cubin" "${HERE}/${HARNESS_NAME}.conf" \
-       "${HERE}/${HARNESS_NAME}_cpu"   "${HERE}/seeds" 2>/dev/null || true
-[[ -L "${HERE}/dict" ]] && ls -la "${HERE}/dict" || true
-echo "  conf:"; sed 's/^/    /' "${HERE}/${HARNESS_NAME}.conf"
+echo "=== Build complete ==="
+ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
+echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"

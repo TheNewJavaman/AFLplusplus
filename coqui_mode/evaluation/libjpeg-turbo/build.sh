@@ -1,54 +1,57 @@
 #!/usr/bin/env bash
-# build.sh — build libjpeg-turbo coqui mode evaluation target.
+# build.sh — build libjpeg-turbo coqui mode evaluation target (nix-free).
 #
-# Produces in this directory:
-#   libjpeg_turbo_decompress_fuzzer.cubin  — GPU kernel (sm_75)
-#   libjpeg_turbo_decompress_fuzzer.conf   — sidecar emitted by coqui-cc
+# Produces in the current directory:
+#   libjpeg_turbo_decompress_fuzzer.cubin  — GPU kernel (configurable via ARCH env, default sm_75)
+#   libjpeg_turbo_decompress_fuzzer.conf   — companion config emitted by coqui-cc
 #   libjpeg_turbo_decompress_fuzzer_cpu    — AFL++ instrumented CPU binary
-#                                             (symlink into the nix store)
-#   seeds/                                 — seed corpus (symlink to nix store)
-#   dict/                                  — jpeg marker dictionary (nix store)
+#   .build/                                — cached upstream source tree (git clone at pinned rev)
+#   jpeg_include/                          — staged patched header tree + library .c copies
 #
-# Mirrors the `libjpeg-turbo` target in the legacy coqui codebase exactly:
-#   - libjpeg-turbo 3.0.4, 20 baseline-only .c files (no arithmetic coding,
-#     no progressive, no block smoothing, no IDCT scaling, no color quant,
-#     no upsample merging, no save markers, no input smoothing, no 12/16-bit)
-#   - patched jmorecfg.h with heavyweight features #undef'd
-#   - custom jconfig.h / jconfigint.h
-#   - generated jversion.h (from jversion.h.in template)
-#   - sources COPIED into jpeg_include/ so #include "jmorecfg.h" finds the
-#     patched copy (quote-includes search the source file's directory first
-#     before -I paths — see nix/targets/libjpeg-turbo.nix commit history)
-#   - -D NO_GETENV
-#   - --stack-size 32768 (coqui-cc default, matches nix spec)
-#   - --slab-pool-size 0 (nix spec does not set a slab pool)
+# Baseline JPEG decode only.  Arithmetic coding, progressive, multi-scan,
+# block smoothing, IDCT scaling/float/fast, color quantization, upsample
+# merging, save markers, input smoothing, and 12/16-bit IDCT paths are all
+# disabled via the patched jmorecfg.h + custom jconfig.h.  This shrinks
+# the NVPTX module and avoids ptxas code-layout pathologies that cause
+# runtime CUBIN hangs.
 #
-# Note: the nix spec passes `${sanitizers.default}` (-fsanitize=...) to the
-# coqui driver, but coqui mode's coqui-cc does not accept -fsanitize flags —
-# sanitizers are baked into the coqui mode pass plugin (/usr/local/lib/coqui-cc/
-# CoquiPassPlugin.so). This matches the cjson/bzip2 build.sh pattern.
+# No external dependencies beyond afl-clang-fast (from this repo),
+# coqui-cc (installed to /usr/local/bin), curl/git (for fetch), and
+# basic POSIX tools (sed, cp).  Upstream source is fetched from
+# github.com/libjpeg-turbo/libjpeg-turbo at tag 3.0.4.
 #
-# Note: the nix spec stresses that libjpeg-turbo uses setjmp/longjmp in the
-# TurboJPEG error-handling path. This is NOT a GPU-only blocker — the
-# harness guards all setjmp/longjmp with `#ifndef __COQUI_DEVICE__`, so
-# the device build never sees setjmp. The CPU build retains the longjmp
-# error handler (oss-fuzz pattern).
+# Overrides:
+#   ARCH          GPU compute capability (default sm_75)
+#   AFL_CC        path to afl-clang-fast (default: this repo's own afl-clang-fast)
+#   COQUI_CC      path to coqui-cc (default /usr/local/bin/coqui-cc)
+#   LIBJPEG_CACHE path to cache the cloned libjpeg-turbo tree
+#                 (default .build/libjpeg-turbo-libjpeg-turbo-<short-sha>)
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COQUI_REPO="${COQUI_REPO:?set COQUI_REPO to your legacy coqui checkout path}"
-COQUI_CC="/usr/local/bin/coqui-cc"
-CPU_OUT_LINK="/tmp/coqui-libjpeg-turbo-cpu"
-HARNESS_DIR="${COQUI_REPO}/harness/targets"
+# --- Config -----------------------------------------------------------------
+HARNESS_BASENAME="libjpeg_turbo_decompress_fuzzer"
+HARNESS_SRC="${SCRIPT_DIR}/harness.c"
+STUBS_SRC="${SCRIPT_DIR}/libjpeg_turbo_stubs.c"
+LIBC_STUBS_SRC="${SCRIPT_DIR}/libjpeg_turbo_libc_stubs.c"
 ARCH="${ARCH:-sm_75}"
-STACK_SIZE=32768            # coqui-cc default; matches nix spec (no override)
-SLAB_POOL_SIZE=0            # libjpeg-turbo.nix does not set a slab pool
+STACK_SIZE=32768          # coqui-cc default; matches nix spec (no override)
+SLAB_POOL_SIZE=0          # libjpeg-turbo.nix does not set a slab pool
 
-HARNESS_NAME="libjpeg_turbo_decompress_fuzzer"
+# libjpeg-turbo upstream pin (matches coqui's legacy fetch at rev 3.0.4).
+LIBJPEG_TAG="3.0.4"
+LIBJPEG_COMMIT="${LIBJPEG_TAG}"   # tag doubles as the git ref
+LIBJPEG_URL="https://github.com/libjpeg-turbo/libjpeg-turbo.git"
 
-# Library sources — EXACTLY the list from nix/targets/libjpeg-turbo.nix.
+# Tools
+AFL_CC="${AFL_CC:-${SCRIPT_DIR}/../../../afl-clang-fast}"
+COQUI_CC="${COQUI_CC:-/usr/local/bin/coqui-cc}"
+LIBJPEG_CACHE="${LIBJPEG_CACHE:-${SCRIPT_DIR}/.build/libjpeg-turbo-${LIBJPEG_TAG}}"
+
+# Library sources — EXACTLY the list from the legacy libjpeg-turbo nix spec.
 # Baseline-only: progressive, multi-scan, smoothing, IDCT scaling/float/fast,
 # color quant, upsample merging, save markers, input smoothing all disabled.
 LIBJPEG_SRCS=(
@@ -60,41 +63,36 @@ LIBJPEG_SRCS=(
   jcomapi.c
 )
 
-echo "=== [1/5] Build AFL++ CPU binary via nix ==="
-# Idempotent: re-running `nix build` is a no-op when the derivation is
-# already realised.
-cd "${COQUI_REPO}"
-nix build '.#target-libjpeg-turbo-aflplusplus' --out-link "${CPU_OUT_LINK}"
-cd "${SCRIPT_DIR}"
+# Sanitizers matching legacy coqui (sanitizers.default = address + full UBSan).
+SANITIZE_FLAGS=(
+  "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
+  "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+  "-fno-stack-protector"
+)
 
-if [[ ! -x "${CPU_OUT_LINK}/${HARNESS_NAME}" ]]; then
-  echo "ERROR: CPU binary not found at ${CPU_OUT_LINK}/${HARNESS_NAME}" >&2
-  exit 1
+# --- Pre-flight -------------------------------------------------------------
+[[ -x "$AFL_CC"         ]] || { echo "ERROR: afl-clang-fast not found at $AFL_CC"         >&2; exit 1; }
+[[ -x "$COQUI_CC"       ]] || { echo "ERROR: coqui-cc not found at $COQUI_CC"             >&2; exit 1; }
+[[ -f "$HARNESS_SRC"    ]] || { echo "ERROR: harness missing at $HARNESS_SRC"             >&2; exit 1; }
+[[ -f "$STUBS_SRC"      ]] || { echo "ERROR: jsimd stubs missing at $STUBS_SRC"           >&2; exit 1; }
+[[ -f "$LIBC_STUBS_SRC" ]] || { echo "ERROR: libc stubs missing at $LIBC_STUBS_SRC"       >&2; exit 1; }
+
+# --- [1/4] Fetch upstream libjpeg-turbo at pinned tag -----------------------
+echo "=== [1/4] Fetch libjpeg-turbo ${LIBJPEG_TAG} ==="
+mkdir -p "$(dirname "$LIBJPEG_CACHE")"
+if [[ ! -f "$LIBJPEG_CACHE/jpeglib.h" || ! -f "$LIBJPEG_CACHE/jmorecfg.h" || ! -f "$LIBJPEG_CACHE/jversion.h.in" ]]; then
+  echo "  git clone ${LIBJPEG_URL} -> ${LIBJPEG_CACHE}"
+  rm -rf "$LIBJPEG_CACHE"
+  git clone --quiet --depth 1 --branch "${LIBJPEG_TAG}" "${LIBJPEG_URL}" "${LIBJPEG_CACHE}"
 fi
-
-echo "=== [2/5] Resolve libjpeg-turbo source path ==="
-# Find the libjpeg-turbo 3.0.4 source dir in the closure of the CPU build.
-# Picking the unique `-source` entry that contains `jpeglib.h` + `jmorecfg.h`.
-LIBJPEG_SRC=$(nix-store -qR "${CPU_OUT_LINK}" \
-  | grep -E '/nix/store/[^/]+-source$' \
-  | xargs -I{} sh -c '[ -f "{}/jpeglib.h" ] && [ -f "{}/jmorecfg.h" ] && [ -f "{}/jversion.h.in" ] && echo "{}"' \
-  | head -n1)
-if [[ -z "${LIBJPEG_SRC}" || ! -f "${LIBJPEG_SRC}/jpeglib.h" ]]; then
-  echo "ERROR: could not resolve libjpeg-turbo source in closure of ${CPU_OUT_LINK}" >&2
-  exit 1
-fi
-echo "  libjpeg-turbo source: ${LIBJPEG_SRC}"
-
 # Sanity: every library .c file we plan to compile must exist upstream.
 for c in "${LIBJPEG_SRCS[@]}"; do
-  if [[ ! -f "${LIBJPEG_SRC}/${c}" ]]; then
-    echo "ERROR: missing ${c} in ${LIBJPEG_SRC}" >&2
-    exit 1
-  fi
+  [[ -f "${LIBJPEG_CACHE}/${c}" ]] || { echo "ERROR: missing ${c} in ${LIBJPEG_CACHE}" >&2; exit 1; }
 done
+echo "  libjpeg-turbo source: ${LIBJPEG_CACHE}"
 
-echo "=== [3/5] Stage patched jpeg_include/ tree ==="
-# Replicate the nix spec's preBuild:
+# --- [2/4] Stage patched jpeg_include/ tree ---------------------------------
+# Replicates the legacy nix spec's preBuild exactly:
 #   1. Symlink every upstream .h into jpeg_include/
 #   2. Overwrite jmorecfg.h with a sed-patched copy (features disabled)
 #   3. Write custom jconfig.h / jconfigint.h
@@ -102,12 +100,13 @@ echo "=== [3/5] Stage patched jpeg_include/ tree ==="
 #   5. COPY (not symlink) each library .c into jpeg_include/ so the quoted
 #      `#include "jmorecfg.h"` directive finds the patched copy (same dir
 #      as the source file) before the upstream unpatched copy on -I path.
+echo "=== [2/4] Stage patched jpeg_include/ tree ==="
 STAGE_DIR="${SCRIPT_DIR}/jpeg_include"
 rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
 
 # 1. Link all headers from upstream into stage dir.
-for h in "${LIBJPEG_SRC}"/*.h; do
+for h in "${LIBJPEG_CACHE}"/*.h; do
   ln -sfn "${h}" "${STAGE_DIR}/$(basename "${h}")"
 done
 
@@ -127,7 +126,7 @@ sed \
   -e 's/^#define DCT_FLOAT_SUPPORTED/\/* #undef DCT_FLOAT_SUPPORTED *\//' \
   -e 's/^#define SAVE_MARKERS_SUPPORTED/\/* #undef SAVE_MARKERS_SUPPORTED *\//' \
   -e 's/^#define INPUT_SMOOTHING_SUPPORTED/\/* #undef INPUT_SMOOTHING_SUPPORTED *\//' \
-  "${LIBJPEG_SRC}/jmorecfg.h" > "${STAGE_DIR}/jmorecfg.h"
+  "${LIBJPEG_CACHE}/jmorecfg.h" > "${STAGE_DIR}/jmorecfg.h"
 
 # 3. jconfig.h — no arithmetic coding, 8-bit only, no SIMD.
 cat > "${STAGE_DIR}/jconfig.h" <<'HEADER'
@@ -158,65 +157,108 @@ cat > "${STAGE_DIR}/jconfigint.h" <<'HEADER'
 HEADER
 
 # 5. jversion.h from template (substitute copyright year).
-sed 's/@COPYRIGHT_YEAR@/2024/' "${LIBJPEG_SRC}/jversion.h.in" > "${STAGE_DIR}/jversion.h"
+sed 's/@COPYRIGHT_YEAR@/2024/' "${LIBJPEG_CACHE}/jversion.h.in" > "${STAGE_DIR}/jversion.h"
 
 # 6. Copy (not symlink) each library .c into jpeg_include/ so the quoted
 #    #include "jmorecfg.h" directive finds the patched copy. If we left
 #    the .c files in the upstream source dir, the compiler's "include from
 #    source dir first" rule would find the unpatched jmorecfg.h alongside
 #    the source file instead of our patched version in -I jpeg_include.
+STAGED_SRCS=()
 for c in "${LIBJPEG_SRCS[@]}"; do
-  cp "${LIBJPEG_SRC}/${c}" "${STAGE_DIR}/${c}"
+  cp "${LIBJPEG_CACHE}/${c}" "${STAGE_DIR}/${c}"
+  STAGED_SRCS+=("${STAGE_DIR}/${c}")
 done
 
 echo "  staged ${STAGE_DIR} (${#LIBJPEG_SRCS[@]} .c files + patched headers)"
 
-echo "=== [4/5] Build GPU cubin via coqui-cc ==="
-# Flags mirror nix/targets/libjpeg-turbo.nix:
-#   -I jpeg_include          — patched headers (jmorecfg, jconfig, jconfigint, jversion)
-#   -I ${LIBJPEG_SRC}        — upstream headers (jpeglib, etc.)
-#   -D NO_GETENV             — strip getenv lookup on GPU (no libc env)
-#   sources  = jpeg_include/*.c  (patched copies)
-#            + harness/targets/libjpeg_turbo_stubs.c  (SIMD + 12/16-bit no-ops)
-#            + harness/targets/libjpeg_turbo_decompress_fuzzer.c
-#            + libjpeg_turbo_libc_stubs.c (local) — coqui mode pass plugin
-#              has no snprintf port; jerror.c/format_message calls it
-#              only for error strings that GPU never reads.
-# Sanitizer flags from the nix spec are intentionally omitted — coqui-cc
-# does not expose -fsanitize; the coqui mode pass plugin injects ASan/UBSan
-# device-side via CoquiPassPlugin.so.
-STAGED_SRCS=()
-for c in "${LIBJPEG_SRCS[@]}"; do
-  STAGED_SRCS+=("${STAGE_DIR}/${c}")
-done
-
-"${COQUI_CC}" \
-  -arch "${ARCH}" \
-  --stack-size "${STACK_SIZE}" \
-  --slab-pool-size "${SLAB_POOL_SIZE}" \
-  -I "${STAGE_DIR}" \
-  -I "${LIBJPEG_SRC}" \
-  -D NO_GETENV \
-  "${STAGED_SRCS[@]}" \
-  "${HARNESS_DIR}/libjpeg_turbo_stubs.c" \
-  "${HARNESS_DIR}/${HARNESS_NAME}.c" \
-  "${SCRIPT_DIR}/libjpeg_turbo_libc_stubs.c" \
-  -o "${HARNESS_NAME}"
-
-if [[ ! -f "${HARNESS_NAME}.cubin" || ! -f "${HARNESS_NAME}.conf" ]]; then
-  echo "ERROR: coqui-cc did not emit ${HARNESS_NAME}.cubin / .conf" >&2
+# Ensure seeds/ has at least one minimal seed.  Regenerate if missing.
+echo "  verifying seeds/ ..."
+if [[ ! -d "${SCRIPT_DIR}/seeds" || -z "$(ls -A "${SCRIPT_DIR}/seeds" 2>/dev/null)" ]]; then
+  echo "ERROR: seeds/ is empty.  Expected at least one minimal JPEG seed." >&2
   exit 1
 fi
 
-echo "=== [5/5] Link CPU binary + seeds + dict ==="
-ln -sfn "${CPU_OUT_LINK}/${HARNESS_NAME}" "${HARNESS_NAME}_cpu"
-ln -sfn "${CPU_OUT_LINK}/seeds" seeds
-if [[ -d "${CPU_OUT_LINK}/dict" ]]; then
-  ln -sfn "${CPU_OUT_LINK}/dict" dict
-fi
+# --- [3/4] Build AFL++ CPU binary -------------------------------------------
+echo "=== [3/4] Build AFL++ CPU binary with afl-clang-fast ==="
+# The CPU build compiles libjpeg-turbo + jsimd stubs + harness.
+# Compile each source to .o separately then link — afl-clang-fast's argv
+# buffer is small (MAX_PARAMS_NUM=2048) and the heavy -D macro expansion
+# afl-cc injects (__AFL_LOOP, __AFL_FUZZ_INIT, __AFL_FUZZ_TESTCASE_BUF, …)
+# overflows when combined with 20+ .c sources and a dozen sanitizer flags
+# on one command line.
+#
+# Note: libjpeg_turbo_libc_stubs.c is GPU-only — the real libc provides the
+# snprintf/fprintf/exit symbols for the CPU binary.
+CPU_BUILD_DIR="${SCRIPT_DIR}/.build/cpu-obj"
+rm -rf "${CPU_BUILD_DIR}"
+mkdir -p "${CPU_BUILD_DIR}"
+
+compile_cpu_obj() {
+  local src="$1" out="$2"
+  "$AFL_CC" -O2 -g \
+    "${SANITIZE_FLAGS[@]}" \
+    -I "${STAGE_DIR}" \
+    -I "${LIBJPEG_CACHE}" \
+    -D NO_GETENV \
+    -c "${src}" -o "${out}"
+}
+
+CPU_OBJS=()
+for c in "${LIBJPEG_SRCS[@]}"; do
+  obj="${CPU_BUILD_DIR}/${c%.c}.o"
+  compile_cpu_obj "${STAGE_DIR}/${c}" "${obj}"
+  CPU_OBJS+=("${obj}")
+done
+compile_cpu_obj "${STUBS_SRC}"   "${CPU_BUILD_DIR}/libjpeg_turbo_stubs.o"
+compile_cpu_obj "${HARNESS_SRC}" "${CPU_BUILD_DIR}/harness.o"
+CPU_OBJS+=("${CPU_BUILD_DIR}/libjpeg_turbo_stubs.o" "${CPU_BUILD_DIR}/harness.o")
+
+CPU_OUT="${HARNESS_BASENAME}_cpu"
+"$AFL_CC" -O2 -g \
+  "${SANITIZE_FLAGS[@]}" \
+  -fsanitize=fuzzer \
+  "${CPU_OBJS[@]}" \
+  -o "${CPU_OUT}" \
+  -lm
+
+[[ -x "$CPU_OUT" ]] || { echo "ERROR: CPU binary not produced" >&2; exit 1; }
+
+# --- [4/4] Build GPU cubin via coqui-cc -------------------------------------
+# Flags mirror the legacy libjpeg-turbo nix spec:
+#   -I jpeg_include          — patched headers (jmorecfg, jconfig, jconfigint, jversion)
+#   -I ${LIBJPEG_CACHE}      — upstream headers (jpeglib, etc.)
+#   -D NO_GETENV             — strip getenv lookup on GPU (no libc env)
+#   sources  = jpeg_include/*.c  (patched copies)
+#            + libjpeg_turbo_stubs.c  (SIMD + 12/16-bit no-ops)
+#            + harness.c
+#            + libjpeg_turbo_libc_stubs.c — coqui mode pass plugin has no
+#              snprintf port; jerror.c/format_message calls it only for
+#              error strings that the GPU never reads.
+# Sanitizer flags from the nix spec are intentionally omitted — coqui-cc
+# does not expose -fsanitize; the coqui mode pass plugin injects ASan/UBSan
+# device-side via CoquiPassPlugin.so.  Also, ptxas is memory-heavy at -O1;
+# flock serialises the coqui-cc step with other parallel subagents to
+# avoid OOMing the box.
+echo "=== [4/4] Build GPU cubin via coqui-cc (serialised with flock) ==="
+flock /tmp/coqui-cc.lock \
+  "${COQUI_CC}" \
+    -arch "${ARCH}" \
+    --stack-size "${STACK_SIZE}" \
+    --slab-pool-size "${SLAB_POOL_SIZE}" \
+    -I "${STAGE_DIR}" \
+    -I "${LIBJPEG_CACHE}" \
+    -D NO_GETENV \
+    "${STAGED_SRCS[@]}" \
+    "${STUBS_SRC}" \
+    "${HARNESS_SRC}" \
+    "${LIBC_STUBS_SRC}" \
+    -o "${HARNESS_BASENAME}"
+
+[[ -f "${HARNESS_BASENAME}.cubin" && -f "${HARNESS_BASENAME}.conf" ]] \
+  || { echo "ERROR: coqui-cc did not emit .cubin/.conf" >&2; exit 1; }
 
 echo
 echo "=== Build complete ==="
-ls -la "${HARNESS_NAME}.cubin" "${HARNESS_NAME}.conf" "${HARNESS_NAME}_cpu" seeds 2>/dev/null || true
-[ -L dict ] && ls -la dict
-echo "  conf:"; sed 's/^/    /' "${HARNESS_NAME}.conf"
+ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
+echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"

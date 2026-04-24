@@ -1,16 +1,19 @@
 /*
- * Math.cpp --- lower llvm.pow/log/exp intrinsics to __coqui_* runtime calls.
+ * Math.cpp --- lower llvm.pow/log/exp intrinsics + frem to __coqui_* calls.
  *
- * Minimal port of /coqui/src/MathTransform.cpp. Only covers the math
- * intrinsics NVPTX can't select natively; the runtime implementations live
- * in coqui_libc.c. Add entries here + corresponding stubs in the runtime
- * on demand.
+ * Partial port of /coqui/src/MathTransform.cpp. Covers:
+ *   - scalar llvm.pow/log/exp intrinsics (runtime stubs in coqui_libc.c)
+ *   - `frem` BinaryOperator instructions (NVPTX has no hardware fmod and
+ *     the backend can't select a libcall on-GPU; lowered to __coqui_fmod).
+ *
+ * Add more intrinsic entries here + stubs in the runtime on demand.
  */
 
 #include "Transforms.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
@@ -58,7 +61,21 @@ bool runMath(Module &M) {
         }
     }
 
-    if (Work.empty()) return false;
+    // Collect frem BinaryOperators. NVPTX has no hardware fmod, and llc
+    // cannot auto-select a libcall for frem on the GPU, so we must lower
+    // them to __coqui_fmod / __coqui_fmodf explicitly.
+    SmallVector<BinaryOperator *> FRemOps;
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                if (auto *BO = dyn_cast<BinaryOperator>(&I))
+                    if (BO->getOpcode() == Instruction::FRem)
+                        FRemOps.push_back(BO);
+            }
+        }
+    }
+
+    if (Work.empty() && FRemOps.empty()) return false;
 
     for (auto &Pair : Work) {
         CallInst *CI = Pair.first;
@@ -81,8 +98,25 @@ bool runMath(Module &M) {
         CI->eraseFromParent();
     }
 
-    errs() << "[coqui-math] rewrote " << Work.size()
-           << " llvm.pow/log/exp intrinsic call(s)\n";
+    for (auto *BO : FRemOps) {
+        Type *Ty = BO->getType();
+        bool IsF32 = Ty->isFloatTy();
+        const char *Name = IsF32 ? "__coqui_fmodf" : "__coqui_fmod";
+        FunctionType *FnTy = FunctionType::get(Ty, {Ty, Ty}, false);
+        FunctionCallee Fn = M.getOrInsertFunction(Name, FnTy);
+        IRBuilder<> Builder(BO);
+        Value *Result =
+            Builder.CreateCall(Fn, {BO->getOperand(0), BO->getOperand(1)});
+        BO->replaceAllUsesWith(Result);
+        BO->eraseFromParent();
+    }
+
+    if (!Work.empty())
+        errs() << "[coqui-math] rewrote " << Work.size()
+               << " llvm.pow/log/exp intrinsic call(s)\n";
+    if (!FRemOps.empty())
+        errs() << "[coqui-math] rewrote " << FRemOps.size()
+               << " frem instruction(s) with __coqui_fmod\n";
     return true;
 }
 

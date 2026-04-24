@@ -58,6 +58,7 @@ export AFL_IGNORE_UNKNOWN_ENVS=1
 SANITIZE_FLAGS=(
   "-fsanitize=address,array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound"
   "-fno-sanitize-recover=array-bounds,bool,builtin,enum,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unreachable,vla-bound"
+  "-fno-stack-protector"
 )
 
 # --- Pre-flight -------------------------------------------------------------

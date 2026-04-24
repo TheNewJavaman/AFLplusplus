@@ -151,12 +151,32 @@ def main():
     # them (e.g., a serial for-loop). An earlier attempt to flock this call
     # broke under SIGKILL of a waiter and left the lock file held
     # indefinitely.
+    #
+    # COQUI_PTXAS_OFC (default unset = off) enables CUDA 13.2+ ptxas
+    # --Ofast-compile, which trades runtime performance for compile speed
+    # by disabling certain optimizations. Useful for huge ASan-instrumented
+    # PTX (libxml2-style) where the 50-90 min ptxas run is the bottleneck.
+    # Values:
+    #   min — minimal impact on both compile and runtime; disables some
+    #         expensive opts. Best safety-to-speed tradeoff per NVIDIA docs.
+    #   mid — balance compile and runtime; disables more expensive opts.
+    #   max — fastest compile; disables many opts. Expect runtime (exec/s)
+    #         regression under fuzzing.
+    #   0   — disabled (default, matches current behavior).
+    # Only applied when explicitly set to a non-empty, non-"0" value.
+    # Requires CUDA 13.2+ ptxas; coqui itself does not use this flag.
     ptxas_opt = os.environ.get("COQUI_PTXAS_OPT", "-O1")
+    ptxas_ofc = os.environ.get("COQUI_PTXAS_OFC", "").strip()
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
-    run([
-        "ptxas", f"-arch={arch}", ptxas_opt,
-        str(ptx_path), "-o", str(cubin),
-    ])
+    ptxas_cmd = ["ptxas", f"-arch={arch}"]
+    # ptxas rejects -O<n> combined with --Ofast-compile=<level>; the OFC
+    # flag replaces the opt-level entirely. Pass only one of them.
+    if ptxas_ofc and ptxas_ofc != "0":
+        ptxas_cmd.append(f"--Ofast-compile={ptxas_ofc}")
+    else:
+        ptxas_cmd.append(ptxas_opt)
+    ptxas_cmd.extend([str(ptx_path), "-o", str(cubin)])
+    run(ptxas_cmd)
 
     # 6. Write .conf sidecar
     conf = cubin.with_suffix(".conf")

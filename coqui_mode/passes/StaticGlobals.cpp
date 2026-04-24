@@ -226,7 +226,7 @@ bool runStaticGlobals(Module &M) {
 
     // Reject if referenced by other global initializers (non-CE non-inst users).
     if (!canPool(GV)) {
-      errs() << "[coqui] StaticGlobals: skipping " << Name
+      errs() << "[coqui-statics] skipping " << Name
              << " (non-instruction users)\n";
       continue;
     }
@@ -235,7 +235,7 @@ bool runStaticGlobals(Module &M) {
   }
 
   if (Candidates.empty()) {
-    errs() << "[coqui] StaticGlobals: no writable globals to pool\n";
+    errs() << "[coqui-statics] no writable globals to pool\n";
     return false;
   }
 
@@ -260,7 +260,7 @@ bool runStaticGlobals(Module &M) {
   }
   uint64_t TotalSize = alignTo(CurOffset, 8);
 
-  errs() << "[coqui] StaticGlobals: pooling " << Candidates.size()
+  errs() << "[coqui-statics] pooling " << Candidates.size()
          << " globals, " << TotalSize << " bytes/thread\n";
   for (const auto &Info : Candidates)
     errs() << "  " << Info.GV->getName() << ": " << Info.Size << "B @ +"
