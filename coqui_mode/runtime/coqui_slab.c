@@ -207,13 +207,13 @@ static char *slab_free_stack_pop(unsigned int n_needed) {
   unsigned long next;
   do {
     old_head = *head;
-    if (old_head == 0) return (char *)0;
+    if (likely(old_head == 0)) return (char *)0;
     next = *(unsigned long *)(void *)old_head;  /* read next pointer */
   } while (slab_atom_cas_64(head, old_head, next) != old_head);
   /* Accept range only if big enough; else push back and fail. */
   char *range = (char *)old_head;
   unsigned int range_n = *(unsigned int *)(void *)(range + 8);
-  if (range_n >= n_needed) return range;
+  if (likely(range_n >= n_needed)) return range;
   slab_free_stack_push(range);
   return (char *)0;
 }
@@ -231,11 +231,13 @@ static char *slab_alloc_slabs(unsigned int n) {
   unsigned int ctrl_slabs = __coqui_slab_ctrl_slabs;
   unsigned int max_slabs = (unsigned int)(__coqui_slab_pool_size / SLAB_SIZE);
 
-  /* Tier 1: block-local bump via shared atomic. */
-  if (__coqui_slab_block_budget > 0) {
+  /* Tier 1: block-local bump via shared atomic. The fast path resolves
+   * inside the SM (~20 cycles); falling through to global / Treiber is
+   * the rare case once a block has been sized to its budget. */
+  if (likely(__coqui_slab_block_budget > 0)) {
     unsigned int *bnext = __coqui_slab_block_next();
     unsigned int local_idx = slab_atom_add_gen(bnext, n);
-    if (local_idx + n <= __coqui_slab_block_budget) {
+    if (likely(local_idx + n <= __coqui_slab_block_budget)) {
       unsigned int bid = slab_blockIdx_x();
       unsigned int abs_slab =
           ctrl_slabs + bid * __coqui_slab_block_budget + local_idx;
@@ -244,13 +246,17 @@ static char *slab_alloc_slabs(unsigned int n) {
     /* block budget exhausted */
   }
 
-  /* Tier 2: global atomic bump. */
+  /* Tier 2: global atomic bump. Reached only after tier-1 missed; a tier-2
+   * miss falls through to tier-3 (rare — the pool sized correctly is bigger
+   * than the cumulative slab demand). */
   unsigned int slab_idx = slab_atom_add_global(__coqui_slab_next, n);
   unsigned int abs_slab = slab_idx + ctrl_slabs;
-  if (abs_slab + n <= max_slabs)
+  if (likely(abs_slab + n <= max_slabs))
     return __coqui_slab_pool + (unsigned long)abs_slab * SLAB_SIZE;
 
-  /* Tier 3: try a reclaimed range from the Treiber stack. */
+  /* Tier 3: try a reclaimed range from the Treiber stack. Reached only on
+   * pool exhaustion; success is the rare case where another thread freed
+   * a range first. */
   char *recycled = slab_free_stack_pop(n);
   if (recycled)
     return recycled;
@@ -293,21 +299,22 @@ static unsigned int slab_size_to_bucket(unsigned int size) {
  * would not survive the indirect call anyway. */
 __attribute__((noinline, nothrow))
 void *__coqui_slab_malloc(unsigned long size) {
-  if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
+  if (unlikely(!__coqui_slab_pool || __coqui_slab_pool_size == 0))
     return (void *)0;
-  if (size == 0) size = 1;
+  if (unlikely(size == 0)) size = 1;
   /* Reject absurdly large single allocations. Corrupted chunk length fields
    * (100MB-4GB) cause catastrophic memset stalls on NVPTX. */
-  if (size > SLAB_MAX_SINGLE_ALLOC)
+  if (unlikely(size > SLAB_MAX_SINGLE_ALLOC))
     return (void *)0;
   unsigned int needed = (unsigned int)size + SLAB_BLOCK_HDR_SIZE;
   unsigned int bucket = slab_size_to_bucket(needed);
 
-  /* Multi-slab path (>64KB): grab contiguous slabs, leak on free. */
-  if (bucket >= SLAB_N_BUCKETS) {
+  /* Multi-slab path (>64KB): grab contiguous slabs, leak on free. Small
+   * allocations dominate; large allocs are the bucket-overflow case. */
+  if (unlikely(bucket >= SLAB_N_BUCKETS)) {
     unsigned int n_slabs = (needed + SLAB_SIZE - 1) / SLAB_SIZE;
     char *block = slab_alloc_slabs(n_slabs);
-    if (!block) return (void *)0;
+    if (unlikely(!block)) return (void *)0;
     *(unsigned int *)(void *)block =
         SLAB_MULTI_SLAB_IDX | ((n_slabs * SLAB_SIZE) << 4);
     return (void *)(block + SLAB_BLOCK_HDR_SIZE);
@@ -328,14 +335,16 @@ void *__coqui_slab_malloc(unsigned long size) {
   /* Store allocation size in first 8 bytes (for first-fit matching). */
   unsigned int block_size = 8 + aligned; /* 8B size header + user data */
 
-  /* Try per-thread freelist (first-fit by size, bounded search). */
+  /* Try per-thread freelist (first-fit by size, bounded search). Small
+   * allocations dominate fuzzing workloads, and a freelist hit is the
+   * expected fast path once a thread has done any allocation churn. */
   {
     char **prev_next = free_head_ptr;
     char *cur = *free_head_ptr;
     int limit = 128;
     while (cur && limit-- > 0) {
       unsigned int blk_sz = *(unsigned int *)(void *)cur;
-      if (blk_sz >= block_size) {
+      if (likely(blk_sz >= block_size)) {
         *prev_next = *(char **)(void *)(cur + 8); /* prev->next = cur->next */
         return (void *)(cur + 8);                 /* user area */
       }
@@ -349,9 +358,9 @@ void *__coqui_slab_malloc(unsigned long size) {
   unsigned int hlimit = *limit_ptr;
   unsigned int btop = *bump_ptr;
 
-  if (!heap) {
+  if (unlikely(!heap)) {
     heap = slab_alloc_slabs(SLAB_OVERFLOW_INITIAL_SLABS);
-    if (!heap) return (void *)0;
+    if (unlikely(!heap)) return (void *)0;
     *(unsigned long *)(void *)heap = 0;  /* prev = NULL */
     *(unsigned int *)(void *)(heap + 8) = SLAB_OVERFLOW_INITIAL_SLABS;
     *heap_ptr = heap;
@@ -360,13 +369,13 @@ void *__coqui_slab_malloc(unsigned long size) {
     btop = 16; /* skip range header */
   }
 
-  if (btop + block_size > hlimit) {
+  if (unlikely(btop + block_size > hlimit)) {
     char *old_heap = heap;
     unsigned int grow = SLAB_OVERFLOW_GROW_SLABS;
     unsigned int need = (block_size + SLAB_SIZE - 1) / SLAB_SIZE;
-    if (need > grow) grow = need;
+    if (unlikely(need > grow)) grow = need;
     heap = slab_alloc_slabs(grow);
-    if (!heap) return (void *)0;
+    if (unlikely(!heap)) return (void *)0;
     *(unsigned long *)(void *)heap = (unsigned long)old_heap;
     *(unsigned int *)(void *)(heap + 8) = grow;
     *heap_ptr = heap;
@@ -384,7 +393,7 @@ void *__coqui_slab_malloc(unsigned long size) {
 /* `noinline, nothrow`: same rationale as __coqui_slab_malloc. */
 __attribute__((noinline, nothrow))
 void __coqui_slab_free(void *ptr) {
-  if (!ptr) return;
+  if (unlikely(!ptr)) return;
 
   /* Push onto per-thread absolute-pointer freelist. */
   unsigned long tid = __coqui_fuzz_tid();
@@ -392,7 +401,8 @@ void __coqui_slab_free(void *ptr) {
   char **free_head_ptr = (char **)(void *)tctrl;
   /* Block starts 8B before ptr (size header preserved for first-fit). */
   char *block = (char *)ptr - 8;
-  if (block < __coqui_slab_pool || block >= __coqui_slab_pool + __coqui_slab_pool_size)
+  if (unlikely(block < __coqui_slab_pool ||
+               block >= __coqui_slab_pool + __coqui_slab_pool_size))
     return;
 
   /* Insert sorted by size (largest first) with a short search to cap
@@ -420,7 +430,7 @@ void __coqui_slab_free(void *ptr) {
  * thread exit. Never throws. */
 __attribute__((nothrow))
 void __coqui_slab_release_thread(void) {
-  if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
+  if (unlikely(!__coqui_slab_pool || __coqui_slab_pool_size == 0))
     return;
   unsigned long tid = __coqui_fuzz_tid();
   char *tctrl = __coqui_slab_pool + tid * 32;
@@ -431,7 +441,7 @@ void __coqui_slab_release_thread(void) {
   while (heap) {
     char *prev = (char *)(*(unsigned long *)(void *)heap);
     unsigned int n_slabs = *(unsigned int *)(void *)(heap + 8);
-    if (n_slabs > 0)
+    if (likely(n_slabs > 0))
       slab_free_stack_push(heap);
     heap = prev;
   }
@@ -452,7 +462,7 @@ void __coqui_slab_release_thread(void) {
  * ctrl_slabs (needs runtime grid dims) and registers with ASan. `nothrow`. */
 __attribute__((nothrow))
 void __coqui_slab_setup(void) {
-  if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
+  if (unlikely(!__coqui_slab_pool || __coqui_slab_pool_size == 0))
     return;
   unsigned int bd, gd;
   asm volatile("mov.u32 %0, %%ntid.x;" : "=r"(bd));
@@ -467,7 +477,7 @@ void __coqui_slab_setup(void) {
  * and the per-block allocation counter. `nothrow`. */
 __attribute__((nothrow))
 void __coqui_slab_init_block(void) {
-  if (!__coqui_slab_pool || __coqui_slab_pool_size == 0)
+  if (unlikely(!__coqui_slab_pool || __coqui_slab_pool_size == 0))
     return;
   char *base = __coqui_slab_bucket_base();
   for (int i = 0; i < SLAB_N_BUCKETS; i++) {

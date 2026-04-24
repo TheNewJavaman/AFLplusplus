@@ -83,7 +83,7 @@ extern char *__coqui_slab_shadow __attribute__((weak));
  * here). */
 static void slab_shadow_poison(unsigned long slab_off, unsigned long n,
                                 u8 value) {
-    if (!__coqui_slab_shadow) return;
+    if (unlikely(!__coqui_slab_shadow)) return;
     u8 *shadow = (u8 *)__coqui_slab_shadow;
     unsigned long start = slab_off >> 3;
     unsigned long end   = (slab_off + n) >> 3;
@@ -91,7 +91,7 @@ static void slab_shadow_poison(unsigned long slab_off, unsigned long n,
 }
 
 static void slab_shadow_unpoison(unsigned long slab_off, unsigned long n) {
-    if (!__coqui_slab_shadow) return;
+    if (unlikely(!__coqui_slab_shadow)) return;
     u8 *shadow = (u8 *)__coqui_slab_shadow;
     unsigned long aligned = n & ~7UL;
     unsigned long partial = n & 7u;
@@ -328,7 +328,7 @@ static unsigned int asan_slab_register(const void *beg,
                                         unsigned long user_size,
                                         unsigned long total_size) {
     unsigned int idx = asan_atom_add_gen(&__coqui_asan_num_slab_descs, 1u);
-    if (idx >= ASAN_MAX_SLAB_DESCS) return ASAN_MAX_SLAB_DESCS;
+    if (unlikely(idx >= ASAN_MAX_SLAB_DESCS)) return ASAN_MAX_SLAB_DESCS;
     __coqui_asan_slab_descs[idx].beg        = beg;
     __coqui_asan_slab_descs[idx].user_size  = user_size;
     __coqui_asan_slab_descs[idx].total_size = total_size;
@@ -381,10 +381,10 @@ static int asan_check_slab(unsigned long addr, unsigned long size) {
  * error code. Returns 0 if the pointer is outside the slab pool. */
 static int asan_check_slab_shadow(void *ptr, u8 access_size,
                                    int *out_error_type) {
-    if (!__coqui_slab_pool || !__coqui_slab_shadow) return 0;
+    if (unlikely(!__coqui_slab_pool || !__coqui_slab_shadow)) return 0;
     unsigned long a = (unsigned long)ptr;
     unsigned long sp = (unsigned long)__coqui_slab_pool;
-    if (a < sp || a + access_size > sp + __coqui_slab_pool_size) return 0;
+    if (unlikely(a < sp || a + access_size > sp + __coqui_slab_pool_size)) return 0;
 
     unsigned long off     = a - sp;
     unsigned long end_off = off + (unsigned long)access_size - 1u;
@@ -456,8 +456,10 @@ static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
     unsigned long a = (unsigned long)ptr;
     unsigned long heap_start = (unsigned long)heap;
 
-    /* Fast path: pointer is outside the usable heap — not our concern. */
-    if (a < heap_start || a + access_size > heap_start + heap_sz)
+    /* Fast path: pointer is outside the usable heap — not our concern.
+     * The slow path is reached almost exclusively from out-of-heap accesses
+     * (globals / slab); the in-heap shadow miss is comparatively rare. */
+    if (unlikely(a < heap_start || a + access_size > heap_start + heap_sz))
         return 0;
 
     unsigned long off     = a - heap_start;
@@ -468,10 +470,10 @@ static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
     for (unsigned long i = si; i <= si_end; i++) {
         u8 s = shadow[i];
 
-        if (s == ASAN_CLEAN)
+        if (likely(s == ASAN_CLEAN))
             continue;   /* fully accessible granule */
 
-        if (s >= 0x80u) {
+        if (unlikely(s >= 0x80u)) {
             /* Fully poisoned — distinguish freed vs red zone. */
             *out_error_type = (s == ASAN_FREED) ? ASAN_ERROR_USE_AFTER_FREE
                                                  : ASAN_ERROR_HEAP_OVERFLOW;
@@ -481,7 +483,7 @@ static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
         /* Partial granule: first s bytes accessible.
            Check whether this access touches any byte beyond offset s. */
         unsigned long end_in_granule = (i == si_end) ? (end_off & 7u) + 1u : 8u;
-        if (end_in_granule > (unsigned long)s) {
+        if (unlikely(end_in_granule > (unsigned long)s)) {
             *out_error_type = ASAN_ERROR_HEAP_OVERFLOW;
             return 1;
         }
@@ -522,8 +524,12 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
     unsigned long a          = (unsigned long)ptr;
     unsigned long heap_start = (unsigned long)heap;
 
-    /* Pointer outside the usable heap — not our concern, treat as clean. */
-    if (a < heap_start || a + access_size > heap_start + heap_sz)
+    /* Pointer outside the usable heap — not our concern, treat as clean.
+     * Inlined fast-path sees both heap and out-of-heap traffic; bias the
+     * branch toward "in heap" so the shadow check is the fall-through.
+     * NB: this differs from asan_check_access (slow-path) where reaching
+     * that body already filtered out most in-heap shadow hits. */
+    if (unlikely(a < heap_start || a + access_size > heap_start + heap_sz))
         return 1;
 
     unsigned long off    = a - heap_start;
@@ -531,13 +537,13 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
     u8 s                 = shadow[off >> 3];
 
     /* First granule must be fully clean. */
-    if (s != ASAN_CLEAN) return 0;
+    if (unlikely(s != ASAN_CLEAN)) return 0;
 
     /* If the access crosses into a second granule, check that one too. */
     unsigned long end_off = off + (unsigned long)access_size - 1u;
-    if ((end_off >> 3) != (off >> 3)) {
+    if (unlikely((end_off >> 3) != (off >> 3))) {
         s = shadow[end_off >> 3];
-        if (s != ASAN_CLEAN) return 0;
+        if (unlikely(s != ASAN_CLEAN)) return 0;
     }
     return 1;
 }
@@ -637,9 +643,11 @@ __attribute__((nothrow))
 void *__coqui_asan_malloc(unsigned long size) {
     unsigned long padded = ASAN_LEFT_REDZONE + size + ASAN_RIGHT_REDZONE;
 
-    /* Tier 1: per-thread heap. */
+    /* Tier 1: per-thread heap. The heap is sized to satisfy the common
+     * mid-execution allocation pattern; falling through to the slab tier
+     * only happens for targets that exhaust the per-thread budget. */
     void *raw = __coqui_malloc(padded);
-    if (raw) {
+    if (likely(raw != (void *)0)) {
         u8 *user      = (u8 *)raw + ASAN_LEFT_REDZONE;
         u8 *heap_base = __coqui_heap_base();
         unsigned long raw_off = (u8 *)raw - heap_base;
@@ -656,9 +664,9 @@ void *__coqui_asan_malloc(unsigned long size) {
     /* Tier 2: slab pool (if a slab runtime is linked and has registered a
      * malloc_fn). g_slab_malloc stays NULL for non-slab targets, in which
      * case we proceed directly to the OOM trap. */
-    if (g_slab_malloc && __coqui_slab_pool && __coqui_slab_pool_size) {
+    if (unlikely(g_slab_malloc && __coqui_slab_pool && __coqui_slab_pool_size)) {
         void *slab_raw = g_slab_malloc(padded);
-        if (slab_raw) {
+        if (likely(slab_raw != (void *)0)) {
             u8 *user = (u8 *)slab_raw + ASAN_LEFT_REDZONE;
             unsigned long slab_off =
                 (unsigned long)((u8 *)slab_raw - (u8 *)__coqui_slab_pool);
@@ -696,15 +704,16 @@ void *__coqui_asan_malloc(unsigned long size) {
  */
 __attribute__((nothrow))
 void __coqui_asan_free(void *ptr) {
-    if (!ptr) return;
+    if (unlikely(!ptr)) return;
 
     u8 *user  = (u8 *)ptr;
     u8 *raw   = user - ASAN_LEFT_REDZONE;
 
     /* Slab-pool routing: if ptr is in the slab range, free via the slab
      * allocator and poison slab shadow. Block header is [size:u32] 8 bytes
-     * before user_raw (matching coqui_slab.c's layout). */
-    if (g_slab_free && __coqui_slab_pool && __coqui_slab_pool_size) {
+     * before user_raw (matching coqui_slab.c's layout). The slab path is
+     * the rare case — most allocations live in the per-thread heap. */
+    if (unlikely(g_slab_free && __coqui_slab_pool && __coqui_slab_pool_size)) {
         u8 *sp_lo = (u8 *)__coqui_slab_pool;
         u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
         if (user >= sp_lo && user < sp_hi) {
@@ -717,12 +726,12 @@ void __coqui_asan_free(void *ptr) {
             u32 blk = (slab_hdr >= sp_lo && slab_hdr < sp_hi)
                         ? *(u32 *)slab_hdr : 0u;
             unsigned long payload = (blk > 8u) ? (blk - 8u) : 0u;
-            if (slab_off + payload > __coqui_slab_pool_size) {
+            if (unlikely(slab_off + payload > __coqui_slab_pool_size)) {
                 unsigned long safe = (__coqui_slab_pool_size > slab_off)
                                        ? (__coqui_slab_pool_size - slab_off) : 0;
                 payload = safe & ~7UL;
             }
-            if (payload) slab_shadow_poison(slab_off, payload, ASAN_FREED);
+            if (likely(payload)) slab_shadow_poison(slab_off, payload, ASAN_FREED);
             g_slab_free((void *)raw);
             return;
         }
@@ -733,11 +742,11 @@ void __coqui_asan_free(void *ptr) {
     /* Bounds check: block header must be within the heap region. */
     u8 *heap_lo = __coqui_heap_base();
     u8 *heap_hi = heap_lo + __coqui_heap_size();
-    if (block < heap_lo || block >= heap_hi) return;
+    if (unlikely(block < heap_lo || block >= heap_hi)) return;
 
     /* Read the original total block size from the header (includes BLOCK_HDR_SIZE). */
     u32 full_sz = *(u32 *)block;
-    if (full_sz < BLOCK_HDR_SIZE) return;   /* sanity */
+    if (unlikely(full_sz < BLOCK_HDR_SIZE)) return;   /* sanity */
 
     /* Poison the entire payload (left_redzone + user + right_redzone). */
     unsigned long payload  = (unsigned long)(full_sz - BLOCK_HDR_SIZE);
@@ -774,11 +783,11 @@ static void asan_memcpy_u8(void *dst, const void *src, unsigned long n) {
 __attribute__((nothrow))
 void *__coqui_asan_calloc(unsigned long nmemb, unsigned long size) {
     unsigned long total;
-    if (__builtin_umull_overflow(nmemb, size, &total))
+    if (unlikely(__builtin_umull_overflow(nmemb, size, &total)))
         return (void *)0;
 
     void *ptr = __coqui_asan_malloc(total);
-    if (!ptr) return (void *)0;
+    if (unlikely(!ptr)) return (void *)0;
 
     /* Zero ONLY the user region — red zones were poisoned in the shadow
      * by __coqui_asan_malloc and must remain untouched. */
@@ -814,8 +823,8 @@ void *__coqui_asan_calloc(unsigned long nmemb, unsigned long size) {
  */
 __attribute__((noinline, nothrow))
 void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
-    if (!ptr) return __coqui_asan_malloc(new_size);
-    if (new_size == 0) {
+    if (unlikely(!ptr)) return __coqui_asan_malloc(new_size);
+    if (unlikely(new_size == 0)) {
         __coqui_asan_free(ptr);
         return (void *)0;
     }
@@ -829,8 +838,8 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
      * Match __coqui_asan_free's slab-range check (see line 680). */
     u8 *sp_lo = (u8 *)__coqui_slab_pool;
     u8 *sp_hi = sp_lo + (__coqui_slab_pool ? __coqui_slab_pool_size : 0);
-    if (__coqui_slab_pool && __coqui_slab_pool_size &&
-        user >= sp_lo && user < sp_hi) {
+    if (unlikely(__coqui_slab_pool && __coqui_slab_pool_size &&
+                 user >= sp_lo && user < sp_hi)) {
         /* Slab block layout handed out by __coqui_asan_slab_malloc /
          * __coqui_asan_malloc's tier-2 fall-through:
          *   [slab hdr: u32 = 8 + total_aligned] [left_rz (16)] [user] [right_rz (16)]
@@ -838,9 +847,9 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
          * total payload the slab allocator tracks (excluding its 8B header).
          * So user_size_aligned = (blk - 8) - LEFT_RZ - RIGHT_RZ. */
         u8 *slab_hdr = raw - 8;
-        if (slab_hdr < sp_lo || slab_hdr >= sp_hi) return (void *)0;
+        if (unlikely(slab_hdr < sp_lo || slab_hdr >= sp_hi)) return (void *)0;
         u32 blk = *(u32 *)slab_hdr;
-        if (blk < 8u + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE) return (void *)0;
+        if (unlikely(blk < 8u + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE)) return (void *)0;
         old_size = (unsigned long)blk - 8u
                    - ASAN_LEFT_REDZONE - ASAN_RIGHT_REDZONE;
     } else {
@@ -848,16 +857,16 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
         u8 *block = raw - BLOCK_HDR_SIZE;
         u8 *heap_lo = __coqui_heap_base();
         u8 *heap_hi = heap_lo + __coqui_heap_size();
-        if (block < heap_lo || block >= heap_hi) return (void *)0;
+        if (unlikely(block < heap_lo || block >= heap_hi)) return (void *)0;
         u32 full_sz = *(u32 *)block;
-        if (full_sz < BLOCK_HDR_SIZE + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE)
+        if (unlikely(full_sz < BLOCK_HDR_SIZE + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE))
             return (void *)0;
         old_size = (unsigned long)(full_sz - BLOCK_HDR_SIZE)
                    - ASAN_LEFT_REDZONE - ASAN_RIGHT_REDZONE;
     }
 
     void *new_ptr = __coqui_asan_malloc(new_size);
-    if (!new_ptr) return (void *)0;
+    if (unlikely(!new_ptr)) return (void *)0;
 
     unsigned long copy_size = (old_size < new_size) ? old_size : new_size;
     asan_memcpy_u8(new_ptr, ptr, copy_size);
@@ -888,15 +897,15 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
  * survive the indirect call. */
 __attribute__((nothrow))
 void *__coqui_asan_slab_malloc(unsigned long size) {
-    if (!g_slab_malloc) return (void *)0;
-    if (size == 0) size = 1;
+    if (unlikely(!g_slab_malloc)) return (void *)0;
+    if (unlikely(size == 0)) size = 1;
 
     /* Align user size up to 8 bytes so right-redzone starts on a boundary. */
     unsigned long user_aligned = (size + 7UL) & ~7UL;
     unsigned long total        = ASAN_LEFT_REDZONE + user_aligned + ASAN_RIGHT_REDZONE;
 
     u8 *raw = (u8 *)g_slab_malloc(total);
-    if (!raw) return (void *)0;
+    if (unlikely(!raw)) return (void *)0;
 
     u8 *user = raw + ASAN_LEFT_REDZONE;
 
@@ -917,8 +926,8 @@ void *__coqui_asan_slab_malloc(unsigned long size) {
 
 __attribute__((nothrow))
 void __coqui_asan_slab_free(void *ptr) {
-    if (!ptr) return;
-    if (!g_slab_free) return;
+    if (unlikely(!ptr)) return;
+    if (unlikely(!g_slab_free)) return;
 
     u8 *user = (u8 *)ptr;
     u8 *raw  = user - ASAN_LEFT_REDZONE;
@@ -927,12 +936,12 @@ void __coqui_asan_slab_free(void *ptr) {
      * for them, and calling g_slab_free with a heap/global pointer would
      * corrupt the slab allocator. */
     unsigned int hot_slot = *(unsigned int *)raw;
-    if (hot_slot > 0u && hot_slot <= ASAN_MAX_SLAB_DESCS) {
+    if (likely(hot_slot > 0u && hot_slot <= ASAN_MAX_SLAB_DESCS)) {
         /* Fast path: clear the descriptor slot the hot-tag points to, and
          * verify the beg matches (guards against stale tags if the caller
          * hands us a random pointer). */
         unsigned int idx = hot_slot - 1u;
-        if (__coqui_asan_slab_descs[idx].beg == (const void *)user) {
+        if (likely(__coqui_asan_slab_descs[idx].beg == (const void *)user)) {
             __coqui_asan_slab_descs[idx].beg        = (void *)0;
             __coqui_asan_slab_descs[idx].user_size  = 0;
             __coqui_asan_slab_descs[idx].total_size = 0;

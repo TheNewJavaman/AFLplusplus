@@ -59,19 +59,20 @@ void __coqui_memory_init(void) {
  * below is always_inline. */
 __attribute__((nothrow))
 void *__coqui_malloc_raw(unsigned long size) {
-    if (size == 0) size = 1;
+    if (unlikely(size == 0)) size = 1;
     u32 need = align8((u32)size) + BLOCK_HDR_SIZE;
     if (need < HEAP_MIN_ALLOC + BLOCK_HDR_SIZE) need = HEAP_MIN_ALLOC + BLOCK_HDR_SIZE;
 
     heap_hdr_t *hdr = heap_hdr();
 
-    /* Try freelist first-fit (8-iter limit) */
+    /* Try freelist first-fit (8-iter limit). Once a thread has done any
+     * alloc/free churn the freelist hit is the steady-state fast path. */
     void **prev_next = &hdr->free_head;
     void *cur = hdr->free_head;
     int iters = 8;
     while (cur && iters-- > 0) {
         u32 blk_sz = *(u32 *)cur;
-        if (blk_sz >= need) {
+        if (likely(blk_sz >= need)) {
             *prev_next = *(void **)((u8 *)cur + BLOCK_HDR_SIZE);
             return (u8 *)cur + BLOCK_HDR_SIZE;
         }
@@ -84,7 +85,7 @@ void *__coqui_malloc_raw(unsigned long size) {
      * pool (if configured) or stamping trap_reason = COQUI_TRAP_OOM. The
      * previous behavior (trap here) blocked slab fall-through entirely. */
     u32 heap_sz = __coqui_heap_size();
-    if (hdr->bump_top + need > heap_sz) {
+    if (unlikely(hdr->bump_top + need > heap_sz)) {
         return (void *)0;
     }
 
@@ -105,13 +106,14 @@ __attribute__((weak)) void __coqui_slab_free(void *ptr);
 
 __attribute__((nothrow))
 void __coqui_free_raw(void *ptr) {
-    if (!ptr) return;
+    if (unlikely(!ptr)) return;
 
     /* Route slab-pool pointers to the slab free path. The range check
      * precedes the heap-header dereference so we never scribble over
      * a slab pointer's first 8 bytes treating them as the heap block
-     * header. */
-    if (__coqui_slab_pool && __coqui_slab_pool_size) {
+     * header. The slab path is the rare case for targets without a
+     * slab pool (and even with one, most allocs land in the heap). */
+    if (unlikely(__coqui_slab_pool && __coqui_slab_pool_size)) {
         u8 *sp_lo = (u8 *)__coqui_slab_pool;
         u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
         if ((u8 *)ptr >= sp_lo && (u8 *)ptr < sp_hi) {
@@ -125,7 +127,7 @@ void __coqui_free_raw(void *ptr) {
     /* Bounds check: block must be within heap region */
     u8 *heap_lo = __coqui_heap_base();
     u8 *heap_hi = heap_lo + __coqui_heap_size();
-    if (block < heap_lo || block >= heap_hi) return;
+    if (unlikely(block < heap_lo || block >= heap_hi)) return;
 
     heap_hdr_t *hdr = heap_hdr();
     u32 blk_sz = *(u32 *)block;
@@ -183,14 +185,14 @@ __attribute__((nothrow))
 void *__coqui_calloc(unsigned long nmemb, unsigned long size) {
     unsigned long total = nmemb * size;
     void *p = __coqui_malloc(total);
-    if (p) memset_u8(p, 0, total);
+    if (likely(p != (void *)0)) memset_u8(p, 0, total);
     return p;
 }
 
 __attribute__((nothrow))
 void *__coqui_realloc(void *ptr, unsigned long size) {
-    if (!ptr) return __coqui_malloc(size);
-    if (size == 0) { __coqui_free(ptr); return (void *)0; }
+    if (unlikely(!ptr)) return __coqui_malloc(size);
+    if (unlikely(size == 0)) { __coqui_free(ptr); return (void *)0; }
 
     /* Slab-pool pointers always take the malloc+copy+free path (no in-place
      * shrink). We cannot safely read a slab allocation's original size from
@@ -198,7 +200,7 @@ void *__coqui_realloc(void *ptr, unsigned long size) {
      * and the slab free path handles the range check itself. This is also
      * how the legacy coqui realloc routes cross-tier reallocs (see
      * runtime/coqui_fuzz_asan.c). */
-    if (__coqui_slab_pool && __coqui_slab_pool_size) {
+    if (unlikely(__coqui_slab_pool && __coqui_slab_pool_size)) {
         u8 *sp_lo = (u8 *)__coqui_slab_pool;
         u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
         if ((u8 *)ptr >= sp_lo && (u8 *)ptr < sp_hi) {
@@ -210,7 +212,7 @@ void *__coqui_realloc(void *ptr, unsigned long size) {
             u32 old_size = (old_block > 8u) ? (old_block - 8u) : 0u;
             unsigned long copy = (old_size < size) ? old_size : (u32)size;
             void *new_ptr = __coqui_malloc(size);
-            if (!new_ptr) return (void *)0;
+            if (unlikely(!new_ptr)) return (void *)0;
             memcpy_u8(new_ptr, ptr, copy);
             __coqui_free(ptr);
             return new_ptr;
@@ -223,7 +225,7 @@ void *__coqui_realloc(void *ptr, unsigned long size) {
     if (old_size >= size) return ptr;   /* no-op shrink */
 
     void *new_ptr = __coqui_malloc(size);
-    if (!new_ptr) return (void *)0;
+    if (unlikely(!new_ptr)) return (void *)0;
     memcpy_u8(new_ptr, ptr, old_size);
     __coqui_free(ptr);
     return new_ptr;
