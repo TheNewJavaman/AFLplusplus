@@ -31,6 +31,7 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runVariadic(M);           /* before RejectIntrinsics so llvm.va_* is lowered first */
     Changed |= coqui::runRejectIntrinsics(M);
     Changed |= coqui::runFuzzEntry(M);
+    Changed |= coqui::runCpp(M);                /* rewrite C++ new/delete before Heap so _Znwm etc are lowered */
     Changed |= coqui::runHeap(M);
     Changed |= coqui::runSprintf(M);            /* before runLibc so raw sprintf/snprintf are resolvable */
     Changed |= coqui::runLibc(M);

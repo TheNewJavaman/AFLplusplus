@@ -16,6 +16,7 @@ bool runRejectInlineAsm(llvm::Module &M);
 bool runRejectLibc(llvm::Module &M);
 bool runRejectIntrinsics(llvm::Module &M);
 bool runFuzzEntry(llvm::Module &M);
+bool runCpp(llvm::Module &M);
 bool runHeap(llvm::Module &M);
 bool runSprintf(llvm::Module &M);
 bool runLibc(llvm::Module &M);

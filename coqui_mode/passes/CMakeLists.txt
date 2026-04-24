@@ -16,6 +16,7 @@ set(COQUI_PASS_SOURCES
     RejectLibc.cpp
     RejectIntrinsics.cpp
     FuzzEntry.cpp
+    Cpp.cpp
     Heap.cpp
     Sprintf.cpp
     Libc.cpp
