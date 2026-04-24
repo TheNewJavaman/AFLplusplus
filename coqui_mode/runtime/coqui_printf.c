@@ -32,11 +32,13 @@
  * rewritten sprintf/snprintf sites. Forward to the engine cores.
  * ===----------------------------------------------------------------=== */
 
+__attribute__((nothrow))
 int __coqui_sprintf_impl(char *buf, const char *fmt,
                          const unsigned long *args, int nargs) {
   return __coqui_sprintf_core(buf, fmt, args, nargs);
 }
 
+__attribute__((nothrow))
 int __coqui_snprintf_impl(char *buf, unsigned long size, const char *fmt,
                           const unsigned long *args, int nargs) {
   return __coqui_snprintf_core(buf, size, fmt, args, nargs);

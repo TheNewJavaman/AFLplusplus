@@ -101,7 +101,11 @@ typedef struct coqui_status {
 
 /* -- Device-side helpers (implemented in runtime .c files) -- */
 
-/* Thread identity */
+/* Thread identity. `const, nothrow`: the underlying PTX %tid/%ntid/%ctaid
+ * registers are invariant for a given thread, so the result depends only
+ * on (implicit) thread state — LLVM may CSE/hoist calls across loops in
+ * any TU that includes this header. */
+__attribute__((const, nothrow))
 u32 __coqui_fuzz_tid(void);
 
 /* Trap / exit */

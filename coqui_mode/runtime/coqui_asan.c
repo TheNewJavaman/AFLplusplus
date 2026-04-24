@@ -64,6 +64,7 @@
 static void *(*g_slab_malloc)(unsigned long) = (void *)0;
 static void  (*g_slab_free)(void *)          = (void *)0;
 
+__attribute__((nothrow))
 void __coqui_asan_register_slab(void *(*m)(unsigned long), void (*f)(void *)) {
     g_slab_malloc = m;
     g_slab_free   = f;
@@ -234,6 +235,7 @@ static unsigned long __coqui_asan_num_globals;
  * below ensures we never dereference it in the no-pool case. */
 extern u8 *__coqui_global_statics_pool_base;
 
+__attribute__((nothrow))
 void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
                                     unsigned long count) {
     /* All GPU threads call this concurrently with identical arguments,
@@ -417,6 +419,10 @@ static int asan_check_slab_shadow(void *ptr, u8 access_size,
  */
 extern coqui_status_t *__coqui_status_array;
 
+/* `noinline, cold, nothrow`: only invoked from slow-path arms that already
+ * detected poison. Out-of-line keeps the crash-sig fold + status write
+ * out of the hot icache. */
+__attribute__((noinline, cold, nothrow))
 static void asan_report(int error_type) {
     u32 tid = __coqui_fuzz_tid();
     __coqui_status_array[tid].asan_error = (u8)error_type;
@@ -507,7 +513,9 @@ static int asan_check_access(void *ptr, u8 access_size, int *out_error_type) {
  * correctly.
  * ===-------------------------------------------------------------------=== */
 
-static inline __attribute__((always_inline))
+/* `always_inline, nothrow`: hot fast path. Caller folds this into a
+ * straight-line range + shadow byte check. */
+static inline __attribute__((always_inline, nothrow))
 int asan_fastpath_ok(void *ptr, u8 access_size) {
     u8  *heap        = __coqui_heap_base();
     u32  heap_sz     = __coqui_heap_size();
@@ -545,8 +553,13 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
  * global-variable descriptor table so OOB into global red zones gets
  * caught.
  */
+/* `noinline, cold, nothrow`: outlined slow path; only entered when the
+ * fast-path shadow check or range check failed. `cold` lets llc place
+ * these at the end of the parent fuzz kernel so the hot fall-through
+ * (clean access) is straight-line. `nothrow` matches every other C
+ * runtime entry point. */
 #define SLOWPATH_IMPL(N)                                                \
-    __attribute__((noinline))                                            \
+    __attribute__((noinline, cold, nothrow))                             \
     void __coqui_asan_slowpath_load_##N(void *ptr) {                     \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
@@ -556,7 +569,7 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
         if (asan_check_slab((unsigned long)ptr, (u8)(N)))                \
             asan_report(ASAN_ERROR_SLAB_OVERFLOW);                       \
     }                                                                    \
-    __attribute__((noinline))                                            \
+    __attribute__((noinline, cold, nothrow))                             \
     void __coqui_asan_slowpath_store_##N(void *ptr) {                    \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
@@ -572,13 +585,17 @@ SLOWPATH_IMPL(2)
 SLOWPATH_IMPL(4)
 SLOWPATH_IMPL(8)
 
+/* `always_inline, nothrow`: fast-path wrappers around the size-specialized
+ * checker. These are the "old" inline entry points retained for any
+ * pre-pass call site; the post-pass instrumentation prefers the outlined
+ * fast helpers in Asan.cpp. */
 #define CHECK_IMPL(N)                                                   \
-    __attribute__((always_inline))                                       \
+    __attribute__((always_inline, nothrow))                              \
     void __coqui_asan_check_load_##N(void *ptr) {                       \
         if (asan_fastpath_ok(ptr, (u8)(N))) return;                     \
         __coqui_asan_slowpath_load_##N(ptr);                             \
     }                                                                    \
-    __attribute__((always_inline))                                       \
+    __attribute__((always_inline, nothrow))                              \
     void __coqui_asan_check_store_##N(void *ptr) {                      \
         if (asan_fastpath_ok(ptr, (u8)(N))) return;                     \
         __coqui_asan_slowpath_store_##N(ptr);                            \
@@ -609,7 +626,14 @@ CHECK_IMPL(8)
  *   user data     → ASAN_CLEAN (+ partial tail if size not multiple of 8)
  *   right_redzone → ASAN_REDZONE_POISON
  * Tier 2 (slab) uses a separate shadow arena (__coqui_slab_shadow).
+ *
+ * `nothrow`: all C runtime entry points. The body is too large after slab
+ * integration to mark always_inline at every user-malloc call site
+ * (poison-range loops + slab tier path), so we leave inlining to LLVM's
+ * heuristics and rely on the fast-path ASan helpers (which ARE
+ * always_inline) for the per-access common case.
  */
+__attribute__((nothrow))
 void *__coqui_asan_malloc(unsigned long size) {
     unsigned long padded = ASAN_LEFT_REDZONE + size + ASAN_RIGHT_REDZONE;
 
@@ -664,7 +688,13 @@ void *__coqui_asan_malloc(unsigned long size) {
  * Poisons the entire allocation (left_redzone + user + right_redzone) with
  * ASAN_FREED so that use-after-free is detected.  Bounds-checks block before
  * touching the header to avoid crashing on bad pointers.
+ *
+ * `nothrow`: all C runtime entry points. Like __coqui_asan_malloc, body is
+ * too large to always_inline (slab range check + slab_shadow_poison +
+ * heap path). LLVM's inliner picks this up at the call sites where it's
+ * profitable.
  */
+__attribute__((nothrow))
 void __coqui_asan_free(void *ptr) {
     if (!ptr) return;
 
@@ -741,6 +771,7 @@ static void asan_memcpy_u8(void *dst, const void *src, unsigned long n) {
  * the user region. Red zones stay poisoned (asan_*malloc already set them
  * to ASAN_REDZONE_POISON for both tiers).
  */
+__attribute__((nothrow))
 void *__coqui_asan_calloc(unsigned long nmemb, unsigned long size) {
     unsigned long total;
     if (__builtin_umull_overflow(nmemb, size, &total))
@@ -776,7 +807,12 @@ void *__coqui_asan_calloc(unsigned long nmemb, unsigned long size) {
  * matching the coqui reference semantics for cross-tier reallocs (see
  * ~/coqui/runtime/coqui_fuzz_asan.c and
  * ~/coqui/docs/superpowers/specs/2026-03-25-shared-slab-pool-allocator-design.md).
+ *
+ * `noinline, nothrow`: large body covering both tiers + memcpy loop;
+ * keeping it out-of-line means each user realloc site is a single call.
+ * `nothrow` matches all C runtime functions.
  */
+__attribute__((noinline, nothrow))
 void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
     if (!ptr) return __coqui_asan_malloc(new_size);
     if (new_size == 0) {
@@ -844,7 +880,13 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
  * ===-------------------------------------------------------------------=== */
 
 /* Offset to the user pointer is 16B (ASAN_LEFT_REDZONE). The back-pointer
- * lives in the first 4B of the leading red zone. */
+ * lives in the first 4B of the leading red zone.
+ *
+ * `nothrow`: C runtime entry. No always_inline — function pointer
+ * registered with the slab runtime via __coqui_asan_register_slab and
+ * called indirectly from __coqui_asan_malloc; an inline body would not
+ * survive the indirect call. */
+__attribute__((nothrow))
 void *__coqui_asan_slab_malloc(unsigned long size) {
     if (!g_slab_malloc) return (void *)0;
     if (size == 0) size = 1;
@@ -873,6 +915,7 @@ void *__coqui_asan_slab_malloc(unsigned long size) {
     return (void *)user;
 }
 
+__attribute__((nothrow))
 void __coqui_asan_slab_free(void *ptr) {
     if (!ptr) return;
     if (!g_slab_free) return;

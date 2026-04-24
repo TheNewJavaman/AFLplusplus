@@ -33,13 +33,16 @@ double __coqui_sin(double x);
 double __coqui_cos(double x);
 
 /* PTX has a native double-precision sqrt; use it. Matches the legacy
- * coqui __coqui_sqrt implementation. */
+ * coqui __coqui_sqrt implementation. `const, always_inline, nothrow`:
+ * pure arithmetic asm; one-liner caller fold. */
+__attribute__((const, always_inline, nothrow))
 static double cx_sqrt(double x) {
     double r;
     asm("sqrt.rn.f64 %0, %1;" : "=d"(r) : "d"(x));
     return r;
 }
 
+__attribute__((const, always_inline, nothrow))
 static double cx_fabs(double x) { return x < 0.0 ? -x : x; }
 
 /* atan2 / sinh / cosh: cuAFL's existing trig/exp stubs return constants,
@@ -47,6 +50,7 @@ static double cx_fabs(double x) { return x < 0.0 ? -x : x; }
  * values. Keep the shape correct and return simple approximations that
  * at least vary with the inputs so fuzz inputs don't collapse to the
  * same branch. */
+__attribute__((const, nothrow))
 static double cx_atan2(double y, double x) {
     /* Crude sign-aware stub: enough to keep fuzzer branches distinct. */
     if (x == 0.0 && y == 0.0) return 0.0;
@@ -55,6 +59,7 @@ static double cx_atan2(double y, double x) {
            y / (cx_fabs(x) + cx_fabs(y) + 1.0);
 }
 
+__attribute__((nothrow))
 static double cx_sinh(double x) {
     /* sinh(x) = (exp(x) - exp(-x)) / 2. Uses the __coqui_exp stub which
      * returns 1.0, so this always returns 0.0 — same tier of approximation
@@ -64,6 +69,7 @@ static double cx_sinh(double x) {
     return (ex - enx) * 0.5;
 }
 
+__attribute__((nothrow))
 static double cx_cosh(double x) {
     double ex = __coqui_exp(x);
     double enx = __coqui_exp(-x);
@@ -72,26 +78,31 @@ static double cx_cosh(double x) {
 
 /* --- cabs / cabsf: complex absolute value --- */
 
+__attribute__((const, nothrow))
 double __coqui_cabs(double real, double imag) {
     return cx_sqrt(real * real + imag * imag);
 }
 
+__attribute__((const, nothrow))
 float __coqui_cabsf(float real, float imag) {
     return (float)__coqui_cabs((double)real, (double)imag);
 }
 
 /* --- carg / cargf: complex argument (phase angle) --- */
 
+__attribute__((const, nothrow))
 double __coqui_carg(double real, double imag) {
     return cx_atan2(imag, real);
 }
 
+__attribute__((const, nothrow))
 float __coqui_cargf(float real, float imag) {
     return (float)__coqui_carg((double)real, (double)imag);
 }
 
 /* --- conj / conjf: complex conjugate --- */
 
+__attribute__((const, nothrow))
 __coqui_cdouble __coqui_conj(double real, double imag) {
     __coqui_cdouble r;
     r.real = real;
@@ -99,6 +110,7 @@ __coqui_cdouble __coqui_conj(double real, double imag) {
     return r;
 }
 
+__attribute__((const, nothrow))
 __coqui_cfloat __coqui_conjf(float real, float imag) {
     __coqui_cfloat r;
     r.real = real;
@@ -109,6 +121,7 @@ __coqui_cfloat __coqui_conjf(float real, float imag) {
 /* --- cexp / cexpf: complex exponential ---
  * cexp(a+bi) = exp(a) * (cos(b) + i*sin(b)) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_cexp(double real, double imag) {
     double e = __coqui_exp(real);
     __coqui_cdouble r;
@@ -117,6 +130,7 @@ __coqui_cdouble __coqui_cexp(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_cexpf(float real, float imag) {
     __coqui_cdouble d = __coqui_cexp((double)real, (double)imag);
     __coqui_cfloat r;
@@ -128,6 +142,7 @@ __coqui_cfloat __coqui_cexpf(float real, float imag) {
 /* --- clog / clogf: complex logarithm ---
  * clog(z) = log(|z|) + i*arg(z) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_clog(double real, double imag) {
     __coqui_cdouble r;
     r.real = __coqui_log(__coqui_cabs(real, imag));
@@ -135,6 +150,7 @@ __coqui_cdouble __coqui_clog(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_clogf(float real, float imag) {
     __coqui_cdouble d = __coqui_clog((double)real, (double)imag);
     __coqui_cfloat r;
@@ -146,6 +162,7 @@ __coqui_cfloat __coqui_clogf(float real, float imag) {
 /* --- csqrt / csqrtf: complex square root ---
  * csqrt(a+bi) = sqrt((|z|+a)/2) + i*sign(b)*sqrt((|z|-a)/2) */
 
+__attribute__((const, nothrow))
 __coqui_cdouble __coqui_csqrt(double real, double imag) {
     if (real == 0.0 && imag == 0.0) {
         __coqui_cdouble r;
@@ -162,6 +179,7 @@ __coqui_cdouble __coqui_csqrt(double real, double imag) {
     return r;
 }
 
+__attribute__((const, nothrow))
 __coqui_cfloat __coqui_csqrtf(float real, float imag) {
     __coqui_cdouble d = __coqui_csqrt((double)real, (double)imag);
     __coqui_cfloat r;
@@ -173,6 +191,7 @@ __coqui_cfloat __coqui_csqrtf(float real, float imag) {
 /* --- cpow / cpowf: complex power ---
  * cpow(z, w) = cexp(w * clog(z)) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_cpow(double zr, double zi, double wr, double wi) {
     __coqui_cdouble lz = __coqui_clog(zr, zi);
     /* w * log(z): (wr + i*wi) * (lr + i*li) */
@@ -181,6 +200,7 @@ __coqui_cdouble __coqui_cpow(double zr, double zi, double wr, double wi) {
     return __coqui_cexp(mr, mi);
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_cpowf(float zr, float zi, float wr, float wi) {
     __coqui_cdouble d = __coqui_cpow((double)zr, (double)zi,
                                      (double)wr, (double)wi);
@@ -193,6 +213,7 @@ __coqui_cfloat __coqui_cpowf(float zr, float zi, float wr, float wi) {
 /* --- csin / csinf: complex sine ---
  * csin(a+bi) = sin(a)*cosh(b) + i*cos(a)*sinh(b) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_csin(double real, double imag) {
     __coqui_cdouble r;
     r.real = __coqui_sin(real) * cx_cosh(imag);
@@ -200,6 +221,7 @@ __coqui_cdouble __coqui_csin(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_csinf(float real, float imag) {
     __coqui_cdouble d = __coqui_csin((double)real, (double)imag);
     __coqui_cfloat r;
@@ -211,6 +233,7 @@ __coqui_cfloat __coqui_csinf(float real, float imag) {
 /* --- ccos / ccosf: complex cosine ---
  * ccos(a+bi) = cos(a)*cosh(b) - i*sin(a)*sinh(b) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_ccos(double real, double imag) {
     __coqui_cdouble r;
     r.real = __coqui_cos(real) * cx_cosh(imag);
@@ -218,6 +241,7 @@ __coqui_cdouble __coqui_ccos(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_ccosf(float real, float imag) {
     __coqui_cdouble d = __coqui_ccos((double)real, (double)imag);
     __coqui_cfloat r;
@@ -229,6 +253,7 @@ __coqui_cfloat __coqui_ccosf(float real, float imag) {
 /* --- ctan / ctanf: complex tangent ---
  * ctan(z) = csin(z) / ccos(z) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_ctan(double real, double imag) {
     __coqui_cdouble s = __coqui_csin(real, imag);
     __coqui_cdouble c = __coqui_ccos(real, imag);
@@ -245,6 +270,7 @@ __coqui_cdouble __coqui_ctan(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_ctanf(float real, float imag) {
     __coqui_cdouble d = __coqui_ctan((double)real, (double)imag);
     __coqui_cfloat r;
@@ -256,6 +282,7 @@ __coqui_cfloat __coqui_ctanf(float real, float imag) {
 /* --- csinh / csinhf: complex hyperbolic sine ---
  * csinh(a+bi) = sinh(a)*cos(b) + i*cosh(a)*sin(b) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_csinh(double real, double imag) {
     __coqui_cdouble r;
     r.real = cx_sinh(real) * __coqui_cos(imag);
@@ -263,6 +290,7 @@ __coqui_cdouble __coqui_csinh(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_csinhf(float real, float imag) {
     __coqui_cdouble d = __coqui_csinh((double)real, (double)imag);
     __coqui_cfloat r;
@@ -274,6 +302,7 @@ __coqui_cfloat __coqui_csinhf(float real, float imag) {
 /* --- ccosh / ccoshf: complex hyperbolic cosine ---
  * ccosh(a+bi) = cosh(a)*cos(b) + i*sinh(a)*sin(b) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_ccosh(double real, double imag) {
     __coqui_cdouble r;
     r.real = cx_cosh(real) * __coqui_cos(imag);
@@ -281,6 +310,7 @@ __coqui_cdouble __coqui_ccosh(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_ccoshf(float real, float imag) {
     __coqui_cdouble d = __coqui_ccosh((double)real, (double)imag);
     __coqui_cfloat r;
@@ -292,6 +322,7 @@ __coqui_cfloat __coqui_ccoshf(float real, float imag) {
 /* --- ctanh / ctanhf: complex hyperbolic tangent ---
  * ctanh(z) = csinh(z) / ccosh(z) */
 
+__attribute__((nothrow))
 __coqui_cdouble __coqui_ctanh(double real, double imag) {
     __coqui_cdouble s = __coqui_csinh(real, imag);
     __coqui_cdouble c = __coqui_ccosh(real, imag);
@@ -307,6 +338,7 @@ __coqui_cdouble __coqui_ctanh(double real, double imag) {
     return r;
 }
 
+__attribute__((nothrow))
 __coqui_cfloat __coqui_ctanhf(float real, float imag) {
     __coqui_cdouble d = __coqui_ctanh((double)real, (double)imag);
     __coqui_cfloat r;
@@ -321,8 +353,11 @@ __coqui_cfloat __coqui_ctanhf(float real, float imag) {
  * compiler-rt (libgcc). Provide NVPTX-safe implementations here.
  *
  * __muldc3(a, b, c, d) = (a+bi) * (c+di) = (ac-bd) + i(ad+bc)
- * __divdc3(a, b, c, d) = (a+bi) / (c+di) */
+ * __divdc3(a, b, c, d) = (a+bi) / (c+di)
+ *
+ * `const, nothrow`: pure arithmetic, no memory access, never throws. */
 
+__attribute__((const, nothrow))
 __coqui_cdouble __coqui___muldc3(double a, double b, double c, double d) {
     __coqui_cdouble r;
     r.real = a * c - b * d;
@@ -330,6 +365,7 @@ __coqui_cdouble __coqui___muldc3(double a, double b, double c, double d) {
     return r;
 }
 
+__attribute__((const, nothrow))
 __coqui_cfloat __coqui___mulsc3(float a, float b, float c, float d) {
     __coqui_cdouble dd = __coqui___muldc3((double)a, (double)b,
                                           (double)c, (double)d);
@@ -339,6 +375,7 @@ __coqui_cfloat __coqui___mulsc3(float a, float b, float c, float d) {
     return r;
 }
 
+__attribute__((const, nothrow))
 __coqui_cdouble __coqui___divdc3(double a, double b, double c, double d) {
     double denom = c * c + d * d;
     __coqui_cdouble r;
@@ -352,6 +389,7 @@ __coqui_cdouble __coqui___divdc3(double a, double b, double c, double d) {
     return r;
 }
 
+__attribute__((const, nothrow))
 __coqui_cfloat __coqui___divsc3(float a, float b, float c, float d) {
     __coqui_cdouble dd = __coqui___divdc3((double)a, (double)b,
                                           (double)c, (double)d);
