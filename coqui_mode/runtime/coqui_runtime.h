@@ -61,6 +61,15 @@ typedef uint64_t u64;
 #define COQUI_TRAP_STACK_OVERFLOW 12
 #define COQUI_TRAP_DEVIRT        13
 #define COQUI_TRAP_EXCEPTION     14
+/* SyscallTransform-emitted reasons. KILL covers raise/kill (signal delivery
+ * to self/other); FORK covers fork/vfork/clone (process creation); EXEC
+ * covers execve/execv/execvp/execlp/system (process replacement). The
+ * existing COQUI_TRAP_FORK=4 / COQUI_TRAP_EXEC=8 are kept for backward
+ * compatibility with host-side tooling that may have been compiled against
+ * the legacy values; new pass-emitted stubs use the SYSCALL_* aliases. */
+#define COQUI_TRAP_SYSCALL_KILL  15
+#define COQUI_TRAP_SYSCALL_FORK  16
+#define COQUI_TRAP_SYSCALL_EXEC  17
 #define COQUI_TRAP_UNSUPPORTED   255
 
 /* Stack-canary sentinel. Written once into an alloca at the outermost kernel

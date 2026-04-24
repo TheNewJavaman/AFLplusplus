@@ -837,3 +837,169 @@ COQUI_TRAP_STUB(__coqui_fegetenv)
 COQUI_TRAP_STUB(__coqui_fesetenv)
 
 /* Note: __coqui_cabs / __coqui_carg are defined in coqui_complex.c. */
+
+/* ===========================================================================
+ * 11. SyscallTransform stubs (task 22) — divertable syscalls rewritten by
+ *     coqui_mode/passes/SyscallTransform.cpp.
+ *
+ * Three flavors:
+ *   - no-op: return 0 / NULL silently. signal-handler installation,
+ *     environment writes, sigset manipulators — none of these have a
+ *     meaningful GPU implementation, but trapping on them would prevent
+ *     fuzz targets that gratuitously call them from running at all.
+ *   - trap-with-reason: __coqui_trap_with_reason(<COQUI_TRAP_SYSCALL_*>);
+ *     stamps a category-specific reason byte in the per-thread status
+ *     slot and exits the thread cleanly, so the host's rerun pipeline
+ *     can decode the failure category instead of seeing a generic crash.
+ *   - deterministic-return: time / pid / uid stubs return a fixed value
+ *     so targets that read these take stable control-flow paths.
+ *
+ * All stubs use the `_stub` suffix to avoid colliding with the generic-
+ * trap stubs already defined above (and rewritten to by Libc.cpp). The
+ * legacy stubs are retained for the existing rewrite path; the new ones
+ * sit alongside them and are addressed exclusively from SyscallTransform.
+ * ===========================================================================*/
+
+void __coqui_trap_with_reason(u8 reason);
+
+/* --- Signal handlers — silent no-op --- */
+/* signal(int signum, void (*handler)(int)) returns the previous handler,
+ * SIG_DFL if no prior install. SIG_DFL == NULL is fine. */
+void *__coqui_signal_stub(int signum, void *handler) {
+    (void)signum; (void)handler;
+    return (void *)0;
+}
+int __coqui_sigaction_stub(int signum, const void *act, void *oldact) {
+    (void)signum; (void)act; (void)oldact;
+    return 0;
+}
+int __coqui_sigprocmask_stub(int how, const void *set, void *oldset) {
+    (void)how; (void)set; (void)oldset;
+    return 0;
+}
+int __coqui_sigemptyset_stub(void *set)            { (void)set; return 0; }
+int __coqui_sigfillset_stub(void *set)             { (void)set; return 0; }
+int __coqui_sigaddset_stub(void *set, int signum)  { (void)set; (void)signum; return 0; }
+int __coqui_sigdelset_stub(void *set, int signum)  { (void)set; (void)signum; return 0; }
+int __coqui_sigismember_stub(const void *set, int signum) { (void)set; (void)signum; return 0; }
+
+/* --- Signal delivery — trap with KILL reason --- */
+__attribute__((noreturn))
+int __coqui_kill_stub(int pid, int sig) {
+    (void)pid; (void)sig;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_KILL);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_raise_stub(int sig) {
+    (void)sig;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_KILL);
+    __builtin_unreachable();
+}
+
+/* --- Process creation — trap with FORK reason --- */
+__attribute__((noreturn))
+int __coqui_fork_stub(void) {
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_FORK);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_vfork_stub(void) {
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_FORK);
+    __builtin_unreachable();
+}
+
+/* --- Process replacement — trap with EXEC reason. The cuAFL pass uses
+ *     getOrInsertFunction(OldType) which inserts a bitcast at the call
+ *     site when the runtime stub's type differs from libc's variadic
+ *     prototypes. Since the stubs are noreturn the bitcast is harmless. */
+__attribute__((noreturn))
+int __coqui_execve_stub(const char *p, char *const argv[], char *const envp[]) {
+    (void)p; (void)argv; (void)envp;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_execv_stub(const char *p, char *const argv[]) {
+    (void)p; (void)argv;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_execvp_stub(const char *file, char *const argv[]) {
+    (void)file; (void)argv;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_execlp_stub(const char *file, const char *arg0) {
+    (void)file; (void)arg0;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_execl_stub(const char *path, const char *arg0) {
+    (void)path; (void)arg0;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_execle_stub(const char *path, const char *arg0) {
+    (void)path; (void)arg0;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+__attribute__((noreturn))
+int __coqui_system_stub(const char *cmd) {
+    (void)cmd;
+    __coqui_trap_with_reason(COQUI_TRAP_SYSCALL_EXEC);
+    __builtin_unreachable();
+}
+
+/* --- Time — deterministic fixed epoch (matches __coqui_time above). ---
+ * Targets reading time take stable control-flow paths on every fuzz run. */
+
+/* timeval / timespec layouts mirror linux <sys/time.h> / <time.h>. We
+ * declare them locally with __coqui_ prefix so we don't pull in any host
+ * headers in the freestanding NVPTX build. */
+struct __coqui_timeval  { long tv_sec; long tv_usec; };
+struct __coqui_timespec { long tv_sec; long tv_nsec; };
+
+int __coqui_gettimeofday_stub(struct __coqui_timeval *tv, void *tz) {
+    (void)tz;
+    if (tv) { tv->tv_sec = 0; tv->tv_usec = 0; }
+    return 0;
+}
+int __coqui_clock_gettime_stub(int clk_id, struct __coqui_timespec *tp) {
+    (void)clk_id;
+    if (tp) { tp->tv_sec = 0; tp->tv_nsec = 0; }
+    return 0;
+}
+long __coqui_time_stub(long *tloc) {
+    if (tloc) *tloc = 0;
+    return 0;
+}
+
+/* --- Environment — no env on GPU. Read returns NULL, write returns 0
+ *     (success) so error checks don't take the failure path. --- */
+char *__coqui_getenv_stub(const char *name) {
+    (void)name; return (char *)0;
+}
+int __coqui_setenv_stub(const char *name, const char *value, int overwrite) {
+    (void)name; (void)value; (void)overwrite; return 0;
+}
+int __coqui_putenv_stub(char *string) {
+    (void)string; return 0;
+}
+int __coqui_unsetenv_stub(const char *name) {
+    (void)name; return 0;
+}
+
+/* --- Process / user identity — fixed non-zero values so root-check paths
+ *     (`if (getuid() == 0)`) take the unprivileged branch deterministically. */
+int __coqui_getpid_stub(void)  { return 1; }
+int __coqui_getppid_stub(void) { return 1; }
+int __coqui_getuid_stub(void)  { return 1000; }
+int __coqui_geteuid_stub(void) { return 1000; }
+int __coqui_getgid_stub(void)  { return 1000; }
+int __coqui_getegid_stub(void) { return 1000; }
