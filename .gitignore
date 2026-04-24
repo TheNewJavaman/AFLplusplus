@@ -145,15 +145,3 @@ test/test-ijon-legacy
 test/test-ijon-pcguard
 test/test-instr.plain.mycheck
 test/test-multiple-mutators
-
-
-# coqui mode docs are Claude's local reference — never committed
-coqui_mode/docs/
-
-# Claude / local workflow notes (never committed)
-/CLAUDE.md
-/CLAUDE.local.md
-
-# Session-scratch docs (Claude's reference material)
-/docs/superpowers/
-/docs/coqui_port_log.md

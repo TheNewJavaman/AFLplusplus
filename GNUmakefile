@@ -71,7 +71,7 @@ ifeq "$(HAVE_CUDA)" "yes"
 else
   CUDA_CFLAGS  =
   CUDA_LDFLAGS =
-  $(warning [-] CUDA not found at $(CUDA_PATH)/lib64/stubs; --coqui mode will fail at runtime)
+  $(warning [-] CUDA not found at $(CUDA_PATH)/lib64/stubs; building without --coqui mode support — afl-fuzz will still build and run, but the --coqui flag will not be recognized)
 endif
 
 ifdef NO_SPLICING

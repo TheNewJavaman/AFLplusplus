@@ -1068,13 +1068,13 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
     setsid();
 
-    /* When afl-fuzz dies (incl. SIGKILL or stuck-in-cuCtxDestroy SIGKILL),
-     * have the kernel deliver SIGKILL to the forkserver immediately so it
-     * can't survive as an orphan. Without this, killing afl-fuzz mid-
-     * shutdown leaves the forkserver process holding GPU context resources
-     * that degrade subsequent processes' per-thread stack budget — a real
-     * bug surfaced during the 2026-04-20 coqui mode bench harness work. Linux-
-     * specific; PR_SET_PDEATHSIG persists across execv. */
+    /* When afl-fuzz dies (including SIGKILL, or abrupt shutdown paths
+     * that can't run atexit handlers), have the kernel deliver SIGKILL
+     * to the forkserver immediately so it can't survive as an orphan.
+     * Without this, orphan forkservers can retain open file descriptors,
+     * shared memory, or (under --coqui) GPU context resources that
+     * degrade subsequent AFL processes. Linux-specific;
+     * PR_SET_PDEATHSIG persists across execv. */
 #if defined(__linux__)
     prctl(PR_SET_PDEATHSIG, SIGKILL);
 #endif
