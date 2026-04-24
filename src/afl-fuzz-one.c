@@ -622,7 +622,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   }
 
-  if (unlikely(afl->shm.cmplog_mode && !afl->gpu_mode &&
+  if (unlikely(afl->shm.cmplog_mode && !afl->coqui_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
 
@@ -3887,7 +3887,7 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
   }
 
-  if (unlikely(afl->shm.cmplog_mode && !afl->gpu_mode &&
+  if (unlikely(afl->shm.cmplog_mode && !afl->coqui_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
 

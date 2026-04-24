@@ -90,7 +90,7 @@ typedef struct coqui_ctx {
   coqui_batch_t *pending;    /* filling now (CPU side) */
   coqui_batch_t *executing;  /* on GPU (or most recent done) */
 
-  u32 batch_size;      /* snapshot of afl->gpu_batch_size */
+  u32 batch_size;      /* snapshot of afl->coqui_batch_size */
   u32 max_input_size;  /* snapshot of afl->max_length (with fallback) */
   u32 byte_budget;     /* size of each h_input_bytes buffer */
   u32 map_size;        /* snapshot of afl->fsrv.map_size */

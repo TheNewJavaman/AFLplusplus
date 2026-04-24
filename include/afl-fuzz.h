@@ -683,9 +683,9 @@ typedef struct afl_state {
       old_seed_selection,               /* use vanilla afl seed selection   */
       reinit_table;                     /* reinit the queue weight table    */
 
-  u8               gpu_mode;         /* 1 if --coqui was given */
+  u8               coqui_mode;       /* 1 if --coqui was given */
   struct coqui_ctx *coqui;           /* opaque coqui_mode context, NULL otherwise */
-  u32              gpu_batch_size;   /* default 8192, tunable */
+  u32              coqui_batch_size; /* default 8192, tunable */
   char            *coqui_cubin_path; /* path to cubin from CLI trailing arg */
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
