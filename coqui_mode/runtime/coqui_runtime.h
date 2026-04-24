@@ -148,6 +148,8 @@ void *__coqui_realloc(void *ptr, unsigned long size);
 /* ASan heap instrumentation (coqui_asan.c) */
 void *__coqui_asan_malloc(unsigned long size);
 void  __coqui_asan_free(void *ptr);
+void *__coqui_asan_calloc(unsigned long nmemb, unsigned long size);
+void *__coqui_asan_realloc(void *ptr, unsigned long new_size);
 void  __coqui_asan_check_load_1(void *ptr);
 void  __coqui_asan_check_load_2(void *ptr);
 void  __coqui_asan_check_load_4(void *ptr);
