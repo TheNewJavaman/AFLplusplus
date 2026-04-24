@@ -14,6 +14,7 @@ set(COQUI_PASS_SOURCES
     CoquiPassPlugin.cpp
     RejectInlineAsm.cpp
     RejectLibc.cpp
+    RejectSyscall.cpp
     RejectIntrinsics.cpp
     FuzzEntry.cpp
     Cpp.cpp

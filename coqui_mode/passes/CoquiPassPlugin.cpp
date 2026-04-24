@@ -27,6 +27,11 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
 
     /* Pass order from coqui internals spec §3.2 */
     Changed |= coqui::runRejectInlineAsm(M);
+    /* RejectSyscall: hard-reject for GPU-impossible syscalls
+     * (dlopen/socket/mmap/...). Runs early so user code containing
+     * these gets a clear diagnostic instead of being silently routed
+     * to a generic-trap stub by Libc.cpp. */
+    Changed |= coqui::runRejectSyscall(M);
     Changed |= coqui::runRejectLibc(M);
     Changed |= coqui::runVariadic(M);           /* before RejectIntrinsics so llvm.va_* is lowered first */
     Changed |= coqui::runRejectIntrinsics(M);

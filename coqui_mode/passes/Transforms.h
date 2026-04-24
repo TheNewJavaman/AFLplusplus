@@ -35,6 +35,10 @@ static constexpr const char *kAsanPoolStrideSymbol =
 
 bool runRejectInlineAsm(llvm::Module &M);
 bool runRejectLibc(llvm::Module &M);
+/* RejectSyscall: compile-time hard-reject for GPU-impossible syscalls
+ * (dlopen/socket/mmap/...). Pairs with SyscallTransform (added separately)
+ * which rewrites divertable syscalls to runtime stubs. */
+bool runRejectSyscall(llvm::Module &M);
 bool runRejectIntrinsics(llvm::Module &M);
 bool runFuzzEntry(llvm::Module &M);
 bool runCpp(llvm::Module &M);
