@@ -58,6 +58,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -105,19 +106,21 @@ static unsigned selectSize(uint64_t ByteCount) {
   return ByteCount >= 8 ? 8u : 1u;
 }
 
-/// Build branch_weights metadata node: used to annotate conditional
-/// branches so llc -O2 lays out the common path as fall-through.
-/// Weights are relative; (95, 5) means 95% likely to take the TRUE branch.
+/// Build branch_weights metadata node via MDBuilder: used to annotate
+/// conditional branches so llc -O2 lays out the common path as
+/// fall-through. Weights are relative; (95, 5) means 95% likely to take
+/// the TRUE branch.
+///
+/// Complements the runtime-side `likely()` / `unlikely()` macros (see
+/// coqui_mode/runtime/coqui_runtime.h, task 21): runtime hot paths use
+/// __builtin_expect at source level, and the pass-emitted helpers carry
+/// equivalent profile metadata so llc lays out the unlikely successor
+/// after the function epilogue (cold layout).
 static llvm::MDNode *createBranchWeightMD(llvm::LLVMContext &Ctx,
                                           uint32_t TrueWeight,
                                           uint32_t FalseWeight) {
-  using namespace llvm;
-  auto *I32 = Type::getInt32Ty(Ctx);
-  return MDNode::get(
-      Ctx,
-      {MDString::get(Ctx, "branch_weights"),
-       ConstantAsMetadata::get(ConstantInt::get(I32, TrueWeight)),
-       ConstantAsMetadata::get(ConstantInt::get(I32, FalseWeight))});
+  llvm::MDBuilder MDB(Ctx);
+  return MDB.createBranchWeights(TrueWeight, FalseWeight);
 }
 
 /// Create an outlined fast-path helper (Task 2 signature with precomputed

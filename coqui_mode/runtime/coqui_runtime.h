@@ -12,6 +12,15 @@
 
 #include <stdint.h>
 
+/* Branch-prediction hints. Lowered by clang/llvm to PTX branch-hint metadata
+ * which the PTX assembler uses to lay out the unlikely successor at the
+ * bottom of the function body. On NVPTX SIMT execution doesn't "predict" in
+ * the CPU sense, but the layout effect is real: the hot path stays in
+ * I-cache and the cold path lives in basic blocks the warp PC rarely visits.
+ * Complements PR #16's attribute sweep (cold/always_inline/etc.). */
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
 /* Basic types (matching AFL's u8/u32/u64 convention) */
 typedef uint8_t  u8;
 typedef uint16_t u16;

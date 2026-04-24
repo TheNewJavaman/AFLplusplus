@@ -82,7 +82,7 @@ __attribute__((noinline, cold, nothrow))
 void __coqui_trap_with_reason(u8 reason) {
     __coqui_slab_release_thread();
     u32 tid = __coqui_fuzz_tid();
-    if (__coqui_status_array) {
+    if (likely(__coqui_status_array != (coqui_status_t *)0)) {
         __coqui_status_array[tid].trap_reason = reason;
     }
     /* sys-wide fence so the status write is visible to the host when the
@@ -108,7 +108,7 @@ void __coqui_trap_with_reason(u8 reason) {
  * stays cold). The function never throws. */
 __attribute__((noinline, nothrow))
 void __coqui_check_stack_canary(const unsigned long *slot) {
-    if (__builtin_expect(*slot != COQUI_STACK_CANARY, 0)) {
+    if (unlikely(*slot != COQUI_STACK_CANARY)) {
         __coqui_trap_with_reason(COQUI_TRAP_STACK_OVERFLOW);
         __builtin_unreachable();
     }
@@ -134,7 +134,7 @@ void __cxa_finalize(void *dso)               { (void)dso; }
 /* pthread_once — single-threaded per GPU thread. `nothrow`. */
 __attribute__((nothrow))
 int pthread_once(int *once_control, void (*init)(void)) {
-    if (*once_control == 0) {
+    if (unlikely(*once_control == 0)) {
         init();
         *once_control = 1;
     }

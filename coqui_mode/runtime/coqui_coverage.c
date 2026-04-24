@@ -67,7 +67,10 @@ void __coqui_classify_counts(u8 *map) {
             asm volatile("prefetch.global.L1 [%0];" :: "l"((const void *)&m64[i+8]));
         }
 
-        if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) continue;
+        /* cov_map is sparse — most cachelines are zero. Cold-skip is the
+         * dominant branch; classification work only fires on populated
+         * cachelines. */
+        if (likely((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0)) continue;
 
         if (w0) { __coqui_classify_word(&w0); m64[i+0] = w0; }
         if (w1) { __coqui_classify_word(&w1); m64[i+1] = w1; }
@@ -107,7 +110,8 @@ u32 __coqui_classify_counts_and_sig(u8 *map) {
             asm volatile("prefetch.global.L1 [%0];" :: "l"((const void *)&m64[i+8]));
         }
 
-        if ((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0) continue;
+        /* cov_map is sparse — most cachelines are zero. */
+        if (likely((w0 | w1 | w2 | w3 | w4 | w5 | w6 | w7) == 0)) continue;
 
         if (w0) {
             __coqui_classify_word(&w0);
@@ -183,7 +187,9 @@ u32 __coqui_trace_sig(u8 *map) {
 
     for (u32 i = 0; i < n_chunks; i++) {
         u64 word = m64[i];
-        if (word == 0) continue;
+        /* cov_map is sparse — most words are zero, especially for
+         * partial-execution dumps from crash paths (asan_report). */
+        if (likely(word == 0)) continue;
         h = (h ^ i)                 * COQUI_FNV32_PRIME;
         h = (h ^ (u32)(word))       * COQUI_FNV32_PRIME;
         h = (h ^ (u32)(word >> 32)) * COQUI_FNV32_PRIME;
@@ -229,23 +235,27 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     const u32 mask = __coqui_active_mask();
     int novel = 0;
 
-    if (mask == 0xFFFFFFFFu) {
+    if (likely(mask == 0xFFFFFFFFu)) {
         u32 laneid;
         asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
 
         for (u32 i = 0; i < n; i++) {
             u64 mine = m64[i];
             u64 warp_mine = __coqui_warp_or_u64(mask, mine);
-            if (warp_mine == 0) continue;
+            /* cov_map is sparse — most words are zero across the warp. */
+            if (likely(warp_mine == 0)) continue;
 
             /* Non-atomic pre-read of virgin[i]. All lanes map to the same
              * address so L1 serves them from one cacheline. Virgin is
              * monotonic (bits only go 0->1), so skipping the atomic when
              * `warp_mine & ~v == 0` is safe: any bit that flips between
              * this read and when we would have done the atomic was claimed
-             * by another warp first, which is the correct outcome. */
+             * by another warp first, which is the correct outcome.
+             *
+             * In steady-state fuzzing most edges have already been seen,
+             * so the skip-the-atomic path is the hot one. */
             u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
-            if ((warp_mine & ~v_pre) == 0) continue;
+            if (likely((warp_mine & ~v_pre) == 0)) continue;
 
             /* Lane 0 does the atomic; broadcast `was` (pre-OR virgin) so
              * every lane can compute its own novelty contribution
@@ -258,23 +268,23 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
                                                 memory_order_relaxed);
             }
             u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
-            if (mine & ~was) { novel = 1; }
+            if (unlikely(mine & ~was)) { novel = 1; }
         }
     } else {
         /* Partial warp: original per-thread atomic. */
         for (u32 i = 0; i < n; i++) {
             u64 mine = m64[i];
-            if (mine == 0) continue;
+            if (likely(mine == 0)) continue;
             /* Same non-atomic pre-read + skip as full-warp path. */
             u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
-            if ((mine & ~v_pre) == 0) continue;
+            if (likely((mine & ~v_pre) == 0)) continue;
             u64 was = atomic_fetch_or_explicit(&v64[i], mine,
                                                 memory_order_relaxed);
-            if (mine & ~was) { novel = 1; }
+            if (unlikely(mine & ~was)) { novel = 1; }
         }
     }
 
-    if (novel) {
+    if (unlikely(novel)) {
         u32 tid = __coqui_fuzz_tid();
         _Atomic u32 *nov32 = (_Atomic u32 *)&novelty_bitmap[tid >> 5];
         atomic_fetch_or_explicit(nov32, 1u << (tid & 31u), memory_order_relaxed);
