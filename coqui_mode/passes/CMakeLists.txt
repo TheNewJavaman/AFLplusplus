@@ -15,6 +15,7 @@ set(COQUI_PASS_SOURCES
     RejectInlineAsm.cpp
     RejectLibc.cpp
     RejectSyscall.cpp
+    SyscallTransform.cpp
     RejectIntrinsics.cpp
     FuzzEntry.cpp
     Cpp.cpp
