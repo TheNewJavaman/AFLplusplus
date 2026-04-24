@@ -58,16 +58,46 @@
 #define ASAN_MAX_SLAB_DESCS 4096
 
 /* Slab pool allocator function pointers (set by slab runtime if linked).
- * Day-1: always NULL — no device-side slab runtime is linked yet in
- * coqui_mode (the host allocates the slab buffer via cuMemAlloc but no
- * kernel-side allocator owns it). When a future slab runtime registers,
- * the ASan wrappers below become active. */
+ * If the slab runtime is linked in, coqui_slab.c's __coqui_slab_setup()
+ * registers its malloc/free pair here. For non-slab targets the pointers
+ * stay NULL and the ASan slab paths short-circuit. */
 static void *(*g_slab_malloc)(unsigned long) = (void *)0;
 static void  (*g_slab_free)(void *)          = (void *)0;
 
 void __coqui_asan_register_slab(void *(*m)(unsigned long), void (*f)(void *)) {
     g_slab_malloc = m;
     g_slab_free   = f;
+}
+
+/* Slab pool globals (defined in coqui_slab.c when linked). Declared weak
+ * so the ASan runtime links cleanly for targets without a slab runtime;
+ * every consumer guards on `__coqui_slab_pool` being non-NULL. */
+extern char *__coqui_slab_pool __attribute__((weak));
+extern unsigned long __coqui_slab_pool_size __attribute__((weak));
+extern char *__coqui_slab_shadow __attribute__((weak));
+
+/* Slab-shadow poison/unpoison (byte-wise; the slab pool rarely needs
+ * the asan-heap vector write path because slab allocations are uncommon
+ * relative to heap and the extra code size matters more than throughput
+ * here). */
+static void slab_shadow_poison(unsigned long slab_off, unsigned long n,
+                                u8 value) {
+    if (!__coqui_slab_shadow) return;
+    u8 *shadow = (u8 *)__coqui_slab_shadow;
+    unsigned long start = slab_off >> 3;
+    unsigned long end   = (slab_off + n) >> 3;
+    for (unsigned long i = start; i < end; i++) shadow[i] = value;
+}
+
+static void slab_shadow_unpoison(unsigned long slab_off, unsigned long n) {
+    if (!__coqui_slab_shadow) return;
+    u8 *shadow = (u8 *)__coqui_slab_shadow;
+    unsigned long aligned = n & ~7UL;
+    unsigned long partial = n & 7u;
+    unsigned long start   = slab_off >> 3;
+    unsigned long full    = (slab_off + aligned) >> 3;
+    for (unsigned long i = start; i < full; i++) shadow[i] = ASAN_CLEAN;
+    if (partial) shadow[full] = (u8)partial;
 }
 
 /* ===-------------------------------------------------------------------===
@@ -157,13 +187,30 @@ static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
 /* ===-------------------------------------------------------------------===
  * Global variable red-zone tracking
  *
- * The IR pass (coqui::runAsanGlobals) replaces each qualifying global
- * `T g;` with a padded struct `{ T orig; u8 rz[32]; }` so there is a
- * physical gap after the user bytes. It then emits a descriptor table
- * and a one-shot call to __coqui_asan_register_globals() inside
- * __coqui_fuzz_kernel. The descriptor records where each global's user
- * region ends and where its red zone ends, so we can detect an access
- * that lands in [user_end, total_end).
+ * The IR pass (coqui::runAsanGlobals) emits a unified descriptor table
+ * listing two kinds of entries:
+ *
+ *   Non-pool (pool_stride == 0):
+ *     Each qualifying user global `T g;` is replaced with a padded struct
+ *     `{ T orig; u8 rz[32]; }` so there is a physical gap after the user
+ *     bytes. The descriptor's `beg` points at the padded global (= the
+ *     absolute address shared by all threads).
+ *
+ *   Pool (pool_stride > 0):
+ *     Writable globals that StaticGlobals pooled into the per-thread slab
+ *     have no single absolute address; each thread's slab lives at
+ *     `__coqui_global_statics_pool_base + tid * pool_stride` and the
+ *     pooled entry sits at `+ pool_offset` within that slab. StaticGlobals
+ *     reserves a 32-byte trailing gap between pooled entries so the
+ *     descriptor's total_size (= user_size + 32) still covers real poison
+ *     bytes. `beg` is NULL for pool entries; asan_check_global() resolves
+ *     the per-thread real_beg at check time.
+ *
+ * A one-shot call to __coqui_asan_register_globals() is injected at the
+ * top of __coqui_fuzz_kernel, so the table is populated before any user
+ * code runs. Descriptors carry their pool-base-relative form, so all
+ * threads write identical values — the per-thread address variation
+ * happens inside asan_check_global().
  *
  * We cannot rely on the existing heap shadow: globals live in NVPTX
  * .global memory, outside any per-thread heap. Instead, the outlined
@@ -174,6 +221,18 @@ static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
 static struct __coqui_asan_global_desc
     __coqui_asan_globals[ASAN_MAX_GLOBALS];
 static unsigned long __coqui_asan_num_globals;
+
+/* Extern ptr bound by the host launcher at module load (see
+ * afl-fuzz-coqui.c phase 9). Declared here so asan_check_global() can
+ * resolve per-thread pool-entry addresses.
+ *
+ * This symbol is defined by StaticGlobals.cpp as `extern ptr
+ * __coqui_global_statics_pool_base` and written at runtime by the host
+ * via cuModuleGetGlobal + cuMemcpyHtoD. For targets with no pooled
+ * globals the symbol is still declared (we take its address here only if
+ * at least one pool-kind descriptor exists) — the `if (stride)` gate
+ * below ensures we never dereference it in the no-pool case. */
+extern u8 *__coqui_global_statics_pool_base;
 
 void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
                                     unsigned long count) {
@@ -194,13 +253,26 @@ void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
  *   (b) the access starts inside the user region but extends past
  *       user_end (partial overflow).
  *
+ * For pool-kind descriptors (pool_stride > 0) the per-thread real_beg
+ * is computed on the fly as `pool_base + tid*stride + pool_offset`, so
+ * each thread checks against its own slab's pooled-entry locations.
+ *
  * Linear scan is fine: typical targets register well under 100 globals,
  * and the slow path only runs on shadow misses / out-of-heap addresses.
  */
 static int asan_check_global(unsigned long addr, unsigned long size) {
-    unsigned long n = __coqui_asan_num_globals;
+    unsigned long n      = __coqui_asan_num_globals;
+    unsigned long pool   = (unsigned long)__coqui_global_statics_pool_base;
+    unsigned long tid    = (unsigned long)__coqui_fuzz_tid();
     for (unsigned long i = 0; i < n; i++) {
-        unsigned long beg       = (unsigned long)__coqui_asan_globals[i].beg;
+        unsigned long stride = __coqui_asan_globals[i].pool_stride;
+        unsigned long beg;
+        if (stride) {
+            /* Pool-kind: resolve this thread's slab-relative location. */
+            beg = pool + tid * stride + __coqui_asan_globals[i].pool_offset;
+        } else {
+            beg = (unsigned long)__coqui_asan_globals[i].beg;
+        }
         unsigned long user_end  = beg + __coqui_asan_globals[i].user_size;
         unsigned long total_end = beg + __coqui_asan_globals[i].total_size;
 
@@ -297,6 +369,40 @@ static int asan_check_slab(unsigned long addr, unsigned long size) {
             return 1;
         if (addr >= beg && addr < user_end && (addr + size) > user_end)
             return 1;
+    }
+    return 0;
+}
+
+/* Slab-pool shadow check for tier-2 accesses. Mirrors asan_check_access()
+ * structure but runs against __coqui_slab_shadow using a slab-pool-relative
+ * offset. Returns 1 on poisoned access, writing *out_error_type with the
+ * error code. Returns 0 if the pointer is outside the slab pool. */
+static int asan_check_slab_shadow(void *ptr, u8 access_size,
+                                   int *out_error_type) {
+    if (!__coqui_slab_pool || !__coqui_slab_shadow) return 0;
+    unsigned long a = (unsigned long)ptr;
+    unsigned long sp = (unsigned long)__coqui_slab_pool;
+    if (a < sp || a + access_size > sp + __coqui_slab_pool_size) return 0;
+
+    unsigned long off     = a - sp;
+    unsigned long end_off = off + (unsigned long)access_size - 1u;
+    unsigned long si      = off >> 3;
+    unsigned long si_end  = end_off >> 3;
+    u8 *shadow = (u8 *)__coqui_slab_shadow;
+
+    for (unsigned long i = si; i <= si_end; i++) {
+        u8 s = shadow[i];
+        if (s == ASAN_CLEAN) continue;
+        if (s >= 0x80u) {
+            *out_error_type = (s == ASAN_FREED) ? ASAN_ERROR_USE_AFTER_FREE
+                                                : ASAN_ERROR_SLAB_OVERFLOW;
+            return 1;
+        }
+        unsigned long end_in_granule = (i == si_end) ? (end_off & 7u) + 1u : 8u;
+        if (end_in_granule > (unsigned long)s) {
+            *out_error_type = ASAN_ERROR_SLAB_OVERFLOW;
+            return 1;
+        }
     }
     return 0;
 }
@@ -444,6 +550,7 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
     void __coqui_asan_slowpath_load_##N(void *ptr) {                     \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
+        if (asan_check_slab_shadow(ptr, (u8)(N), &err)) asan_report(err); \
         if (asan_check_global((unsigned long)ptr, (u8)(N)))              \
             asan_report(ASAN_ERROR_GLOBAL_OVERFLOW);                     \
         if (asan_check_slab((unsigned long)ptr, (u8)(N)))                \
@@ -453,6 +560,7 @@ int asan_fastpath_ok(void *ptr, u8 access_size) {
     void __coqui_asan_slowpath_store_##N(void *ptr) {                    \
         int err = 0;                                                     \
         if (asan_check_access(ptr, (u8)(N), &err)) asan_report(err);   \
+        if (asan_check_slab_shadow(ptr, (u8)(N), &err)) asan_report(err); \
         if (asan_check_global((unsigned long)ptr, (u8)(N)))              \
             asan_report(ASAN_ERROR_GLOBAL_OVERFLOW);                     \
         if (asan_check_slab((unsigned long)ptr, (u8)(N)))                \
@@ -488,30 +596,66 @@ CHECK_IMPL(8)
 /*
  * __coqui_asan_malloc — allocate `size` bytes with left and right red zones.
  *
- * Physical layout in the heap:
+ * Two-tier: per-thread heap first (tier 1), then shared slab pool on
+ * exhaustion (tier 2). On full exhaustion of both tiers, stamp
+ * trap_reason = COQUI_TRAP_OOM and exit the thread (the host re-runs the
+ * input on the CPU forkserver).
+ *
+ * Physical layout in the heap (both tiers use the same layout):
  *   [left_redzone (16)] [user data (size)] [right_redzone (16)]
  *
- * Shadow state after allocation:
+ * Shadow state after allocation (tier 1 heap):
  *   left_redzone  → ASAN_REDZONE_POISON
  *   user data     → ASAN_CLEAN (+ partial tail if size not multiple of 8)
  *   right_redzone → ASAN_REDZONE_POISON
+ * Tier 2 (slab) uses a separate shadow arena (__coqui_slab_shadow).
  */
 void *__coqui_asan_malloc(unsigned long size) {
     unsigned long padded = ASAN_LEFT_REDZONE + size + ASAN_RIGHT_REDZONE;
+
+    /* Tier 1: per-thread heap. */
     void *raw = __coqui_malloc(padded);
-    if (!raw) return (void *)0;
+    if (raw) {
+        u8 *user      = (u8 *)raw + ASAN_LEFT_REDZONE;
+        u8 *heap_base = __coqui_heap_base();
+        unsigned long raw_off = (u8 *)raw - heap_base;
 
-    u8 *user      = (u8 *)raw + ASAN_LEFT_REDZONE;
-    u8 *heap_base = __coqui_heap_base();
-    unsigned long raw_off = (u8 *)raw - heap_base;
+        asan_poison_range(raw_off,                             ASAN_LEFT_REDZONE,
+                          ASAN_REDZONE_POISON);
+        asan_unpoison_range(raw_off + ASAN_LEFT_REDZONE,       size);
+        asan_poison_range(raw_off + ASAN_LEFT_REDZONE + size,  ASAN_RIGHT_REDZONE,
+                          ASAN_REDZONE_POISON);
 
-    asan_poison_range(raw_off,                             ASAN_LEFT_REDZONE,
-                      ASAN_REDZONE_POISON);
-    asan_unpoison_range(raw_off + ASAN_LEFT_REDZONE,       size);
-    asan_poison_range(raw_off + ASAN_LEFT_REDZONE + size,  ASAN_RIGHT_REDZONE,
-                      ASAN_REDZONE_POISON);
+        return (void *)user;
+    }
 
-    return (void *)user;
+    /* Tier 2: slab pool (if a slab runtime is linked and has registered a
+     * malloc_fn). g_slab_malloc stays NULL for non-slab targets, in which
+     * case we proceed directly to the OOM trap. */
+    if (g_slab_malloc && __coqui_slab_pool && __coqui_slab_pool_size) {
+        void *slab_raw = g_slab_malloc(padded);
+        if (slab_raw) {
+            u8 *user = (u8 *)slab_raw + ASAN_LEFT_REDZONE;
+            unsigned long slab_off =
+                (unsigned long)((u8 *)slab_raw - (u8 *)__coqui_slab_pool);
+            slab_shadow_poison(slab_off,
+                               ASAN_LEFT_REDZONE,
+                               ASAN_REDZONE_POISON);
+            slab_shadow_unpoison(slab_off + ASAN_LEFT_REDZONE, size);
+            unsigned long aligned = (size + 7UL) & ~7UL;
+            slab_shadow_poison(slab_off + ASAN_LEFT_REDZONE + aligned,
+                               ASAN_RIGHT_REDZONE,
+                               ASAN_REDZONE_POISON);
+            return (void *)user;
+        }
+    }
+
+    /* Both tiers exhausted. Stamp trap_reason = OOM and exit this thread.
+     * The host-side post-batch scan finds trap_reason == COQUI_TRAP_OOM
+     * and re-runs the input on the CPU forkserver where no GPU memory
+     * constraint applies. */
+    __coqui_trap_with_reason(COQUI_TRAP_OOM);
+    return (void *)0; /* unreachable */
 }
 
 /*
@@ -526,6 +670,34 @@ void __coqui_asan_free(void *ptr) {
 
     u8 *user  = (u8 *)ptr;
     u8 *raw   = user - ASAN_LEFT_REDZONE;
+
+    /* Slab-pool routing: if ptr is in the slab range, free via the slab
+     * allocator and poison slab shadow. Block header is [size:u32] 8 bytes
+     * before user_raw (matching coqui_slab.c's layout). */
+    if (g_slab_free && __coqui_slab_pool && __coqui_slab_pool_size) {
+        u8 *sp_lo = (u8 *)__coqui_slab_pool;
+        u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
+        if (user >= sp_lo && user < sp_hi) {
+            unsigned long slab_off = (unsigned long)(raw - sp_lo);
+            /* Slab size header sits 8B before `raw` (i.e. 8B before the
+             * leading red zone -- it's the slab block size, not the user
+             * size). Clamp payload length to the remaining pool so a
+             * corrupted header can't walk off the end. */
+            u8 *slab_hdr = raw - 8;
+            u32 blk = (slab_hdr >= sp_lo && slab_hdr < sp_hi)
+                        ? *(u32 *)slab_hdr : 0u;
+            unsigned long payload = (blk > 8u) ? (blk - 8u) : 0u;
+            if (slab_off + payload > __coqui_slab_pool_size) {
+                unsigned long safe = (__coqui_slab_pool_size > slab_off)
+                                       ? (__coqui_slab_pool_size - slab_off) : 0;
+                payload = safe & ~7UL;
+            }
+            if (payload) slab_shadow_poison(slab_off, payload, ASAN_FREED);
+            g_slab_free((void *)raw);
+            return;
+        }
+    }
+
     u8 *block = raw - BLOCK_HDR_SIZE;
 
     /* Bounds check: block header must be within the heap region. */
