@@ -23,6 +23,7 @@ set(COQUI_PASS_SOURCES
     Variadic.cpp
     Reloc.cpp
     Math.cpp
+    Complex.cpp
     StaticGlobals.cpp
     MemoryLayout.cpp
     Coverage.cpp

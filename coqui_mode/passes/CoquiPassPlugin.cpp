@@ -36,6 +36,7 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runSprintf(M);            /* before runLibc so raw sprintf/snprintf are resolvable */
     Changed |= coqui::runLibc(M);
     Changed |= coqui::runMath(M);               /* rewrite llvm.pow/log/exp -> __coqui_* runtime calls */
+    Changed |= coqui::runComplex(M);            /* rewrite C99 _Complex math -> __coqui_c* runtime calls */
     Changed |= coqui::runReloc(M);              /* break cyclic global init deps (NVPTX AsmPrinter can't handle) */
     Changed |= coqui::runStaticGlobals(M);
     Changed |= coqui::runMemoryLayout(M);
