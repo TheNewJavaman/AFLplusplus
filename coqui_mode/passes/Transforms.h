@@ -4,11 +4,32 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace llvm {
 class Module;
 }
 
 namespace coqui {
+
+/* ASan right-side red-zone size in bytes. 32 = 4 shadow granules. Shared
+ * between Asan.cpp (pads non-pooled globals) and StaticGlobals.cpp (inserts
+ * a matching-sized padding between pooled entries so runAsanGlobals can
+ * emit descriptors with the same total_size = user_size + kAsanGlobalRedZone
+ * for both pooled and non-pooled entries). */
+constexpr std::uint64_t kAsanGlobalRedZone = 32;
+
+/* Name of the optional sidecar emitted by StaticGlobals when it pools any
+ * writable globals: an internal constant array of {i64 offset, i64 user_size}
+ * describing each pooled entry's in-slab location. runAsanGlobals reads it
+ * to emit pool-kind descriptors (pool_stride > 0) that share the unified
+ * __coqui_asan_global_descriptors table with non-pooled user globals. */
+static constexpr const char *kAsanPoolEntriesSymbol =
+    "__coqui_asan_pool_entries";
+static constexpr const char *kAsanPoolEntryCountSymbol =
+    "__coqui_asan_pool_entry_count";
+static constexpr const char *kAsanPoolStrideSymbol =
+    "__coqui_statics_per_thread"; /* already emitted by StaticGlobals */
 
 /* Each returns true if the module was modified (standard LLVM convention). */
 

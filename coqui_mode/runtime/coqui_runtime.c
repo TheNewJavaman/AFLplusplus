@@ -17,6 +17,20 @@ __attribute__((visibility("default")))
 __attribute__((used))
 coqui_status_t *__coqui_status_array;
 
+/* Per-thread statics pool base pointer. Written by the host launcher
+ * (afl-fuzz-coqui.c) via cuModuleGetGlobal/cuMemcpyHtoD when
+ * StaticGlobals pooled any writable globals; stays NULL otherwise.
+ *
+ * Defined here so the symbol exists unconditionally — coqui_asan.c reads
+ * it from asan_check_global() to resolve per-thread pool-kind descriptor
+ * addresses, and that reference must link even for targets where
+ * StaticGlobals found nothing to pool. The StaticGlobals pass looks up
+ * this symbol with getOrInsert and reuses this definition instead of
+ * creating a duplicate. */
+__attribute__((visibility("default")))
+__attribute__((used))
+u8 *__coqui_global_statics_pool_base;
+
 /* Thread identity via clang NVPTX intrinsic builtins (lower to mov.u32 %r, %tid.x etc). */
 u32 __coqui_fuzz_tid(void) {
     return (u32)__nvvm_read_ptx_sreg_ctaid_x()

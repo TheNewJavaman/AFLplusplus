@@ -122,14 +122,27 @@ void  __coqui_asan_check_store_8(void *ptr);
 
 /* ASan global-variable red-zone descriptor (matches IR-emitted table).
  *   beg        : base address of the padded global (inner + outer red zone)
+ *                -- or NULL for a pool-kind entry (see pool_stride below).
  *   user_size  : bytes the original (pre-instrumentation) global occupied
  *   total_size : user_size + right red zone in bytes
+ *   pool_offset: for pool-kind entries, byte offset into the per-thread
+ *                statics pool slab. Ignored when pool_stride == 0.
+ *   pool_stride: 0 for legacy (absolute-`beg`) entries; positive for
+ *                pool-kind entries emitted when runStaticGlobals pooled
+ *                writable globals. When non-zero the runtime computes
+ *                real_beg = __coqui_global_statics_pool_base
+ *                         + __coqui_fuzz_tid() * pool_stride
+ *                         + pool_offset
+ *                so the per-thread slab each thread sees is checked
+ *                against its own pooled-entry locations.
  * The runtime linearly scans __coqui_asan_globals[] from the slow path to
  * detect out-of-bounds accesses that land inside the red zone. */
 struct __coqui_asan_global_desc {
     const void   *beg;
     unsigned long user_size;
     unsigned long total_size;
+    unsigned long pool_offset;
+    unsigned long pool_stride;
 };
 
 /* Invoked once per kernel launch (all threads write the same descriptors,

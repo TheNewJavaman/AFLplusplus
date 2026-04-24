@@ -325,14 +325,20 @@ bool runAsanGlobals(Module &M) {
   Type *VoidTy = Type::getVoidTy(C);
   Type *PtrTy  = PointerType::get(C, 0);
 
-  /* Right red zone size in bytes. 32 bytes = 4 shadow granules. Matches
-   * the reference coqui implementation and large enough to catch the
-   * common "off-by-one / off-by-a-few" patterns without massively
-   * inflating .global memory use on large targets. */
-  constexpr uint64_t kRedZone = 32;
+  /* Right red-zone size in bytes. 32 = 4 shadow granules. Shared with
+   * StaticGlobals via the kAsanGlobalRedZone constant in Transforms.h,
+   * so a pool-kind entry's total_size = user_size + kAsanGlobalRedZone
+   * (the trailing gap StaticGlobals reserved) matches exactly what a
+   * non-pooled entry looks like after the type-wrap below. */
+  constexpr uint64_t kRedZone = kAsanGlobalRedZone;
 
-  /* Descriptor struct matches coqui_runtime.h. */
-  auto *DescTy = StructType::get(C, {PtrTy, I64Ty, I64Ty});
+  /* Descriptor struct matches coqui_runtime.h. The last two fields
+   * (pool_offset, pool_stride) were added additively for pooled-global
+   * support. Non-pool entries emit pool_offset=0 and pool_stride=0 —
+   * the runtime treats pool_stride==0 as "beg is absolute" (legacy path).
+   * Pool entries emit pool_stride>0 (the per-thread slab size) and the
+   * runtime computes real_beg = statics_pool_base + tid*stride + offset. */
+  auto *DescTy = StructType::get(C, {PtrTy, I64Ty, I64Ty, I64Ty, I64Ty});
 
   struct Candidate { GlobalVariable *GV; uint64_t UserSize; };
   SmallVector<Candidate, 16> Candidates;
@@ -369,6 +375,13 @@ bool runAsanGlobals(Module &M) {
      * produces bitcode the NVPTX backend can't handle. */
     if (GV->getAddressSpace() != 0)
       continue;
+    /* StaticGlobals demotes pooled originals to InternalLinkage but leaves
+     * them in the module with their initializers intact. Their instruction
+     * uses were RAUW'd through the accessor, so they're use-empty here —
+     * skip them to avoid padding unreachable memory (we emit pool-kind
+     * descriptors further down from the StaticGlobals sidecar instead). */
+    if (GV->use_empty())
+      continue;
     /* Need a known fixed size. */
     Type *Ty = GV->getValueType();
     if (!Ty->isSized())
@@ -385,13 +398,10 @@ bool runAsanGlobals(Module &M) {
     Candidates.push_back({GV, UserSize});
   }
 
-  if (Candidates.empty())
-    return false;
-
-  /* Phase 1: pad each global by wrapping its type with a trailing
-   * red zone. With opaque pointers, all existing users (GEPs, loads,
-   * stores) continue to work after RAUW because the original data is
-   * still at byte offset 0. */
+  /* Phase 1: pad each non-pooled candidate by wrapping its type with a
+   * trailing red zone. With opaque pointers, all existing users (GEPs,
+   * loads, stores) continue to work after RAUW because the original data
+   * is still at byte offset 0. */
   struct Descriptor { GlobalVariable *GV; uint64_t UserSize; };
   SmallVector<Descriptor, 16> Descriptors;
 
@@ -423,16 +433,94 @@ bool runAsanGlobals(Module &M) {
     Descriptors.push_back({NewGV, Cand.UserSize});
   }
 
-  /* Phase 2: build the descriptor table [{ptr beg, i64 user, i64 total}]. */
-  SmallVector<Constant *, 16> Entries;
+  /* Phase 1b: lift the StaticGlobals pool-entry sidecar into pool-kind
+   * descriptors. These share the unified __coqui_asan_global_descriptors
+   * table with non-pool entries; the runtime branches on pool_stride.
+   *
+   * Sidecar globals (emitted by StaticGlobals when it pools anything):
+   *   __coqui_asan_pool_entries : [{ i64 offset, i64 user_size } x N]
+   *   __coqui_asan_pool_entry_count : i64   (== N)
+   *   __coqui_statics_per_thread    : i32   (per-thread slab stride)
+   *
+   * StaticGlobals already inserted a kAsanGlobalRedZone-byte gap after each
+   * entry's user bytes, so total_size = user_size + kAsanGlobalRedZone
+   * matches the non-pool entries above. */
+  struct PoolDesc { uint64_t Offset; uint64_t UserSize; };
+  SmallVector<PoolDesc, 16> PoolEntries;
+  uint64_t PoolStride = 0;
+  /* AllowInternal=true — the sidecar StaticGlobals emits has internal
+   * linkage (so DCE is free to drop it after we consume it), and
+   * getGlobalVariable() defaults to AllowInternal=false which would skip
+   * it. */
+  if (GlobalVariable *SideGV =
+          M.getGlobalVariable(kAsanPoolEntriesSymbol,
+                              /*AllowInternal=*/true)) {
+    if (GlobalVariable *StrideGV =
+            M.getGlobalVariable(kAsanPoolStrideSymbol,
+                                /*AllowInternal=*/true)) {
+      if (auto *StrideInit =
+              dyn_cast_or_null<ConstantInt>(StrideGV->getInitializer())) {
+        PoolStride = StrideInit->getZExtValue();
+      }
+    }
+    if (auto *Init = dyn_cast_or_null<ConstantArray>(SideGV->getInitializer())) {
+      for (unsigned i = 0; i < Init->getNumOperands(); i++) {
+        auto *CS = dyn_cast<ConstantStruct>(Init->getOperand(i));
+        if (!CS) continue;
+        auto *OffC  = dyn_cast<ConstantInt>(CS->getOperand(0));
+        auto *SizeC = dyn_cast<ConstantInt>(CS->getOperand(1));
+        if (!OffC || !SizeC) continue;
+        PoolEntries.push_back(
+            {OffC->getZExtValue(), SizeC->getZExtValue()});
+      }
+    }
+    /* We're the only consumer of the sidecar; erase it so it doesn't
+     * bloat the emitted PTX with an unused constant array. The count
+     * sidecar is also removed for the same reason. */
+    SideGV->eraseFromParent();
+    if (GlobalVariable *CntGV =
+            M.getGlobalVariable(kAsanPoolEntryCountSymbol,
+                                /*AllowInternal=*/true)) {
+      CntGV->eraseFromParent();
+    }
+  }
+
+  if (Descriptors.empty() && PoolEntries.empty())
+    return false;
+
+  /* Phase 2: build the unified descriptor table. */
+  SmallVector<Constant *, 32> Entries;
+  Constant *NullPtr = ConstantPointerNull::get(PointerType::get(C, 0));
+  Constant *Zero64  = ConstantInt::get(I64Ty, 0);
+
+  /* Non-pool entries: beg = &padded_global, pool_offset = 0, pool_stride = 0. */
   for (auto &D : Descriptors) {
-    uint64_t TotalSize = DL.getTypeAllocSize(D.GV->getValueType()).getFixedValue();
+    uint64_t TotalSize =
+        DL.getTypeAllocSize(D.GV->getValueType()).getFixedValue();
     Constant *Entry = ConstantStruct::get(
         DescTy,
-        {D.GV, ConstantInt::get(I64Ty, D.UserSize),
-         ConstantInt::get(I64Ty, TotalSize)});
+        {D.GV,
+         ConstantInt::get(I64Ty, D.UserSize),
+         ConstantInt::get(I64Ty, TotalSize),
+         Zero64, Zero64});
     Entries.push_back(Entry);
   }
+
+  /* Pool entries: beg = NULL (unused), pool_offset/stride identify the
+   * per-thread location. The runtime computes real_beg as
+   *   __coqui_global_statics_pool_base + tid * pool_stride + pool_offset
+   * in asan_check_global(). */
+  for (auto &P : PoolEntries) {
+    Constant *Entry = ConstantStruct::get(
+        DescTy,
+        {NullPtr,
+         ConstantInt::get(I64Ty, P.UserSize),
+         ConstantInt::get(I64Ty, P.UserSize + kRedZone),
+         ConstantInt::get(I64Ty, P.Offset),
+         ConstantInt::get(I64Ty, PoolStride)});
+    Entries.push_back(Entry);
+  }
+
   auto *TableTy = ArrayType::get(DescTy, Entries.size());
   auto *Table = new GlobalVariable(
       M, TableTy, /*isConstant=*/true,
@@ -443,11 +531,15 @@ bool runAsanGlobals(Module &M) {
    * at the start of __coqui_fuzz_kernel so the runtime has the table
    * before any user code runs. The call is idempotent (all threads
    * write identical descriptors at identical indices), so we can just
-   * inject it unconditionally — no tid==0 gate required. */
+   * inject it unconditionally — no tid==0 gate required. Pool-kind
+   * descriptors carry their pool-base-relative form so they remain
+   * identical across threads too (the per-thread variation happens
+   * inside asan_check_global()). */
   Function *Kernel = M.getFunction("__coqui_fuzz_kernel");
   if (!Kernel || Kernel->isDeclaration()) {
     errs() << "[coqui-asan-globals] no __coqui_fuzz_kernel; "
-           << Descriptors.size() << " global(s) padded but unregistered\n";
+           << (Descriptors.size() + PoolEntries.size())
+           << " global(s) padded but unregistered\n";
     return true;
   }
 
@@ -462,8 +554,10 @@ bool runAsanGlobals(Module &M) {
   IRBuilder<> B(InsertPt);
   B.CreateCall(RegFn, {Table, ConstantInt::get(I64Ty, Entries.size())});
 
-  errs() << "[coqui-asan-globals] padded " << Descriptors.size()
-         << " global(s) with " << kRedZone << "-byte right red zones\n";
+  errs() << "[coqui-asan-globals] padded "
+         << (Descriptors.size() + PoolEntries.size()) << " global(s) ("
+         << Descriptors.size() << " non-pooled + " << PoolEntries.size()
+         << " pooled) with " << kRedZone << "-byte right red zones\n";
 
   return true;
 }

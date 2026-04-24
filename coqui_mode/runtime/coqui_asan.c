@@ -157,13 +157,30 @@ static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
 /* ===-------------------------------------------------------------------===
  * Global variable red-zone tracking
  *
- * The IR pass (coqui::runAsanGlobals) replaces each qualifying global
- * `T g;` with a padded struct `{ T orig; u8 rz[32]; }` so there is a
- * physical gap after the user bytes. It then emits a descriptor table
- * and a one-shot call to __coqui_asan_register_globals() inside
- * __coqui_fuzz_kernel. The descriptor records where each global's user
- * region ends and where its red zone ends, so we can detect an access
- * that lands in [user_end, total_end).
+ * The IR pass (coqui::runAsanGlobals) emits a unified descriptor table
+ * listing two kinds of entries:
+ *
+ *   Non-pool (pool_stride == 0):
+ *     Each qualifying user global `T g;` is replaced with a padded struct
+ *     `{ T orig; u8 rz[32]; }` so there is a physical gap after the user
+ *     bytes. The descriptor's `beg` points at the padded global (= the
+ *     absolute address shared by all threads).
+ *
+ *   Pool (pool_stride > 0):
+ *     Writable globals that StaticGlobals pooled into the per-thread slab
+ *     have no single absolute address; each thread's slab lives at
+ *     `__coqui_global_statics_pool_base + tid * pool_stride` and the
+ *     pooled entry sits at `+ pool_offset` within that slab. StaticGlobals
+ *     reserves a 32-byte trailing gap between pooled entries so the
+ *     descriptor's total_size (= user_size + 32) still covers real poison
+ *     bytes. `beg` is NULL for pool entries; asan_check_global() resolves
+ *     the per-thread real_beg at check time.
+ *
+ * A one-shot call to __coqui_asan_register_globals() is injected at the
+ * top of __coqui_fuzz_kernel, so the table is populated before any user
+ * code runs. Descriptors carry their pool-base-relative form, so all
+ * threads write identical values — the per-thread address variation
+ * happens inside asan_check_global().
  *
  * We cannot rely on the existing heap shadow: globals live in NVPTX
  * .global memory, outside any per-thread heap. Instead, the outlined
@@ -174,6 +191,18 @@ static void asan_unpoison_range(unsigned long heap_off, unsigned long n) {
 static struct __coqui_asan_global_desc
     __coqui_asan_globals[ASAN_MAX_GLOBALS];
 static unsigned long __coqui_asan_num_globals;
+
+/* Extern ptr bound by the host launcher at module load (see
+ * afl-fuzz-coqui.c phase 9). Declared here so asan_check_global() can
+ * resolve per-thread pool-entry addresses.
+ *
+ * This symbol is defined by StaticGlobals.cpp as `extern ptr
+ * __coqui_global_statics_pool_base` and written at runtime by the host
+ * via cuModuleGetGlobal + cuMemcpyHtoD. For targets with no pooled
+ * globals the symbol is still declared (we take its address here only if
+ * at least one pool-kind descriptor exists) — the `if (stride)` gate
+ * below ensures we never dereference it in the no-pool case. */
+extern u8 *__coqui_global_statics_pool_base;
 
 void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
                                     unsigned long count) {
@@ -194,13 +223,26 @@ void __coqui_asan_register_globals(const struct __coqui_asan_global_desc *descs,
  *   (b) the access starts inside the user region but extends past
  *       user_end (partial overflow).
  *
+ * For pool-kind descriptors (pool_stride > 0) the per-thread real_beg
+ * is computed on the fly as `pool_base + tid*stride + pool_offset`, so
+ * each thread checks against its own slab's pooled-entry locations.
+ *
  * Linear scan is fine: typical targets register well under 100 globals,
  * and the slow path only runs on shadow misses / out-of-heap addresses.
  */
 static int asan_check_global(unsigned long addr, unsigned long size) {
-    unsigned long n = __coqui_asan_num_globals;
+    unsigned long n      = __coqui_asan_num_globals;
+    unsigned long pool   = (unsigned long)__coqui_global_statics_pool_base;
+    unsigned long tid    = (unsigned long)__coqui_fuzz_tid();
     for (unsigned long i = 0; i < n; i++) {
-        unsigned long beg       = (unsigned long)__coqui_asan_globals[i].beg;
+        unsigned long stride = __coqui_asan_globals[i].pool_stride;
+        unsigned long beg;
+        if (stride) {
+            /* Pool-kind: resolve this thread's slab-relative location. */
+            beg = pool + tid * stride + __coqui_asan_globals[i].pool_offset;
+        } else {
+            beg = (unsigned long)__coqui_asan_globals[i].beg;
+        }
         unsigned long user_end  = beg + __coqui_asan_globals[i].user_size;
         unsigned long total_end = beg + __coqui_asan_globals[i].total_size;
 
