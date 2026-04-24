@@ -65,10 +65,10 @@ bool runAsanGlobals(llvm::Module &M);
 bool runAsan(llvm::Module &M);
 bool runExternalSymbolGatekeeper(llvm::Module &M);
 
-/* === task23: line-trace pass (oracle mode) ===
- * Gated by the `-coqui-line-trace` opt flag. Returns false (no-op) when
- * the flag is unset, so production runs pay nothing. See LineTrace.cpp
- * for the (file, line) ID assignment scheme + skip list. */
+/* Line-trace pass (oracle mode). Gated by the `-coqui-line-trace` opt flag.
+ * Returns false (no-op) when the flag is unset, so production runs pay
+ * nothing. See LineTrace.cpp for the (file, line) ID assignment scheme +
+ * skip list. */
 bool runLineTrace(llvm::Module &M);
 
 } // namespace coqui

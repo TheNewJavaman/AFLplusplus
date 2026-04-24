@@ -318,8 +318,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
         slab_size, shadow_size, ctx->slab_block_budget);
   }
 
-  /* === task23: oracle-mode line-trace setup (gated by COQUI_ORACLE=1) ===
-   *
+  /* Oracle-mode line-trace setup (gated by COQUI_ORACLE=1).
    * When set, allocate per-thread trace buffer + count array and bind
    * them to the cubin's __coqui_trace_buffer / __coqui_trace_count
    * globals. If the cubin wasn't built with -coqui-line-trace,
@@ -373,7 +372,6 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
           buf_bytes, ctx->batch_size, COQUI_TRACE_BUFFER_BYTES, count_bytes);
     }
   }
-  /* === end task23 block === */
 
   ctx->batch_timeout_us = getenv_u64("AFL_COQUI_TIMEOUT_US", 3000000);
   ctx->timeout_env_override = getenv("AFL_COQUI_TIMEOUT_US") ? 1 : 0;
@@ -611,7 +609,7 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                              ctx->slab_pool_size / 8, s));
   }
 
-  /* === task23: zero per-thread trace counters before each launch ===
+  /* Zero per-thread trace counters before each launch.
    * Trace buffer contents stay (they're overwritten by index, not
    * appended), but the count array MUST start at zero so the first
    * call to __coqui_trace_line writes to slot [0]. The buffer itself
@@ -952,8 +950,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
-  /* === task23: oracle-mode line-trace readback ===
-   *
+  /* Oracle-mode line-trace readback.
    * After a healthy batch, copy thread-0's count + trace stripe back to
    * host scratch and print. Thread 0 is sufficient for end-to-end pass
    * validation — every thread runs the same kernel against its own input,
@@ -966,8 +963,8 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
    * running a known-input through afl-fuzz, capture the recorded
    * sequence, and diff against the host CPU build's expected trace
    * separately. Wiring a flexible seed/expected-trace harness into core
-   * afl-fuzz is a separate piece of work; per task23 spec the readback
-   * path being functional is enough to validate the device side. */
+   * afl-fuzz is a separate piece of work; the readback path being
+   * functional is enough to validate the device side. */
   if (ctx->oracle_enabled && ctx->h_trace_t0_buf && b->h_input_lens[0] > 0) {
     /* DtoH thread-0 count first, then conditionally the buffer.
      * Synchronous DtoH so the print below sees the values. */
@@ -1003,7 +1000,6 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
               (unsigned long long)ctx->launch_count);
     }
   }
-  /* === end task23 block === */
 
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
@@ -1310,7 +1306,7 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_slab_shadow);
   if (ctx->d_slab_next)
     cuMemFree((CUdeviceptr)ctx->d_slab_next);
-  /* === task23: free oracle-mode line-trace buffers === */
+  /* Free oracle-mode line-trace buffers. */
   if (ctx->d_trace_buffer)
     cuMemFree((CUdeviceptr)ctx->d_trace_buffer);
   if (ctx->d_trace_count)
