@@ -1,25 +1,18 @@
 # Build outputs
-libxml2_xml_read_fuzzer
-libxml2_xml_read_fuzzer.cubin
-libxml2_xml_read_fuzzer.conf
-libxml2_xml_read_fuzzer_cpu
-libxml2_xml_read_fuzzer.ptx
-libxml2_xml_read_fuzzer.bc
-
-# Symlinks into /nix/store
-seeds
-dict
-
-# Fuzzer outputs
-out/
-.build/
-.cache/
-.libxml2_fuzzer.build/
-.libxml2_xml_read_fuzzer.build/
-
-# Generic
 *.cubin
 *.conf
-*.ptx
-*.bc
-*_cpu
+libxml2_xml_read_fuzzer_cpu
+
+# Upstream source cache (fetched by build.sh at pinned tag)
+/.build/
+
+# coqui-cc + generated-header intermediate build dir
+/.*_fuzzer.build/
+
+# afl-fuzz output
+/out/
+
+# Bench artifacts / logs
+build.log
+*.log
+/seed_min/
