@@ -1,107 +1,48 @@
 # coqui mode cmark evaluation target
 
-Adapts the cmark (CommonMark Markdown parser) fuzz target from coqui so it can
-be driven with coqui mode's `afl-fuzz --coqui`.
+Adapts the cmark (CommonMark Markdown parser) fuzz target so it can be
+driven with coqui mode's `afl-fuzz --coqui`.
 
 - Upstream: https://github.com/commonmark/cmark (pinned to `0.31.1`)
-- GPU ref spec: `cmark` target in the legacy coqui codebase
-- AFL++ CPU spec: `target-cmark-aflplusplus` in the legacy coqui codebase
-- Harness: `cmark_fuzzer.c` from the legacy coqui codebase (libFuzzer-style,
-  4-byte `options` + 4-byte `width` prefix; mode selected by upper 2 bits of
-  `options`)
+- Harness: `harness.c` (libFuzzer-style, 4-byte `options` + 4-byte
+  `width` prefix; mode selected by upper 2 bits of `options`)
 
 ## Build / run
 
 ```
-./build.sh   # compiles .cubin + resolves CPU binary + seeds + dict
-./fuzz.sh    # launches: afl-fuzz --coqui gpu0 -i seeds -o out -- cmark_fuzzer_cpu
+./build.sh   # fetches cmark + builds .cubin + CPU binary
+./fuzz.sh    # prints launch commands for Main/Secondary/Coqui
 ```
 
-`fuzz.sh` forwards `$@` to `afl-fuzz` (insert before the `--` separator if you
-need extra flags like `-x dict/markdown.dict`).
-
-## Build status (as of 2026-04-22)
-
-**`build.sh` currently FAILS** at the coqui-cc coqui-link pipeline:
-
-```
-LLVM ERROR: [coqui-cc] ExternalSymbolGatekeeper: unresolved external
-'snprintf' — port the replacement transform or runtime stub.
-Used by: cmark_render_html
-```
-
-### Why
-
-- `cmark`'s renderers (`html.c`, `commonmark.c`, `xml.c`, `man.c`, `latex.c`)
-  all call `snprintf` for integer-to-string conversion.
-- The coqui mode `coqui-cc` device runtime (`/usr/local/lib/coqui-cc/runtime.bc`)
-  exposes `__coqui_malloc`, `__coqui_strlen`, `__coqui_memcmp`, ... but
-  **no `printf`/`snprintf` family**; the `ExternalSymbolGatekeeper` pass refuses
-  any build that leaves these unresolved.
-- The upstream coqui flake solves this by linking `coqui-musl-bitcode` (a
-  port of musl libc to NVPTX); coqui mode's compressed `coqui-cc` distribution does
-  not ship a libc bitcode equivalent.
-- The harness itself uses `cmark_markdown_to_html` in mode 3, which pulls in
-  `cmark_render_html` regardless of whether `html.c` is passed explicitly;
-  internalize+DCE won't drop it because `LLVMFuzzerTestOneInput` is live-root.
-
-### What works
-
-- CPU half (AFL++-instrumented `cmark_fuzzer_cpu`) builds fine via
-  `nix build .#target-cmark-aflplusplus` and the symlink/wire-up works.
-- Seeds (`seeds/`) and dictionary (`dict/markdown.dict`) are present from
-  the nix store.
-- `build.sh` correctly resolves the pinned cmark source tarball via
-  `fetchFromGitHub` (identical hash → identical `/nix/store` path each run),
-  generates the local `generated/{config,cmark_export,cmark_version}.h`
-  headers that the nix `preBuild` produces, and invokes `coqui-cc` with
-  the same sources / `-I` / `-D` / `--stack-size 32768` as the coqui nix spec.
-- All cmark `.c` sources compile to NVPTX bitcode cleanly; the failure is
-  strictly at the final coqui-link gatekeeper step, not at the earlier
-  per-TU clang stage.
-
-### Paths forward
-
-1. **Add an `snprintf`-family port to coqui mode's device runtime** (likely by
-   pulling the relevant translation units from `coqui-musl-bitcode` into
-   `coqui_mode/runtime/`, or implementing a minimal integer-only `snprintf`
-   under `__coqui_snprintf` plus a `Libc.cpp`-pass rewrite to route
-   `snprintf` → `__coqui_snprintf`). This is the intrusive-but-correct fix.
-2. **Harness surgery** — patch `cmark_fuzzer.c` to remove mode 3
-   (`cmark_markdown_to_html`) and drop the renderer TUs. The harness already
-   documents that render functions were meant to be excluded on GPU; current
-   code path is inconsistent with its own comment. Still needs a gatekeeper-
-   satisfying story for any residual snprintf calls (e.g. from
-   `references.c` / `scanners.c`).
-3. **Add `snprintf` to the `ExternalSymbolGatekeeper` allowlist and provide
-   a device-side stub that trips an unreachable** — works for targets that
-   don't actually execute the renderer path; bad idea for cmark because
-   mode 3 exercises it on every seed matching the high-bit pattern.
+`build.sh` is self-contained: no nix, no external COQUI_REPO. It clones
+cmark from GitHub into `.build/`, synthesizes the cmark config headers
+inline (cmark's upstream build is CMake; we skip that), compiles the
+CPU binary with this repo's own `afl-clang-fast`, and builds the GPU
+cubin via `coqui-cc` under a `/tmp/coqui-cc.lock` flock so ptxas can
+serialize with any parallel target builds.
 
 ## Layout
 
 - `build.sh` / `fuzz.sh` — entry points (set -euo pipefail).
-- `.gitignore` — excludes build artifacts.
-- `generated/` — produced by `build.sh`; config headers the cmark source
-  expects at build time.
-- After a successful build the following appear (symlinks into `/nix/store`
-  where applicable):
-  - `cmark_fuzzer.cubin`, `cmark_fuzzer.conf` (from coqui-cc)
-  - `cmark_fuzzer_cpu` -> `/tmp/coqui-cmark-cpu/cmark_fuzzer`
-  - `seeds/` -> `/tmp/coqui-cmark-cpu/seeds`
-  - `dict/` -> `/tmp/coqui-cmark-cpu/dict`
+- `harness.c` — in-tree libFuzzer-style harness.
+- `seeds/min.md` — single minimal seed (`a`; 1 byte).
+- `.gitignore` — excludes build artifacts + `.build/` cache + `generated/`.
+- `.build/` (ignored) — cached cmark source clone.
+- `generated/` (ignored) — `config.h`, `cmark_export.h`, `cmark_version.h`
+  synthesized by `build.sh`.
+- After a successful build:
+  - `cmark_fuzzer.cubin`, `cmark_fuzzer.conf` (from `coqui-cc`)
+  - `cmark_fuzzer_cpu` (AFL++-instrumented binary)
   - `out/` — created by `fuzz.sh`; AFL output dir
 
-## Gotchas
+## Notes
 
-- Requires a working coqui flake from the legacy coqui codebase (for the
-  AFL++ CPU build) and a local install of coqui mode's `coqui-cc` at
-  `/usr/local/bin/coqui-cc` (for the GPU build).
-- `--arch sm_75` is hardcoded in `build.sh` (matches the RTX Titan test box
-  per `CLAUDE.local.md`).
-- The first run of `build.sh` is slow (nix fetches cmark upstream + builds
-  the AFL++ target); subsequent runs hit the Nix cache.
+- `--arch sm_75` matches the RTX Titan test box (see `CLAUDE.local.md`).
+  Override with `ARCH=sm_XX ./build.sh`.
+- CPU build compiles each translation unit separately to `.o` before
+  linking. One-shot compile overflows afl-cc's 2048-parameter cap with
+  the full sanitizer list and 19 cmark TUs; see the inline comment in
+  `build.sh`.
 - `fuzz.sh` sets `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`,
   `AFL_SKIP_CPUFREQ=1`, `AFL_SKIP_BIN_CHECK=1`, `AFL_NO_UI=1` per the
-  project convention; override by exporting them yourself before calling
-  the script.
+  project convention; override by exporting them yourself.

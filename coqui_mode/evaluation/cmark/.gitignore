@@ -1,10 +1,21 @@
-# coqui mode cmark target build outputs
-cmark_fuzzer.cubin
-cmark_fuzzer.conf
+# Build outputs
+*.cubin
+*.conf
 cmark_fuzzer_cpu
-seeds
-dict
-generated/
-.cmark_fuzzer.build/
-.*.build/
-out/
+
+# Upstream source cache (fetched by build.sh at pinned commit)
+/.build/
+
+# Config headers generated inline by build.sh from the legacy nix preBuild
+/generated/
+
+# coqui-cc intermediate build dir (.harness.build/)
+/.*_fuzzer.build/
+
+# afl-fuzz output
+/out/
+
+# Bench artifacts / logs
+build.log
+*.log
+/seed_min/
