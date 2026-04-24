@@ -24,9 +24,11 @@
  */
 
 #include "Transforms.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -34,6 +36,10 @@
 using namespace llvm;
 
 namespace coqui {
+
+/* Stack-canary sentinel. Must match COQUI_STACK_CANARY in
+ * coqui_mode/runtime/coqui_runtime.h — if that literal changes, update here. */
+static constexpr uint64_t kStackCanary = 0xCA7A1C0FFEE0DE50ULL;
 
 /* Total per-thread budget. sm_75 hardware ceiling is 512KB but real devices
  * typically allow 256KB (driver caps based on max-resident-threads × #SMs vs
@@ -97,7 +103,9 @@ bool runMemoryLayout(Module &M) {
 
   Type *i8  = Type::getInt8Ty(C);
   Type *i32 = Type::getInt32Ty(C);
+  Type *i64 = Type::getInt64Ty(C);
   Type *i8p = PointerType::get(C, 0); /* addrspace(0) opaque pointer */
+  Type *voidT = Type::getVoidTy(C);
 
   /* 2. Declare the addrspace(0) slot pool and the tid helper. */
   GlobalVariable *Pool = getOrMakeSlotPool(M);
@@ -108,6 +116,22 @@ bool runMemoryLayout(Module &M) {
   /* 3. Insert allocas at kernel entry, then store base pointers into pool slots */
   BasicBlock &EntryBB = Kernel->getEntryBlock();
   IRBuilder<> Builder(&EntryBB, EntryBB.begin());
+
+  /* Stack canary. i64 alloca at the outermost kernel frame; we store
+   * COQUI_STACK_CANARY (kStackCanary) into it here, then emit a check at
+   * every kernel exit. On NVPTX, allocas and the call-stack frames share
+   * the per-thread .local region — a deep recursion that overruns
+   * CU_LIMIT_STACK_SIZE will eventually corrupt this slot.
+   *
+   * We place it first so (a) it's the outermost alloca and hence the
+   * farthest from growing call-stack frames, maximizing the chance that
+   * runaway recursion reaches it before other important state, and
+   * (b) its address is stable regardless of how the other allocas below
+   * get ordered by the NVPTX lowering. */
+  AllocaInst *CanarySlot =
+      Builder.CreateAlloca(i64, nullptr, "stack_canary");
+  CanarySlot->setAlignment(Align(8));
+  Builder.CreateStore(ConstantInt::get(i64, kStackCanary), CanarySlot);
 
   AllocaInst *CovAlloca = Builder.CreateAlloca(
       ArrayType::get(i8, kCovMapSize), nullptr, "cov_map");
@@ -194,6 +218,30 @@ bool runMemoryLayout(Module &M) {
       IRBuilder<> B(BB);
       B.CreateRet(ConstantInt::get(i32, usableHeap));
     }
+  }
+
+  /* 5. Emit the stack-canary check at every kernel exit.
+   *
+   * We insert BEFORE each ReturnInst in __coqui_fuzz_kernel so the check
+   * runs no matter which of FuzzEntry's exit paths (len==0 early exit vs
+   * post-bucketing fall-through) the thread takes. The runtime helper
+   * calls __coqui_trap_with_reason(COQUI_TRAP_STACK_OVERFLOW) on mismatch
+   * so the host's rerun loop (PR #10) picks up trap_reason=12 and
+   * re-verifies on the CPU. */
+  FunctionType *CheckT = FunctionType::get(voidT, {i8p}, /*isVarArg=*/false);
+  FunctionCallee Check =
+      M.getOrInsertFunction("__coqui_check_stack_canary", CheckT);
+
+  /* Collect ReturnInsts first — inserting calls before ret shouldn't
+   * invalidate iteration, but we keep the two steps separate for clarity. */
+  SmallVector<ReturnInst *, 4> Returns;
+  for (BasicBlock &BB : *Kernel) {
+    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+      Returns.push_back(RI);
+  }
+  for (ReturnInst *RI : Returns) {
+    IRBuilder<> RBuilder(RI);
+    RBuilder.CreateCall(Check, {CanarySlot});
   }
 
   return true;

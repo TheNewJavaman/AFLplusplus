@@ -63,6 +63,16 @@ typedef uint64_t u64;
 #define COQUI_TRAP_EXCEPTION     14
 #define COQUI_TRAP_UNSUPPORTED   255
 
+/* Stack-canary sentinel. Written once into an alloca at the outermost kernel
+ * frame; compared at every kernel exit point. On NVPTX, allocas and call-stack
+ * frames share the per-thread .local region, so a runaway recursion that
+ * exceeds CU_LIMIT_STACK_SIZE will eventually corrupt this slot. Mismatch ->
+ * __coqui_trap_with_reason(COQUI_TRAP_STACK_OVERFLOW).
+ *
+ * Value is chosen to be a 64-bit constant unlikely to arise naturally
+ * (no run of identical bytes, no ASCII text, no common poison pattern). */
+#define COQUI_STACK_CANARY 0xCA7A1C0FFEE0DE50ULL
+
 /* Per-thread status reported to the host.
  *
  * Layout is BYTE-IDENTICAL to the host-side coqui_status_t in
@@ -108,6 +118,13 @@ void __coqui_slab_release_thread(void);
  * releases any slab allocations, then calls __coqui_exit() — NOT trap.
  * The kernel keeps running so peer threads still make progress. */
 void __coqui_trap_with_reason(u8 reason);
+
+/* Stack-canary check. Reads the u64 at `slot`, compares against
+ * COQUI_STACK_CANARY, and calls __coqui_trap_with_reason(COQUI_TRAP_STACK_OVERFLOW)
+ * on mismatch. The pass MemoryLayout emits a call at every kernel exit;
+ * the slot is an alloca the pass sets up at kernel entry. Returns normally
+ * on match so the kernel can clean up and `ret` as usual. */
+void __coqui_check_stack_canary(const unsigned long *slot);
 
 /* Status writing */
 void __coqui_status_set_phase(u32 tid, u8 phase);

@@ -75,6 +75,22 @@ void __coqui_trap_with_reason(u8 reason) {
     __builtin_unreachable();
 }
 
+/* Stack-canary check (see COQUI_STACK_CANARY in coqui_runtime.h).
+ *
+ * The pass MemoryLayout emits a call here at every kernel exit. `slot`
+ * points at the u64 alloca written with COQUI_STACK_CANARY at kernel entry.
+ * If the canary is intact this is a single load + compare + early return;
+ * on mismatch we stamp COQUI_TRAP_STACK_OVERFLOW into the status slot and
+ * __coqui_exit() the thread without trapping the whole kernel — peer
+ * threads keep running, and the host's rerun loop picks up trap_reason=12
+ * so it can re-verify this input on the CPU rerun path. */
+void __coqui_check_stack_canary(const unsigned long *slot) {
+    if (__builtin_expect(*slot != COQUI_STACK_CANARY, 0)) {
+        __coqui_trap_with_reason(COQUI_TRAP_STACK_OVERFLOW);
+        __builtin_unreachable();
+    }
+}
+
 /* Status writer */
 void __coqui_status_set_phase(u32 tid, u8 phase) {
     __coqui_status_array[tid].phase = phase;
