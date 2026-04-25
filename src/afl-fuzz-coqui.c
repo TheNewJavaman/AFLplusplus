@@ -141,18 +141,30 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->k_batch_count = 0;
 
   /* 4. Probe the device for its maximum allowed per-thread stack size.
-   *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
+   *    CUDA's cuCtxSetLimit accepts values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must
-   *    fit in device memory). There's no direct query API; binary-search
-   *    downward from the sm_75+ hardware ceiling (512 KB) to find the
-   *    largest accepted value. */
-  unsigned int total_budget = 524288;   /* sm_75+ hardware ceiling */
+   *    fit in device memory). There's no direct query API.
+   *
+   *    Phase 1: halve from a high ceiling until the driver accepts. This
+   *    bounds the answer to [last_failed/2, last_failed].
+   *    Phase 2: linear-step upward from the accepted value in 8 KB
+   *    increments while the driver still accepts, to recover the last
+   *    bit of budget the halving missed. */
+  unsigned int total_budget = 1048576;  /* 1 MB upper bound */
+  unsigned int last_failed = total_budget * 2;
   while (total_budget >= 32768) {
     if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget) == CUDA_SUCCESS) break;
+    last_failed = total_budget;
     total_budget /= 2;
   }
   if (total_budget < 32768) {
     FATAL("device rejected all per-thread stack sizes >= 32 KB");
+  }
+  /* Phase 2: try +8 KB increments toward last_failed. */
+  while (total_budget + 8192 < last_failed) {
+    unsigned int trial = total_budget + 8192;
+    if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, trial) != CUDA_SUCCESS) break;
+    total_budget = trial;
   }
   size_t actual_set = 0;
   cuCtxGetLimit(&actual_set, CU_LIMIT_STACK_SIZE);
