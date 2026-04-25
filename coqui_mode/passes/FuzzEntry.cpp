@@ -16,6 +16,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
@@ -77,7 +78,15 @@ bool runFuzzEntry(Module &M) {
     "__coqui_virgin_compare_and_flag",
     FunctionType::get(voidT, {i8p, i8p, i8p}, false));
 
-  /* 4. Declare the virgin_map as an extern global [65536 x i8] */
+  /* 4. Declare the virgin_map as an extern global [65536 x i8].
+   *
+   * Alignment must be at least 8 bytes. __coqui_virgin_compare_and_flag
+   * casts this pointer to `_Atomic u64 *` and issues atom.or.b64 through
+   * it; on sm_75+ any 64-bit atomic at a non-8-byte-aligned address
+   * produces CUDA_ERROR_MISALIGNED_ADDRESS. Without an explicit Align(8)
+   * here, LLVM emits `.align 1 .b8 __coqui_virgin_map[65536]` in PTX and
+   * the CUDA driver is not required to over-align the symbol even when
+   * allocating a 64 KB chunk. */
   ArrayType *VirginArrTy = ArrayType::get(i8, 65536);
   GlobalVariable *VirginMap = M.getGlobalVariable("__coqui_virgin_map", true);
   if (!VirginMap) {
@@ -85,6 +94,11 @@ bool runFuzzEntry(Module &M) {
       M, VirginArrTy, /*isConstant*/false, GlobalValue::ExternalLinkage,
       nullptr, "__coqui_virgin_map");
   }
+  /* Unconditionally enforce 8-byte alignment — covers both the freshly-
+   * created declaration and any pre-existing one that may have been
+   * created without an alignment hint. */
+  if (VirginMap->getAlign().valueOrOne() < Align(8))
+    VirginMap->setAlignment(Align(8));
 
   /* 4b. Per-phase kernel timing accumulators: [init, exec, classify,
    * virgin, total] u64 cycles. Each thread atomic-adds its phase cycles
