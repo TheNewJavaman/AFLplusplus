@@ -323,7 +323,7 @@ void *__coqui_slab_malloc(unsigned long size) {
   (void)bucket;
 
   unsigned long tid = __coqui_fuzz_tid();
-  char *tctrl = __coqui_slab_pool + tid * 32;
+  char *tctrl = __coqui_slab_pool + tid * COQUI_SLAB_THREAD_CTRL_STRIDE;
   char **free_head_ptr = (char **)(void *)tctrl;
   char **heap_ptr = (char **)(void *)(tctrl + 8);
   unsigned int *limit_ptr = (unsigned int *)(void *)(tctrl + 16);
@@ -397,7 +397,7 @@ void __coqui_slab_free(void *ptr) {
 
   /* Push onto per-thread absolute-pointer freelist. */
   unsigned long tid = __coqui_fuzz_tid();
-  char *tctrl = __coqui_slab_pool + tid * 32;
+  char *tctrl = __coqui_slab_pool + tid * COQUI_SLAB_THREAD_CTRL_STRIDE;
   char **free_head_ptr = (char **)(void *)tctrl;
   /* Block starts 8B before ptr (size header preserved for first-fit). */
   char *block = (char *)ptr - 8;
@@ -433,11 +433,13 @@ void __coqui_slab_release_thread(void) {
   if (unlikely(!__coqui_slab_pool || __coqui_slab_pool_size == 0))
     return;
   unsigned long tid = __coqui_fuzz_tid();
-  char *tctrl = __coqui_slab_pool + tid * 32;
+  char *tctrl = __coqui_slab_pool + tid * COQUI_SLAB_THREAD_CTRL_STRIDE;
+
+  /* Walk the per-thread heap chain (tctrl+8) and push each range back onto
+   * the global Treiber free stack.  Each heap range already carries the
+   * canonical header layout: [0..7]=prev_range, [8..11]=n_slabs. */
   char **heap_ptr = (char **)(void *)(tctrl + 8);
   char *heap = *heap_ptr;
-  if (!heap)
-    return;
   while (heap) {
     char *prev = (char *)(*(unsigned long *)(void *)heap);
     unsigned int n_slabs = *(unsigned int *)(void *)(heap + 8);
@@ -450,6 +452,38 @@ void __coqui_slab_release_thread(void) {
   *(unsigned long *)(void *)(tctrl + 8) = 0;  /* current_heap */
   *(unsigned int *)(void *)(tctrl + 16) = 0;  /* heap_limit */
   *(unsigned int *)(void *)(tctrl + 20) = 0;  /* bump_top */
+
+  /* Walk the per-thread stack chain (tctrl+COQUI_SLAB_STACK_HEAD_OFFSET) and
+   * push each 1-slab stack-spill page back onto the global Treiber free stack.
+   *
+   * Each stack-spill page has a 16-byte header carved by __coqui_stack_alloc:
+   *   [0..7]  prev_page    (u64) — the chain link, captured before overwrite
+   *   [8..11] virtual_base (u32) — repurposed: rewritten to n_slabs=1 so
+   *                                slab_free_stack_pop's size check passes
+   *
+   * slab_free_stack_push itself overwrites [0..7] with the Treiber next ptr
+   * inside its CAS loop, so only [8..11] needs an explicit fixup here.
+   *
+   * Normal-exit coverage note: FuzzEntry does not insert a call to this
+   * function in the kernel epilogue; only __coqui_trap_with_reason covers the
+   * trap path.  On clean thread exit the stack pages are "leaked" until the
+   * host-side cuMemsetD32Async resets __coqui_slab_next at the start of the
+   * next batch, so leaked pages do not accumulate across batches in practice. */
+  char **stack_ptr =
+      (char **)(void *)(tctrl + COQUI_SLAB_STACK_HEAD_OFFSET);
+  char *sp = *stack_ptr;
+  while (sp) {
+    char *prev = (char *)(*(unsigned long *)(void *)(sp + 0));
+    /* Rewrite the page header to the canonical Treiber range format:
+     *   [0..7]  = 0  (slab_free_stack_push fills this with old_head in CAS)
+     *   [8..11] = 1  (n_slabs; each stack page is exactly one slab) */
+    *(unsigned long *)(void *)(sp + 0) = 0;
+    *(unsigned int *)(void *)(sp + 8) = 1;
+    slab_free_stack_push(sp);
+    sp = prev;
+  }
+  /* Zero the stack chain head to prevent double-release. */
+  *(unsigned long *)(void *)(tctrl + COQUI_SLAB_STACK_HEAD_OFFSET) = 0;
 }
 
 /* ===------------------------------------------------------------------===
