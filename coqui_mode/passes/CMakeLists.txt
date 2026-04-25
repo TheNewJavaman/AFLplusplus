@@ -20,6 +20,7 @@ set(COQUI_PASS_SOURCES
     FuzzEntry.cpp
     Cpp.cpp
     Heap.cpp
+    StackSpill.cpp
     Sprintf.cpp
     Libc.cpp
     Variadic.cpp

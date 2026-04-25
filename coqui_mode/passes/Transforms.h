@@ -46,6 +46,11 @@ bool runRejectIntrinsics(llvm::Module &M);
 bool runFuzzEntry(llvm::Module &M);
 bool runCpp(llvm::Module &M);
 bool runHeap(llvm::Module &M);
+/* StackSpill: rewrite oversize allocas (per-function budget exceeded or
+ * dynamic) into __coqui_stack_alloc calls. Save/restore brackets at fn
+ * entry/return rewind a per-thread bump pointer through carved slab pages.
+ * Spill pointers' loads/stores get !nosanitize so runAsan skips them. */
+bool runStackSpill(llvm::Module &M);
 bool runSprintf(llvm::Module &M);
 bool runLibc(llvm::Module &M);
 bool runVariadic(llvm::Module &M);

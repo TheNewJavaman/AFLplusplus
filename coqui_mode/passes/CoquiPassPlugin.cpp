@@ -44,6 +44,10 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runFuzzEntry(M);
     Changed |= coqui::runCpp(M);                /* rewrite C++ new/delete before Heap so _Znwm etc are lowered */
     Changed |= coqui::runHeap(M);
+    /* StackSpill: redirect oversize allocas to slab-pool carves. After Heap
+     * (which only RAUWs malloc/free symbols) and before MemoryLayout (which
+     * sets up the kernel-entry stack canary). */
+    Changed |= coqui::runStackSpill(M);
     Changed |= coqui::runSprintf(M);            /* before runLibc so raw sprintf/snprintf are resolvable */
     Changed |= coqui::runLibc(M);
     Changed |= coqui::runMath(M);               /* rewrite llvm.pow/log/exp -> __coqui_* runtime calls */
