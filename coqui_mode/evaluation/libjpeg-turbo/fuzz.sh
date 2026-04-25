@@ -43,7 +43,6 @@ cat <<INNEREOF
 # 1. Set environment once (or prefix each command):
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \\
        AFL_SKIP_CPUFREQ=1 \\
-       AFL_SKIP_BIN_CHECK=1 \\
        AFL_NO_UI=1 \\
        AFL_COQUI_CUBIN=$CUBIN \\
        AFL_COQUI_DEVICE=$AFL_DEVICE
