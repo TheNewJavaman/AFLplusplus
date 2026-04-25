@@ -274,6 +274,38 @@ double __coqui_strtod(const char *nptr, char **endptr);
 /* Slab page size: every allocation unit from the pool is this many bytes. */
 #define SLAB_SIZE  4096u
 
+/* Multi-slab block header encoding (coqui_slab.c::__coqui_slab_malloc).
+ *
+ * When a request exceeds the largest sub-block bucket (~64 KB), the slab
+ * allocator carves n_slabs contiguous pages and writes a packed marker into
+ * the first 4 bytes of the block:
+ *
+ *   marker = SLAB_MULTI_SLAB_MARKER | ((n_slabs * SLAB_SIZE) << 4)
+ *
+ * The low nibble (SLAB_MULTI_SLAB_MARKER = 15) is the sentinel that
+ * distinguishes multi-slab blocks from sub-block allocations (which store
+ * block_size = 8 + aligned_user_bytes, always a multiple of 8 — so the low
+ * nibble is never 0xF for a valid sub-block).
+ * The upper 28 bits carry (n_slabs * SLAB_SIZE), the total byte capacity of
+ * the allocation (excluding the 8-byte SLAB_BLOCK_HDR_SIZE prefix).
+ *
+ * slab_blk_actual_bytes() decodes the total allocation size from any slab
+ * block header value, returning the number of bytes from the BLOCK START
+ * (inclusive of the 8-byte slab block header) that this allocation owns.
+ * Callers that need the user-visible bytes must subtract SLAB_BLOCK_HDR_SIZE.
+ *
+ * Used by coqui_asan.c and coqui_memory.c to correctly derive copy-size and
+ * shadow-poison range for slab-backed pointers. */
+#define SLAB_MULTI_SLAB_MARKER  15u
+#define SLAB_BLOCK_HDR_SIZE      8u
+
+__attribute__((const, always_inline, nothrow))
+static inline unsigned long slab_blk_actual_bytes(unsigned int blk) {
+    if ((blk & 0xFu) == SLAB_MULTI_SLAB_MARKER)
+        return (unsigned long)(blk >> 4);   /* n_slabs * SLAB_SIZE */
+    return (unsigned long)blk;              /* sub-block: blk == block_size */
+}
+
 /* Per-thread slab control block at slab_pool[tid * 32]:
  *   [0..7]   free_head        (u64) — heap free-list head (coqui_slab.c)
  *   [8..15]  current_heap     (u64) — current heap range pointer
