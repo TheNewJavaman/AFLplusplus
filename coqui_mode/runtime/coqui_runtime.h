@@ -291,6 +291,23 @@ double __coqui_strtod(const char *nptr, char **endptr);
 #define COQUI_STACK_PAGE_HDR_SIZE       16u
 #define COQUI_STACK_PAGE_USABLE         (SLAB_SIZE - COQUI_STACK_PAGE_HDR_SIZE)
 
+/* Stack-spill runtime (coqui_stack_spill.c).
+ *
+ * Per-thread bump pointer through chained 4 KB slab pages. Used by the
+ * StackSpill compile pass to redirect oversize allocas into the slab pool.
+ * The marker returned by __coqui_stack_save is a u32 absolute virtual offset
+ * (sum of bytes used across all pages in the chain to date). _restore
+ * rewinds the bump pointer; pages with vbase above the saved marker
+ * are dropped from the chain head and reclaimed at thread exit by
+ * __coqui_slab_release_thread. They are not re-bumped on the next _alloc.
+ *
+ * On thread exit / __coqui_trap_with_reason, __coqui_slab_release_thread
+ * walks the stack chain (via slab_pool[tid*32+24]) and pushes pages onto
+ * the global Treiber free stack alongside the heap chain. */
+unsigned int __coqui_stack_save(void);
+void *        __coqui_stack_alloc(unsigned int size);
+void          __coqui_stack_restore(unsigned int saved);
+
 /* Parameter-free setup. Slab pool globals (__coqui_slab_pool etc.) are
  * bound by the host via cuModuleGetGlobal + cuMemcpyHtoD before launch;
  * this call just computes the per-launch ctrl_slabs derived from grid
