@@ -176,6 +176,20 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
    *      [coverage 64 KB][heap H][shadow H/8][real stack S]
    *      where H = (total - 64K - S) * 8/9 and shadow = H/8 */
   unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 65536);
+
+  /* The probe above leaves the hardware stack limit at total_budget (e.g.
+   * 328 KB on RTX Titan).  The driver immediately backs that reservation
+   * with physical pages: 328 KB × 72 SMs × 2048 threads/SM ≈ 46 GB,
+   * exhausting a 24 GB card.  Lower the limit to the actually-needed
+   * stack_size so only stack_size × max_threads is reserved, leaving
+   * the bulk of device memory available for the slab pool and input
+   * buffers.  total_budget is still used below for budget-layout maths. */
+  if (stack_size < total_budget) {
+    if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, stack_size) != CUDA_SUCCESS) {
+      FATAL("failed to lower stack limit from %u KB to %u KB",
+            total_budget / 1024, stack_size / 1024);
+    }
+  }
   unsigned int cov = 65536;
   if (stack_size + cov >= total_budget) {
     FATAL("--stack-size %u + 64KB coverage >= total_budget %u",
