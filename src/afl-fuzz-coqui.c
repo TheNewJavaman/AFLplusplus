@@ -183,7 +183,12 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   }
 
   /* 6. Batch sizing (with u64 overflow protection from coqui mode T3.6 fixup) */
-  ctx->batch_size = 8192;
+  ctx->batch_size = getenv_u32("AFL_COQUI_BATCH_SIZE", 8192);
+  /* Kernel grid = batch_size/128 (block-size 128 threads). batch_size must be
+   * a positive multiple of 128, capped to keep ping-pong buffers reasonable. */
+  if (ctx->batch_size < 128) ctx->batch_size = 128;
+  if (ctx->batch_size > 65536) ctx->batch_size = 65536;
+  ctx->batch_size = (ctx->batch_size / 128) * 128;
   ctx->max_input_size = afl->max_length ? afl->max_length : 4096;
   unsigned long long budget64 = ((unsigned long long)ctx->batch_size
                                   * ctx->max_input_size) / 4;

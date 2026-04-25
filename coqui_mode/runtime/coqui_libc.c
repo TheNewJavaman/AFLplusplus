@@ -372,10 +372,24 @@ double __coqui_strtod(const char *nptr, char **endptr) {
         int en = 0;
         if (*p == '-') { en = 1; p++; }
         else if (*p == '+') { p++; }
+        /* Saturate exponent at 400 (well past IEEE 754 double's 10^308 limit
+         * but bounded). Anything past 400 produces ±inf or 0 in double, so the
+         * naive loop's extra iterations are useless work. Without the cap a
+         * pathological input like "0E0100000000000000000" overflows int and
+         * the `while (e--)` loop runs ~10^9 iterations per thread — found via
+         * cjson havoc, locks the GPU kernel for tens of seconds. */
         int e = 0;
-        while (*p >= '0' && *p <= '9') { e = e * 10 + (*p - '0'); p++; }
-        double base = en ? 0.1 : 10.0;
-        while (e--) val *= base;
+        while (*p >= '0' && *p <= '9') {
+            if (e < 1000) { e = e * 10 + (*p - '0'); }
+            p++;
+        }
+        if (e > 400) e = 400;
+        /* val == 0 short-circuit: 0 * anything is 0, skip the multiplication
+         * loop entirely. */
+        if (val != 0.0) {
+            double base = en ? 0.1 : 10.0;
+            while (e--) val *= base;
+        }
     }
     if (endptr) *endptr = (char *)p;
     return neg ? -val : val;
