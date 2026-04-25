@@ -22,7 +22,7 @@
  *   [8..15]   current_heap -- pointer to current bump heap
  *   [16..19]  heap_limit (u32)
  *   [20..23]  bump_top (u32)
- *   [24..31]  reserved
+ *   [24..31]  stack_chain_head (u64) -- see coqui_runtime.h
  *
  * Free-stack head at slab_pool[grid*block*32] (single u64 cell inside
  * ctrl_slabs reservation). Push/pop via atom.cas.b64 in generic space.
@@ -91,7 +91,7 @@ void __coqui_slab_free(void *ptr);
  * Slab constants
  * ===------------------------------------------------------------------=== */
 
-#define SLAB_SIZE             4096u
+/* SLAB_SIZE is defined in coqui_runtime.h (included above). */
 #define SLAB_N_BUCKETS        13
 #define SLAB_MIN_BUCKET_SIZE  16u
 #define SLAB_MULTI_SLAB_IDX   15
@@ -286,7 +286,7 @@ static unsigned int slab_size_to_bucket(unsigned int size) {
  *   [8-15]   current_heap -- current bump heap (range head)
  *   [16-19]  heap_limit   -- size of current heap
  *   [20-23]  bump_top     -- bump position in current heap
- *   [24-31]  reserved
+ *   [24-31]  stack_chain_head (u64) -- see coqui_runtime.h
  * ===------------------------------------------------------------------=== */
 
 #define SLAB_OVERFLOW_INITIAL_SLABS 4    /* 16KB initial */

@@ -271,6 +271,26 @@ double __coqui_strtod(const char *nptr, char **endptr);
 
 /* -- Slab pool runtime (coqui_slab.c) -- */
 
+/* Slab page size: every allocation unit from the pool is this many bytes. */
+#define SLAB_SIZE  4096u
+
+/* Per-thread slab control block at slab_pool[tid * 32]:
+ *   [0..7]   free_head        (u64) — heap free-list head (coqui_slab.c)
+ *   [8..15]  current_heap     (u64) — current heap range pointer
+ *   [16..19] heap_limit       (u32)
+ *   [20..23] heap_bump_top    (u32)
+ *   [24..31] stack_chain_head (u64) — current stack-spill page (coqui_stack_spill.c)
+ *
+ * Stack-spill page header (16 bytes, at offset 0 of each carved 4 KB page):
+ *   [0..7]   prev_page (u64)            — previous page in chain or 0
+ *   [8..11]  page_virtual_base (u32)    — sum of usable bytes in earlier pages
+ *   [12..15] page_bump_top (u32)        — bytes used in this page (>= 16)
+ * Usable space per page: SLAB_SIZE - 16 = 4080 bytes. */
+#define COQUI_SLAB_THREAD_CTRL_STRIDE   32u
+#define COQUI_SLAB_STACK_HEAD_OFFSET    24u
+#define COQUI_STACK_PAGE_HDR_SIZE       16u
+#define COQUI_STACK_PAGE_USABLE         (SLAB_SIZE - COQUI_STACK_PAGE_HDR_SIZE)
+
 /* Parameter-free setup. Slab pool globals (__coqui_slab_pool etc.) are
  * bound by the host via cuModuleGetGlobal + cuMemcpyHtoD before launch;
  * this call just computes the per-launch ctrl_slabs derived from grid
