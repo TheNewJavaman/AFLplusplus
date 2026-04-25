@@ -116,6 +116,10 @@ bool runLibc(Module &M) {
         {"snprintf",  "__coqui_snprintf"},
         {"puts",      "__coqui_puts"},
         {"putchar",   "__coqui_putchar"},
+        {"sscanf",         "__coqui_sscanf"},
+        {"__isoc99_sscanf","__coqui_sscanf"},
+        {"vsscanf",        "__coqui_vsscanf"},
+        {"__isoc99_vsscanf","__coqui_vsscanf"},
 
         /* File ops (VFS-backed stubs) */
         {"fwrite",   "__coqui_fwrite"},

@@ -31,11 +31,6 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
     if(json == NULL) return 0;
 
-    /* Print and minify paths use strlen/realloc/memcpy extensively.
-     * On GPU, these are byte-by-byte (no SIMD), making O(n²) print
-     * paths take 57,000x longer than CPU. Skip on GPU; the host
-     * binary (without __COQUI_DEVICE__) still exercises all paths. */
-#ifndef __COQUI_DEVICE__
     if(buffered)
     {
         printed_json = cJSON_PrintBuffered(json, 1, formatted);
@@ -66,7 +61,6 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
         free(copied);
     }
-#endif
 
     cJSON_Delete(json);
 
