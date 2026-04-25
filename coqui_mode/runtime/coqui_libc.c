@@ -577,6 +577,14 @@ int __coqui_vsnprintf(char *buf, unsigned long size, const char *fmt, __builtin_
 }
 int __coqui_puts(const char *s)               { (void)s; return 0; }
 int __coqui_putchar(int c)                    { return c; }
+/* sscanf stub. cJSON's print_number uses sscanf("%lg") to round-trip-check
+ * a printed double; returning 0 (no fields matched) makes the caller fall
+ * through to the safe high-precision (%1.17g) format. Functionally correct,
+ * just bypasses the precision optimization. */
+int __coqui_sscanf(const char *str, const char *fmt, ...)
+    { (void)str; (void)fmt; return 0; }
+int __coqui_vsscanf(const char *str, const char *fmt, __builtin_va_list ap)
+    { (void)str; (void)fmt; (void)ap; return 0; }
 
 /* sprintf / snprintf stubs retained as variadic so Sprintf.cpp can intercept
  * any direct calls before Libc.cpp runs. If Sprintf has already rewritten a
