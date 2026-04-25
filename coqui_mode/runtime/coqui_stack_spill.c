@@ -16,6 +16,7 @@
 extern char         *__coqui_slab_pool;
 extern unsigned long __coqui_slab_pool_size;
 extern unsigned int *__coqui_slab_next;
+extern unsigned int  __coqui_slab_ctrl_slabs;
 
 /* Page header layout (16 bytes at offset 0 of each carved 4 KB page):
  *   [0..7]   prev_page        (u64) — previous page in chain, or 0
@@ -59,8 +60,12 @@ static inline u64 page_get_prev(char *page) {
  * `prev_vbase` is the virtual base to record in the new page's header.
  * Returns NULL on pool exhaustion (caller must trap). */
 static char *carve_one_page(u32 prev_vbase) {
+  /* slab_idx counts within the data partition; absolute index skips
+   * past the [0..ctrl_slabs) per-thread control rows.  Matches the
+   * heap path's pattern at coqui_slab.c:242-244. */
   unsigned int slab_idx = stack_atom_add_global(__coqui_slab_next, 1u);
-  unsigned long byte_off = (unsigned long)slab_idx * SLAB_SIZE;
+  unsigned int abs_slab = slab_idx + __coqui_slab_ctrl_slabs;
+  unsigned long byte_off = (unsigned long)abs_slab * SLAB_SIZE;
   if (unlikely(byte_off + SLAB_SIZE > __coqui_slab_pool_size)) {
     return (char *)0;
   }
