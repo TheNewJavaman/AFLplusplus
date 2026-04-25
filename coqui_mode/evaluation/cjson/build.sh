@@ -79,6 +79,7 @@ CPU_OUT="${HARNESS_BASENAME}_cpu"
   -fsanitize=fuzzer \
   -I "$CJSON_CACHE" \
   -D CJSON_HIDE_SYMBOLS \
+  -D CJSON_NESTING_LIMIT=300 \
   "${CJSON_CACHE}/cJSON.c" \
   "${CJSON_CACHE}/cJSON_Utils.c" \
   "$HARNESS_SRC" \
@@ -95,6 +96,7 @@ flock /tmp/coqui-cc.lock "$COQUI_CC" \
   --slab-pool-size "$SLAB_POOL_SIZE" \
   -I "$CJSON_CACHE" \
   -D CJSON_HIDE_SYMBOLS \
+  -D CJSON_NESTING_LIMIT=300 \
   "${CJSON_CACHE}/cJSON.c" \
   "${CJSON_CACHE}/cJSON_Utils.c" \
   "$HARNESS_SRC" \
