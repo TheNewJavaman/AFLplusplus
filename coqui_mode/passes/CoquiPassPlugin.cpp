@@ -60,14 +60,13 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     /* === end task25 === */
     Changed |= coqui::runMemoryLayout(M);
     Changed |= coqui::runCoverage(M);
-    /* === task23: LineTrace block ===
-     * Runs after coverage so its trace IDs are assigned post-edge-instrumentation.
-     * Order matters: coverage adds new BBs/edges; LineTrace dedups per-BB and
-     * doesn't care about the AFL hash blocks (they have no debug info, so the
-     * DILocation walk skips them naturally). Gated by -coqui-line-trace; no-op
-     * + returns false when the flag is unset. */
+    /* LineTrace runs after coverage so its trace IDs are assigned
+     * post-edge-instrumentation. Order matters: coverage adds new BBs/edges;
+     * LineTrace dedups per-BB and doesn't care about the AFL hash blocks
+     * (they have no debug info, so the DILocation walk skips them naturally).
+     * Gated by -coqui-line-trace; no-op + returns false when the flag is
+     * unset. */
     Changed |= coqui::runLineTrace(M);
-    /* === end task23 block === */
     /* Pad user globals with red zones and register them in a descriptor
      * table BEFORE runAsan so the load/store instrumentation sees the
      * padded struct types and its slow path can detect OOB via the

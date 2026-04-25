@@ -227,8 +227,7 @@ typedef struct coqui_ctx {
   u64                k_cycles[5];      /* host-side accumulator, reset at print */
   u32                k_batch_count;    /* batches contributing to accumulator */
 
-  /* === task23: oracle-mode line-trace readback (gated by COQUI_ORACLE=1) ===
-   *
+  /* Oracle-mode line-trace readback (gated by COQUI_ORACLE=1).
    * When the env var COQUI_ORACLE is set at coqui_init time, the host
    * allocates a per-thread trace buffer + counter array and binds them to
    * the cubin's __coqui_trace_buffer / __coqui_trace_count globals via
