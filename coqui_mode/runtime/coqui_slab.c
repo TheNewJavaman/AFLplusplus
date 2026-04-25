@@ -95,7 +95,15 @@ void __coqui_slab_free(void *ptr);
 #define SLAB_N_BUCKETS        13
 #define SLAB_MIN_BUCKET_SIZE  16u
 #define SLAB_MULTI_SLAB_IDX   15
-#define SLAB_BLOCK_HDR_SIZE   4u
+/* 8 bytes (not 4) so multi-slab user pointers are 8-byte aligned. NVPTX
+ * sm_75+ traps st.b64 / ld.b64 at non-8-byte addresses with
+ * CUDA_ERROR_MISALIGNED_ADDRESS, and LLVM's vectorizer happily emits b64
+ * stores into char buffers. The packed marker (`SLAB_MULTI_SLAB_IDX |
+ * ((n_slabs * SLAB_SIZE) << 4)`) still fits in [0..3]; bytes [4..7] are
+ * padding. The free / realloc paths use `ptr - 8`, which now lands on
+ * the actual block start for both this multi-slab path and the
+ * heap-style sub-block path at line 390. */
+#define SLAB_BLOCK_HDR_SIZE   8u
 
 /* ===------------------------------------------------------------------===
  * Inline PTX helpers (static, slab-local).
