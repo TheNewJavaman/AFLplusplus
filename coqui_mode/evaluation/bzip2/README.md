@@ -59,6 +59,6 @@ with any parallel target builds.
   size is read from `AFL_COQUI_BATCH_SIZE` at fuzz time (default
   8192).
 - `fuzz.sh` sets `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1`,
-  `AFL_SKIP_CPUFREQ=1`, `AFL_SKIP_BIN_CHECK=1`, `AFL_NO_UI=1` per the
+  `AFL_SKIP_CPUFREQ=1`, `AFL_NO_UI=1` per the
   project convention; override by exporting them yourself. GPU device
   index is controlled by `AFL_COQUI_DEVICE` (default 0).
