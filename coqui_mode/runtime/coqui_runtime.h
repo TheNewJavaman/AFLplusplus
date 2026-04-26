@@ -271,6 +271,43 @@ double __coqui_strtod(const char *nptr, char **endptr);
 
 /* -- Slab pool runtime (coqui_slab.c) -- */
 
+/* Slab page size: every allocation unit from the pool is this many bytes. */
+#define SLAB_SIZE  4096u
+
+/* Per-thread slab control block at slab_pool[tid * 32]:
+ *   [0..7]   free_head        (u64) — heap free-list head (coqui_slab.c)
+ *   [8..15]  current_heap     (u64) — current heap range pointer
+ *   [16..19] heap_limit       (u32)
+ *   [20..23] heap_bump_top    (u32)
+ *   [24..31] stack_chain_head (u64) — current stack-spill page (coqui_stack_spill.c)
+ *
+ * Stack-spill page header (16 bytes, at offset 0 of each carved 4 KB page):
+ *   [0..7]   prev_page (u64)            — previous page in chain or 0
+ *   [8..11]  page_virtual_base (u32)    — sum of usable bytes in earlier pages
+ *   [12..15] page_bump_top (u32)        — bytes used in this page (>= 16)
+ * Usable space per page: SLAB_SIZE - 16 = 4080 bytes. */
+#define COQUI_SLAB_THREAD_CTRL_STRIDE   32u
+#define COQUI_SLAB_STACK_HEAD_OFFSET    24u
+#define COQUI_STACK_PAGE_HDR_SIZE       16u
+#define COQUI_STACK_PAGE_USABLE         (SLAB_SIZE - COQUI_STACK_PAGE_HDR_SIZE)
+
+/* Stack-spill runtime (coqui_stack_spill.c).
+ *
+ * Per-thread bump pointer through chained 4 KB slab pages. Used by the
+ * StackSpill compile pass to redirect oversize allocas into the slab pool.
+ * The marker returned by __coqui_stack_save is a u32 absolute virtual offset
+ * (sum of bytes used across all pages in the chain to date). _restore
+ * rewinds the bump pointer; pages with vbase above the saved marker
+ * are dropped from the chain head and reclaimed at thread exit by
+ * __coqui_slab_release_thread. They are not re-bumped on the next _alloc.
+ *
+ * On thread exit / __coqui_trap_with_reason, __coqui_slab_release_thread
+ * walks the stack chain (via slab_pool[tid*32+24]) and pushes pages onto
+ * the global Treiber free stack alongside the heap chain. */
+unsigned int __coqui_stack_save(void);
+void *        __coqui_stack_alloc(unsigned int size);
+void          __coqui_stack_restore(unsigned int saved);
+
 /* Parameter-free setup. Slab pool globals (__coqui_slab_pool etc.) are
  * bound by the host via cuModuleGetGlobal + cuMemcpyHtoD before launch;
  * this call just computes the per-launch ctrl_slabs derived from grid

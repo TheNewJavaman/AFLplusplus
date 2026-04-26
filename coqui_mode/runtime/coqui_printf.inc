@@ -65,6 +65,42 @@ static int __coqui_utoa(unsigned long val, char *buf, int base,
  * Double-to-string conversion
  * ===----------------------------------------------------------------=== */
 
+/* Bring `*valp` into [1.0, 10.0) by powers of 10, returning the matching
+ * exp10 such that the original value equals (new *valp) * 10^exp10.
+ *
+ * The naive single-step loop ("while (val >= 10) val /= 10; exp10++") runs
+ * up to ~324 iterations for adversarial doubles like 1e308 or 1e-323.
+ * NVPTX sm_75 emulates `div.rn.f64` in software (~70 ns/op), so a single
+ * cJSON_Print of a large-magnitude double burns ~22 µs in this loop, and
+ * cJSON_Print's precision-roundtrip check (post-PR-#23 sscanf no-op) calls
+ * sprintf twice per number. Adversarial JSON with hundreds of such doubles
+ * drags one thread's input past 900 ms wall, hitting AFL's 3 s adaptive
+ * batch timeout.
+ *
+ * Binary descent through `POW10` keeps total fp64 divides at ≤ 9 per call
+ * — O(1) instead of O(log10(val)). Caller pre-checks val > 0 + finite. */
+__attribute__((always_inline))
+static inline int __coqui_log10_normalize(double *valp) {
+  static const double POW10[9] = {
+    1e1, 1e2, 1e4, 1e8, 1e16, 1e32, 1e64, 1e128, 1e256
+  };
+  double val = *valp;
+  int exp10 = 0;
+  if (val >= 10.0) {
+    for (int i = 8; i >= 0; i--) {
+      double scaled = val / POW10[i];
+      if (scaled >= 1.0) { val = scaled; exp10 += (1 << i); }
+    }
+  } else if (val < 1.0) {
+    for (int i = 8; i >= 0; i--) {
+      double scaled = val * POW10[i];
+      if (scaled < 10.0) { val = scaled; exp10 -= (1 << i); }
+    }
+  }
+  *valp = val;
+  return exp10;
+}
+
 /* Simple double-to-string for %f format.
  * Precision is the number of digits after decimal point. */
 static int __coqui_dtoa_f(double val, char *buf, int precision) {
@@ -184,18 +220,8 @@ static int __coqui_dtoa_e(double val, char *buf, int precision,
   if (precision < 0)
     precision = 6;
 
-  /* Find exponent */
-  int exp10 = 0;
-  if (val != 0.0) {
-    while (val >= 10.0) {
-      val /= 10.0;
-      exp10++;
-    }
-    while (val < 1.0) {
-      val *= 10.0;
-      exp10--;
-    }
-  }
+  /* Find exponent — binary descent O(1) (see __coqui_log10_normalize). */
+  int exp10 = (val != 0.0) ? __coqui_log10_normalize(&val) : 0;
 
   /* Now val is in [1.0, 10.0) (or 0.0) */
   if (neg)
@@ -274,19 +300,11 @@ static int __coqui_dtoa_g(double val, char *buf, int precision,
     return i;
   }
 
-  /* Find the exponent to decide format */
-  int exp10 = 0;
+  /* Find the exponent to decide format — O(1) via binary descent. tmp is
+   * a scratch copy because we only need exp10; the signed value is
+   * forwarded unchanged to dtoa_e/f below. */
   double tmp = absval;
-  if (tmp != 0.0) {
-    while (tmp >= 10.0) {
-      tmp /= 10.0;
-      exp10++;
-    }
-    while (tmp < 1.0) {
-      tmp *= 10.0;
-      exp10--;
-    }
-  }
+  int exp10 = (tmp != 0.0) ? __coqui_log10_normalize(&tmp) : 0;
 
   /* Reconstruct the signed value for delegation to %e/%f formatters
    * (which handle their own sign output). */

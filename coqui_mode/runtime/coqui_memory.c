@@ -38,6 +38,16 @@ static heap_hdr_t *heap_hdr(void) {
     return (heap_hdr_t *)__coqui_heap_base();
 }
 
+/* Slab pool globals -- defined in coqui_slab.c when linked; weak decls
+ * here so __coqui_memory_init can zero the per-thread stack-chain head
+ * and __coqui_free_raw can route slab-pool pointers to the slab free
+ * path without hard-depending on the slab runtime being linked. When
+ * the slab runtime is absent, __coqui_slab_pool stays NULL and both
+ * paths short-circuit. */
+extern char *__coqui_slab_pool __attribute__((weak));
+extern unsigned long __coqui_slab_pool_size __attribute__((weak));
+__attribute__((weak)) void __coqui_slab_free(void *ptr);
+
 /* Initialize the heap control header (called once per thread at kernel entry).
    MemoryLayout transform inserts a call to this. `nothrow`. */
 __attribute__((nothrow))
@@ -45,6 +55,17 @@ void __coqui_memory_init(void) {
     heap_hdr_t *hdr = heap_hdr();
     hdr->free_head = (void *)0;
     hdr->bump_top  = HEAP_HDR_SIZE;
+
+    /* Zero the stack-spill chain head (slab_pool[tid*32+24]). Loaded lazily
+     * by __coqui_stack_alloc on the first call from this thread; if no spill
+     * happens, the slot stays 0 and the cleanup walk is a no-op. */
+    if (__coqui_slab_pool != (char *)0) {
+        u32 tid = __coqui_fuzz_tid();
+        unsigned long *stack_head = (unsigned long *)(__coqui_slab_pool
+                                  + (unsigned long)tid * COQUI_SLAB_THREAD_CTRL_STRIDE
+                                  + COQUI_SLAB_STACK_HEAD_OFFSET);
+        *stack_head = 0;
+    }
 }
 
 /* The actual allocator lives in __coqui_malloc_raw / __coqui_free_raw so that
@@ -94,15 +115,6 @@ void *__coqui_malloc_raw(unsigned long size) {
     hdr->bump_top += need;
     return block + BLOCK_HDR_SIZE;
 }
-
-/* Slab pool globals -- defined in coqui_slab.c when linked; weak decls
- * here so the raw heap free can route slab-pool pointers to the slab
- * free path without hard-depending on the slab runtime being linked.
- * When the slab runtime is absent, __coqui_slab_pool stays NULL and the
- * range check falls through to the normal heap path. */
-extern char *__coqui_slab_pool __attribute__((weak));
-extern unsigned long __coqui_slab_pool_size __attribute__((weak));
-__attribute__((weak)) void __coqui_slab_free(void *ptr);
 
 __attribute__((nothrow))
 void __coqui_free_raw(void *ptr) {

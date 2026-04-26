@@ -141,18 +141,86 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->k_batch_count = 0;
 
   /* 4. Probe the device for its maximum allowed per-thread stack size.
-   *    CUDA's cuCtxSetLimit accepts only values that fit within the device's
+   *    CUDA's cuCtxSetLimit accepts values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must
-   *    fit in device memory). There's no direct query API; binary-search
-   *    downward from the sm_75+ hardware ceiling (512 KB) to find the
-   *    largest accepted value. */
-  unsigned int total_budget = 524288;   /* sm_75+ hardware ceiling */
+   *    fit in device memory). There's no direct query API.
+   *
+   *    The driver immediately backs the requested per-thread limit with
+   *    physical pages: cuCtxSetLimit(S) reserves S × n_threads bytes of
+   *    device memory where n_threads = SMs × max_threads_per_SM.  On a
+   *    24 GB RTX Titan (72 SMs × 1024 thr/SM = 73728 threads) even 256 KB
+   *    consumes 18 GB, leaving little room for a 2 GB slab pool.
+   *
+   *    To compute a safe ceiling, query free device memory before any
+   *    allocations, subtract the expected non-stack footprint (slab pool +
+   *    slab shadow + input buffers + 2 GB headroom), and divide by the
+   *    thread count.  The probe stays within this ceiling so the stack
+   *    reservation leaves enough room for all subsequent allocations.
+   *
+   *    Phase 1: halve from the safe ceiling until the driver accepts. This
+   *    bounds the answer to [last_failed/2, last_failed].
+   *    Phase 2: linear-step upward from the accepted value in 8 KB
+   *    increments while the driver still accepts, to recover the last
+   *    bit of budget the halving missed. */
+
+  /* Compute memory-safe ceiling for the probe.  Query free memory and
+   * subtract expected non-stack footprint so the stack reservation never
+   * crowds out slab pool + input buffers.  Floor at 32 KB; if the device
+   * is extremely memory-constrained the subsequent probe loop will FATAL. */
+  unsigned int probe_ceiling = 65536;  /* fallback; overwritten below */
+  {
+    size_t free_bytes = 0, total_bytes = 0;
+    CUCHECK(cuMemGetInfo(&free_bytes, &total_bytes));
+
+    int n_sms = 0, max_thr_per_sm = 0;
+    CUCHECK(cuDeviceGetAttribute(&n_sms,
+        CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
+    CUCHECK(cuDeviceGetAttribute(&max_thr_per_sm,
+        CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev));
+    unsigned long long n_threads =
+        (unsigned long long)n_sms * (unsigned long long)max_thr_per_sm;
+
+    /* Reserve: slab pool + shadow (1.125× slab_size), two input buffers
+     * (MAX_ALLOC cap = 1 GB each), statics (negligible), plus 2 GB headroom.
+     * Use AFL_COQUI_SLAB_SIZE if set, otherwise assume no slab. */
+    unsigned long long slab_size_probe =
+        (unsigned long long)getenv_u64("AFL_COQUI_SLAB_SIZE", 0);
+    unsigned long long non_stack_bytes =
+        slab_size_probe + slab_size_probe / 8 +  /* slab + shadow */
+        2ULL * 0x40000000ULL +                   /* two input ping-pong buffers */
+        2ULL * 1024ULL * 1024ULL * 1024ULL;      /* 2 GB headroom */
+    unsigned long long stack_bytes_avail =
+        free_bytes > non_stack_bytes ? (free_bytes - non_stack_bytes) : 0;
+    unsigned long long per_thread_ceiling_bytes =
+        n_threads > 0 ? (stack_bytes_avail / n_threads) : 65536ULL;
+    /* Round down to 8 KB alignment; floor at 32 KB. */
+    if (per_thread_ceiling_bytes < 32768) per_thread_ceiling_bytes = 32768;
+    per_thread_ceiling_bytes = (per_thread_ceiling_bytes / 8192) * 8192;
+    /* Hard cap: never exceed 512 KB (sm_75+ hardware ceiling). */
+    if (per_thread_ceiling_bytes > 524288) per_thread_ceiling_bytes = 524288;
+
+    probe_ceiling = (unsigned int)per_thread_ceiling_bytes;
+  }
+
+  unsigned int total_budget = probe_ceiling;
+  unsigned int last_failed = total_budget * 2;
   while (total_budget >= 32768) {
     if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget) == CUDA_SUCCESS) break;
+    last_failed = total_budget;
     total_budget /= 2;
   }
   if (total_budget < 32768) {
     FATAL("device rejected all per-thread stack sizes >= 32 KB");
+  }
+  /* Phase 2: try +8 KB increments toward last_failed, capped at
+   * probe_ceiling so we never exceed the memory-safe bound computed
+   * above.  Without the cap, Phase 2 would step past probe_ceiling
+   * if Phase 1 accepted it without halving (last_failed = 2*ceiling). */
+  while (total_budget + 8192 < last_failed &&
+         total_budget + 8192 <= probe_ceiling) {
+    unsigned int trial = total_budget + 8192;
+    if (cuCtxSetLimit(CU_LIMIT_STACK_SIZE, trial) != CUDA_SUCCESS) break;
+    total_budget = trial;
   }
   size_t actual_set = 0;
   cuCtxGetLimit(&actual_set, CU_LIMIT_STACK_SIZE);
