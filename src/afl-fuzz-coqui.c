@@ -241,13 +241,35 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   unsigned int heap = (remaining * 8) / 9;
   ctx->real_stack_size = stack_size;
 
-  /* 5. Check static stack usage doesn't exceed budget */
+  /* 5. Check static stack usage doesn't exceed budget.
+   *
+   * CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES is the per-thread local memory for
+   * statically-allocated variables and register spills (the PTX ".local"
+   * address space, mapped via LDL/STL). On NVPTX this is backed by the
+   * same per-thread pool as the call stack — both are bounded by
+   * cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget).
+   *
+   * Require a CALL_HEADROOM_BYTES margin beyond the static frame so
+   * dynamic function calls (e.g. libpng → inflate_fast call chains of
+   * ~40–80 KB depth) do not overflow the budget.  Without this guard the
+   * kernel would crash at runtime with CUDA_ERROR_LAUNCH_FAILED rather
+   * than failing here with a clear diagnostic.
+   *
+   * 64 KB is a conservative lower bound for typical fuzz-target call
+   * chains; targets with unusually deep recursion (e.g. libpng's inflate
+   * path) may still overflow even with this margin.  The check is an
+   * early-warning heuristic, not a hard guarantee. */
+  #define CALL_HEADROOM_BYTES 65536u
   int static_usage;
   CUCHECK(cuFuncGetAttribute(&static_usage,
     CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel));
-  if ((unsigned int)static_usage > total_budget - 1024) {
-    FATAL("kernel static stack %d B exceeds budget %u B — bump --stack-size",
-          static_usage, total_budget);
+  OKF("coqui kernel static lmem: %d B (budget %u B, headroom %u B required)",
+      static_usage, total_budget, CALL_HEADROOM_BYTES);
+  if ((unsigned int)static_usage + CALL_HEADROOM_BYTES > total_budget) {
+    FATAL("kernel static lmem %d B + %u B call-chain headroom exceeds "
+          "budget %u B — target too large for this GPU's memory configuration; "
+          "consider reducing slab size (AFL_COQUI_SLAB_SIZE) to raise budget",
+          static_usage, CALL_HEADROOM_BYTES, total_budget);
   }
 
   /* 6. Batch sizing (with u64 overflow protection from coqui mode T3.6 fixup) */
