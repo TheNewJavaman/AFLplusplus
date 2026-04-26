@@ -718,14 +718,21 @@ void __coqui_asan_free(void *ptr) {
         u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
         if (user >= sp_lo && user < sp_hi) {
             unsigned long slab_off = (unsigned long)(raw - sp_lo);
-            /* Slab size header sits 8B before `raw` (i.e. 8B before the
-             * leading red zone -- it's the slab block size, not the user
-             * size). Clamp payload length to the remaining pool so a
-             * corrupted header can't walk off the end. */
+            /* Slab block header sits 8B before `raw` (= SLAB_BLOCK_HDR_SIZE
+             * before the leading red zone).  Decode the actual allocation
+             * byte count via slab_blk_actual_bytes(): for sub-block allocs
+             * this is block_size (= 8 + aligned_user); for multi-slab allocs
+             * the header encodes n_slabs*SLAB_SIZE in bits [4..31] with a
+             * 0xF low-nibble sentinel — treating it directly as block_size
+             * would over-poison by ~16× and corrupt neighbour allocations'
+             * shadow bytes.  Clamp to the remaining pool to guard against
+             * a corrupted header walking off the end. */
             u8 *slab_hdr = raw - 8;
             u32 blk = (slab_hdr >= sp_lo && slab_hdr < sp_hi)
                         ? *(u32 *)slab_hdr : 0u;
-            unsigned long payload = (blk > 8u) ? (blk - 8u) : 0u;
+            unsigned long actual = slab_blk_actual_bytes(blk);
+            unsigned long payload = (actual > SLAB_BLOCK_HDR_SIZE)
+                                      ? (actual - SLAB_BLOCK_HDR_SIZE) : 0u;
             if (unlikely(slab_off + payload > __coqui_slab_pool_size)) {
                 unsigned long safe = (__coqui_slab_pool_size > slab_off)
                                        ? (__coqui_slab_pool_size - slab_off) : 0;
@@ -842,15 +849,20 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
                  user >= sp_lo && user < sp_hi)) {
         /* Slab block layout handed out by __coqui_asan_slab_malloc /
          * __coqui_asan_malloc's tier-2 fall-through:
-         *   [slab hdr: u32 = 8 + total_aligned] [left_rz (16)] [user] [right_rz (16)]
-         * where total_aligned = aligned(size) + LEFT_RZ + RIGHT_RZ is the
-         * total payload the slab allocator tracks (excluding its 8B header).
-         * So user_size_aligned = (blk - 8) - LEFT_RZ - RIGHT_RZ. */
+         *   [slab hdr: u32] [left_rz (16)] [user] [right_rz (16)]
+         * For sub-block allocs: slab hdr = 8 + total_aligned (byte count).
+         * For multi-slab allocs: slab hdr encodes n_slabs*SLAB_SIZE in bits
+         * [4..31] with 0xF low-nibble sentinel — treating it directly as a
+         * byte count would make old_size ~16× too large and cause an OOB
+         * read from user memory during the memcpy below.
+         * slab_blk_actual_bytes() decodes both cases correctly. */
         u8 *slab_hdr = raw - 8;
         if (unlikely(slab_hdr < sp_lo || slab_hdr >= sp_hi)) return (void *)0;
         u32 blk = *(u32 *)slab_hdr;
-        if (unlikely(blk < 8u + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE)) return (void *)0;
-        old_size = (unsigned long)blk - 8u
+        unsigned long actual = slab_blk_actual_bytes(blk);
+        if (unlikely(actual < SLAB_BLOCK_HDR_SIZE + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE))
+            return (void *)0;
+        old_size = actual - SLAB_BLOCK_HDR_SIZE
                    - ASAN_LEFT_REDZONE - ASAN_RIGHT_REDZONE;
     } else {
         /* Per-thread heap: mirror __coqui_asan_free's header read (line 709). */

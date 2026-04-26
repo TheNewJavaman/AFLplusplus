@@ -216,13 +216,19 @@ void *__coqui_realloc(void *ptr, unsigned long size) {
         u8 *sp_lo = (u8 *)__coqui_slab_pool;
         u8 *sp_hi = sp_lo + __coqui_slab_pool_size;
         if ((u8 *)ptr >= sp_lo && (u8 *)ptr < sp_hi) {
-            /* Slab blocks store [size:u32][next:u64] with user data at
-             * block+8 (see coqui_slab.c). We read the stored block size
-             * and subtract the 8B header to get the user-visible size. */
+            /* Slab blocks store [hdr:u32][pad:u32][user data...] with user
+             * data at ptr (= block+8, see coqui_slab.c).  For sub-block
+             * allocs hdr is block_size (= 8 + aligned_user_bytes).  For
+             * multi-slab allocs hdr encodes n_slabs*SLAB_SIZE in bits
+             * [4..31] with a 0xF low-nibble sentinel; treating it directly
+             * as a byte count would make old_size ~16× too large and cause
+             * an OOB read during memcpy_u8.  slab_blk_actual_bytes() decodes
+             * both cases, returning the total bytes owned from block start. */
             u8 *sb = (u8 *)ptr - 8;
             u32 old_block = *(u32 *)sb;
-            u32 old_size = (old_block > 8u) ? (old_block - 8u) : 0u;
-            unsigned long copy = (old_size < size) ? old_size : (u32)size;
+            unsigned long actual = slab_blk_actual_bytes(old_block);
+            unsigned long old_size = (actual > 8u) ? (actual - 8u) : 0u;
+            unsigned long copy = (old_size < size) ? old_size : (unsigned long)size;
             void *new_ptr = __coqui_malloc(size);
             if (unlikely(!new_ptr)) return (void *)0;
             memcpy_u8(new_ptr, ptr, copy);
