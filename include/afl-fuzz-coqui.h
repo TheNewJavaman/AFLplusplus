@@ -129,7 +129,21 @@ typedef struct coqui_ctx {
   u8  *crash_sig_seen_used;       /* 1 = slot occupied, 0 = empty */
   u32  crash_sig_seen_cap;        /* capacity (power of 2) */
   u32  crash_sig_seen_count;      /* slots in use (observability) */
-  u64  crash_sig_persistent_hits; /* cross-batch dedup hits (telemetry) */
+  u64  crash_sig_persistent_hits; /* cross-batch dedup hits (telemetry, lifetime) */
+
+  /* Per-[coqui-rate]-window dedup counters (reset at each print, like
+   * t_submit_us).  Using window deltas rather than lifetime totals ensures
+   * the "avg/batch" figures printed in [coqui-rate] reflect only the current
+   * window, not the cumulative run.  This matters most after a force-reset:
+   * coqui_init zeroes launch_count but force_reset restores the large
+   * crash_sig_persistent_hits value, making (lifetime / new_launch_count)
+   * report astronomically wrong per-batch averages until launch_count grows
+   * large enough to dilute the ratio.  Window counters reset naturally after
+   * each force-reset because coqui_init zero-initialises them, so they are
+   * intentionally NOT preserved in coqui_force_reset's save/restore block. */
+  u64  crash_dedup_hits_window;       /* intra-batch dedup hits this window */
+  u64  crash_verify_calls_window;     /* CPU verify calls this window */
+  u64  crash_sig_persist_hits_window; /* cross-batch dedup hits this window */
 
   /* Host-side per-phase timing accumulators (reset at each [coqui-rate]
    * print).  Each batch contributes one sample; dividing by dl
