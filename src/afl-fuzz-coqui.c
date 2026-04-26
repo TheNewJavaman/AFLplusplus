@@ -671,7 +671,24 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
    * (checked by cubin-compile-time symbol presence -> ctx->d_slab_*
    * being non-zero). */
   if (ctx->d_slab_next) {
-    CUCHECK(cuMemsetD32Async((CUdeviceptr)ctx->d_slab_next, 0, 1, s));
+    /* Initialize slab_next past the per-block tier-1 partition so that
+     * tier-2 global-bump allocations don't alias tier-1 block-local slabs.
+     *
+     * Tier-1 layout (coqui_slab.c:slab_alloc_slabs):
+     *     abs_slab = ctrl_slabs + bid * block_budget + local_idx
+     * occupies slab indices [ctrl_slabs, ctrl_slabs + grid * block_budget).
+     * Tier-2:
+     *     abs_slab = slab_idx + ctrl_slabs   (slab_idx from atom on slab_next)
+     * If slab_next starts at 0, tier-2's first allocation lands at
+     * ctrl_slabs + 0 — overlapping the first block's tier-1 partition,
+     * silently aliasing addresses.
+     *
+     * Legacy coqui (coqui/driver/coqui_fuzz_driver.c:2507) initializes
+     * slab_next to grid * block_budget so tier-2 starts where tier-1
+     * ends. Match that. */
+    unsigned int slab_next_init =
+        (ctx->batch_size / 128u) * ctx->slab_block_budget;
+    CUCHECK(cuMemsetD32Async((CUdeviceptr)ctx->d_slab_next, slab_next_init, 1, s));
     /* Zero ctrl-header area. bs*32 + 8 per the reclamation design spec. */
     unsigned long long ctrl_bytes =
         (unsigned long long)ctx->batch_size * 32ULL + 8ULL;
