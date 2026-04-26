@@ -40,8 +40,18 @@ static bool isPrintfFamily(StringRef Name) {
          Name == "__coqui_snprintf" || Name == "__coqui_sscanf";
 }
 
+/* open() and open64() are variadic (optional third `mode` arg) but are
+ * rewritten by the Libc pass (which runs after Variadic) to __coqui_open.
+ * Skip them here so the Libc pass can replace the call sites directly
+ * without leaving an unresolved open64__va_packed declaration that the
+ * ExternalSymbolGatekeeper would reject. */
+static bool isLibcHandled(StringRef Name) {
+  return Name == "open" || Name == "open64";
+}
+
 static bool shouldSkip(StringRef Name) {
-  return isPrintfFamily(Name) || Name.starts_with("__coqui_") ||
+  return isPrintfFamily(Name) || isLibcHandled(Name) ||
+         Name.starts_with("__coqui_") ||
          Name.starts_with("__ubsan_") || Name.starts_with("__sanitizer_") ||
          Name.starts_with("__asan_") || Name.starts_with("llvm.");
 }
