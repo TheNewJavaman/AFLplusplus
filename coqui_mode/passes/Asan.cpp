@@ -137,13 +137,18 @@ static llvm::MDNode *createBranchWeightMD(llvm::LLVMContext &Ctx,
 ///     __coqui_asan_slowpath_{load|store}_N(addr);
 ///   }
 ///
-/// AlwaysInline + NoUnwind — the helper body is the literal fast path; we
-/// want it folded into every call site so the common-case shadow-byte
-/// check is straight-line PTX (no `call`/`ret` overhead). Branch-weight
-/// metadata on the conditional branches keeps the cold slow-path call
-/// out of the icache hot stream. The helper itself must NOT be
-/// instrumented (`__coqui_` prefix skip in the main instrumentation loop
-/// covers that); body never throws.
+/// NoInline + NoUnwind — keep the helper body OUT of every access site.
+/// Inlining the fast path at thousands of load/store sites recreates the
+/// 3× basic-block bloat (entry / shadow / ok / slow) per access, which
+/// drives ptxas-O1 into hours-long compiles + tens of GB RSS on larger
+/// targets (cmark, libpng, libxml2 — see coqui_mode/docs/coqui_delta.md
+/// §1). With NoInline, every access site becomes a single `call` to a
+/// size-specialized helper, and the helper body is compiled once. Total
+/// .text shrinks dramatically; ptxas-O1 finishes in minutes. Branch-
+/// weight metadata on the helper's internal conditional branches still
+/// keeps the cold slow-path call out of the helper's own icache hot
+/// stream. The helper itself must NOT be instrumented (`__coqui_` prefix
+/// skip in the main instrumentation loop covers that); body never throws.
 static llvm::Function *createSizedFastHelper(llvm::Module &M,
                                              llvm::StringRef HelperName,
                                              uint64_t AccessSize,
@@ -189,13 +194,16 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Function *F = Function::Create(HelperTy, GlobalValue::InternalLinkage,
                                  HelperName, M);
   F->setCallingConv(CallingConv::C);
-  // AlwaysInline: fold the fast path (range + shadow byte) into each call
-  // site so the hot path is straight-line PTX (entry / shadow / ok BBs
-  // collapse into the caller). NoUnwind: nothing in the body can throw
-  // — keeps the call site free of EH metadata and lets the inliner avoid
-  // synthesizing a landing pad. The slab-check + slowpath branches still
-  // carry branch-weight metadata so llc lays them out cold.
-  F->addFnAttr(Attribute::AlwaysInline);
+  // NoInline: each access site emits a single `call` to this helper; the
+  // helper body lives once in the kernel module instead of being re-
+  // expanded at every load/store. This is the whole point of outlining
+  // the fast path — see the function-level doc comment for why
+  // AlwaysInline here defeats the design and burns ptxas-O1 on large
+  // targets. NoUnwind: nothing in the body can throw, so the call site
+  // stays free of EH metadata. The slab-check + slowpath branches
+  // internal to the helper still carry branch-weight metadata so llc
+  // lays them out cold.
+  F->addFnAttr(Attribute::NoInline);
   F->addFnAttr(Attribute::NoUnwind);
   F->getArg(0)->setName("addr");
   F->getArg(1)->setName("heap.base");
