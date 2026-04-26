@@ -241,13 +241,35 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   unsigned int heap = (remaining * 8) / 9;
   ctx->real_stack_size = stack_size;
 
-  /* 5. Check static stack usage doesn't exceed budget */
+  /* 5. Diagnostic: report static stack usage vs budget.
+   *
+   * CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES is the per-thread local memory for
+   * statically-allocated variables and register spills (the PTX ".local"
+   * address space, mapped via LDL/STL). On NVPTX this is backed by the
+   * same per-thread pool as the call stack — both are bounded by
+   * cuCtxSetLimit(CU_LIMIT_STACK_SIZE, total_budget).
+   *
+   * Empirically, static lmem alone is not a reliable predictor of runtime
+   * launch failure: libyaml runs cleanly with only ~41 KB headroom while
+   * cmark/libjpeg-turbo fail at runtime for unrelated reasons even with
+   * comparable margins.  We keep the diagnostic so operators see lmem and
+   * call-chain headroom before launch, but we no longer block startup —
+   * the warning suggests recovery actions if the first batch does fail. */
+  #define CALL_HEADROOM_BYTES 65536u
   int static_usage;
   CUCHECK(cuFuncGetAttribute(&static_usage,
     CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel));
-  if ((unsigned int)static_usage > total_budget - 1024) {
-    FATAL("kernel static stack %d B exceeds budget %u B — bump --stack-size",
-          static_usage, total_budget);
+  OKF("coqui kernel static lmem: %d B (budget %u B, headroom %u B required)",
+      static_usage, total_budget, CALL_HEADROOM_BYTES);
+  if ((unsigned int)static_usage + CALL_HEADROOM_BYTES > total_budget) {
+    long long deficit = (long long)static_usage + (long long)CALL_HEADROOM_BYTES
+                        - (long long)total_budget;
+    WARNF("kernel static lmem %d B + %u B call-chain headroom is close to "
+          "per-thread budget %u B (deficit %lld B); first kernel launch may "
+          "fail with CUDA_ERROR_LAUNCH_FAILED — if so, reduce "
+          "AFL_COQUI_SLAB_SIZE or shrink kernel via per-target NoInline; "
+          "continuing",
+          static_usage, CALL_HEADROOM_BYTES, total_budget, deficit);
   }
 
   /* 6. Batch sizing (with u64 overflow protection from coqui mode T3.6 fixup) */
