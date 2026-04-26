@@ -465,6 +465,9 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->crash_sig_seen_cap   = 1u << 20;   /* 1,048,576 */
   ctx->crash_sig_seen_count = 0;
   ctx->crash_sig_persistent_hits = 0;
+  ctx->crash_dedup_hits_window       = 0;
+  ctx->crash_verify_calls_window     = 0;
+  ctx->crash_sig_persist_hits_window = 0;
   ctx->crash_sig_seen       = ck_alloc(ctx->crash_sig_seen_cap * sizeof(u32));
   ctx->crash_sig_seen_used  = ck_alloc(ctx->crash_sig_seen_cap);
   ctx->rate_log_init    = 0;
@@ -789,10 +792,10 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
     if (elapsed_us >= 1000000ULL || dl >= 4) {
       if (elapsed_us > 0) {
         double avg_dedup_per_batch = dl > 0
-            ? (double)ctx->crash_dedup_hits / (double)ctx->launch_count
+            ? (double)ctx->crash_dedup_hits_window / (double)dl
             : 0.0;
         double avg_verify_per_batch = dl > 0
-            ? (double)ctx->crash_verify_calls / (double)ctx->launch_count
+            ? (double)ctx->crash_verify_calls_window / (double)dl
             : 0.0;
         /* Per-batch phase averages over this window. submit is driver-API
          * time (all async), await is the GPU wait in the poll loop, verify
@@ -840,9 +843,8 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
           }
         }
 
-        double avg_persist_per_batch = ctx->launch_count > 0
-            ? (double)ctx->crash_sig_persistent_hits
-                / (double)ctx->launch_count : 0.0;
+        double avg_persist_per_batch = dl > 0
+            ? (double)ctx->crash_sig_persist_hits_window / (double)dl : 0.0;
         fprintf(stderr,
                 "[coqui-rate] %.1f batches/s, %llu submits/s "
                 "(avg %.0f inputs/batch, %llu slow-skipped, "
@@ -886,6 +888,13 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
       ctx->t_dtoh_us = 0;
       ctx->t_await_us  = 0;
       ctx->t_verify_us = 0;
+      /* Reset per-window dedup counters (parallel to the timing accumulators
+       * above).  These are NOT preserved across force-reset (intentional:
+       * coqui_init zeros them fresh so the first post-reset window only shows
+       * what happened AFTER the reset, not the lifetime accumulation). */
+      ctx->crash_dedup_hits_window       = 0;
+      ctx->crash_verify_calls_window     = 0;
+      ctx->crash_sig_persist_hits_window = 0;
     }
   }
 }
@@ -1170,6 +1179,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
 
     if (seen) {
       ctx->crash_dedup_hits++;
+      ctx->crash_dedup_hits_window++;
       continue;
     }
 
@@ -1199,10 +1209,12 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
 
     if (p_seen) {
       ctx->crash_sig_persistent_hits++;
+      ctx->crash_sig_persist_hits_window++;
       continue;
     }
 
     ctx->crash_verify_calls++;
+    ctx->crash_verify_calls_window++;
     u8 *input = b->h_input_bytes + b->h_offsets[i];
     u32 len = b->h_input_lens[i];
     process_input_via_cpu_fsrv(afl, input, len);
