@@ -227,28 +227,6 @@ static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
     return ((u64)hi << 32) | lo;
 }
 
-/* Block-local pre-aggregation buffer. 8 warps × (warp_mine, was) = 16 u64 slots.
- * Layout per word `i`:
- *   slot 0..7 : warp's contributing OR (warp_mine), one slot per warpid
- *   slot 8    : block-aggregated `was` (pre-OR virgin), broadcast back to warps
- *
- * Using clang's address_space(3) attribute to land in PTX .shared. The slots
- * are reused per-iteration; bar.sync 0 boundaries delimit lifetimes.
- *
- * Sized for 8 warps/block (the launcher uses 256 threads/block). If the
- * launcher block size changes, this must grow.
- */
-#define COQUI_VIRGIN_BLOCK_WARPS 8u
-__attribute__((address_space(3)))
-static u64 __coqui_virgin_block_slots[COQUI_VIRGIN_BLOCK_WARPS + 1];
-
-/* PTX block barrier (== __syncthreads()). Inline asm avoids the function-call
- * overhead that `__nvvm_bar0` would emit (LLVM's bar0 builtin lowers to a
- * `call __nvvm_bar0` rather than the bar.sync instruction directly). */
-static inline void __coqui_block_sync(void) {
-    asm volatile("bar.sync 0;" ::: "memory");
-}
-
 __attribute__((nothrow))
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
@@ -259,71 +237,41 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
 
     if (likely(mask == 0xFFFFFFFFu)) {
         u32 laneid;
-        u32 warpid;
         asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
-        asm volatile("mov.u32 %0, %%warpid;" : "=r"(warpid));
 
         for (u32 i = 0; i < n; i++) {
             u64 mine = m64[i];
             u64 warp_mine = __coqui_warp_or_u64(mask, mine);
+            /* cov_map is sparse — most words are zero across the warp. */
+            if (likely(warp_mine == 0)) continue;
 
-            /* Each warp's lane 0 publishes its warp_mine into the block-local
-             * shared slot. Doing this unconditionally (even for zero warps)
-             * keeps the per-iteration shared-memory pattern uniform and lets
-             * warp 0 compute the block-OR without a second sync. */
+            /* Non-atomic pre-read of virgin[i]. All lanes map to the same
+             * address so L1 serves them from one cacheline. Virgin is
+             * monotonic (bits only go 0->1), so skipping the atomic when
+             * `warp_mine & ~v == 0` is safe: any bit that flips between
+             * this read and when we would have done the atomic was claimed
+             * by another warp first, which is the correct outcome.
+             *
+             * In steady-state fuzzing most edges have already been seen,
+             * so the skip-the-atomic path is the hot one. */
+            u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
+            if (likely((warp_mine & ~v_pre) == 0)) continue;
+
+            /* Lane 0 does the atomic; broadcast `was` (pre-OR virgin) so
+             * every lane can compute its own novelty contribution
+             * mine & ~was. Over-reports novelty within a warp when >1
+             * lane independently set the same bit — benign, CPU verify
+             * rejects false positives. */
+            u64 was0 = 0;
             if (laneid == 0) {
-                __coqui_virgin_block_slots[warpid] = warp_mine;
+                was0 = atomic_fetch_or_explicit(&v64[i], warp_mine,
+                                                memory_order_relaxed);
             }
-            __coqui_block_sync();
-
-            /* cov_map is sparse — most words are zero across the entire block.
-             * Warp 0 lane 0 reads the published per-warp slots, ORs them, and
-             * decides whether to fire the global atomic. Other warps wait on
-             * the second barrier below. */
-            u64 was = 0;
-            if (warpid == 0 && laneid == 0) {
-                u64 block_mine = 0;
-                #pragma unroll
-                for (u32 w = 0; w < COQUI_VIRGIN_BLOCK_WARPS; w++) {
-                    block_mine |= __coqui_virgin_block_slots[w];
-                }
-                if (block_mine != 0) {
-                    /* Non-atomic pre-read; same skip-on-no-novelty trick as
-                     * the original per-warp path. Virgin is monotonic so a
-                     * stale read only over-reports novelty (benign — CPU
-                     * verify rejects false positives). */
-                    u64 v_pre = atomic_load_explicit(&v64[i],
-                                                     memory_order_relaxed);
-                    if ((block_mine & ~v_pre) != 0) {
-                        was = atomic_fetch_or_explicit(&v64[i], block_mine,
-                                                       memory_order_relaxed);
-                    } else {
-                        /* No novel bits across the whole block; skip the
-                         * atomic. Mark `was` so peer warps see "no novelty"
-                         * via the broadcast slot below. */
-                        was = block_mine;  /* mine & ~was == 0 always */
-                    }
-                }
-                /* Publish `was` for peer warps (slot 8). When block_mine == 0,
-                 * `was` is 0 — and `mine` is also 0 for every lane in this
-                 * block, so the per-lane novelty test (mine & ~was) trivially
-                 * yields 0. Correct. */
-                __coqui_virgin_block_slots[COQUI_VIRGIN_BLOCK_WARPS] = was;
-            }
-            __coqui_block_sync();
-
-            /* Each lane reads the broadcast `was` and computes its own
-             * novelty contribution. Over-reports within a block when >1
-             * lane independently set the same bit — benign, same as the
-             * original per-warp behavior. */
-            was = __coqui_virgin_block_slots[COQUI_VIRGIN_BLOCK_WARPS];
+            u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
             if (unlikely(mine & ~was)) { novel = 1; }
         }
     } else {
-        /* Partial warp: original per-thread atomic. No bar.sync — partial-warp
-         * threads may not have peers on the same iteration, and using a
-         * block barrier here would require all 256 threads to participate.
-         * Falling back to per-thread atomics is correct and the rare path. */
+        /* Partial warp: original per-thread atomic. */
         for (u32 i = 0; i < n; i++) {
             u64 mine = m64[i];
             if (likely(mine == 0)) continue;
