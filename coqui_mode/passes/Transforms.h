@@ -68,6 +68,15 @@ bool runAsanGlobals(llvm::Module &M);
 bool runAsan(llvm::Module &M);
 bool runExternalSymbolGatekeeper(llvm::Module &M);
 
+/* AddressSpace: promote module-level non-llvm.*, non-__coqui_*, non-thread-
+ * local globals from default address space (AS=0) to NVPTX `.global` (AS=1).
+ * Lets ptxas emit ld.global / st.global directly instead of going through
+ * generic-address-space resolution — meaningful on read-heavy code paths
+ * (Huffman tables, DCT lookup, color-space matrices). Runs as the very
+ * last pass in the pipeline so every prior pass that creates new globals
+ * has already run by the time we sweep. */
+bool runAddressSpace(llvm::Module &M);
+
 /* Line-trace pass (oracle mode). Gated by the `-coqui-line-trace` opt flag.
  * Returns false (no-op) when the flag is unset, so production runs pay
  * nothing. See LineTrace.cpp for the (file, line) ID assignment scheme +
