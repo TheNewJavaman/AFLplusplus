@@ -82,12 +82,19 @@ using namespace llvm;
 /// (e.g., literal `{ double, double }` vs named `%struct.__coqui_cdouble`).
 /// These are still direct calls to known functions — not indirect calls
 /// through runtime pointers — so we must not devirtualize them.
+///
+/// Skip invoke (and any other Terminator-flavored CallBase): the rewrite
+/// uses splitBasicBlock at the call instruction, which asserts the split
+/// point is not a terminator. NVPTX targets have no working unwinder,
+/// so invokes are rare in practice and earlier passes (Cpp.cpp) collapse
+/// the C++ invoke -> br pattern; leave any survivors for a future port.
 static void collectIndirectCallSites(Module &M,
                                      SmallVectorImpl<CallBase *> &Out) {
   for (Function &F : M)
     for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I)
       if (auto *CB = dyn_cast<CallBase>(&*I))
-        if (!CB->getCalledFunction() && !CB->isInlineAsm() &&
+        if (isa<CallInst>(CB) &&
+            !CB->getCalledFunction() && !CB->isInlineAsm() &&
             !dyn_cast<Function>(CB->getCalledOperand()))
           Out.push_back(CB);
 }
