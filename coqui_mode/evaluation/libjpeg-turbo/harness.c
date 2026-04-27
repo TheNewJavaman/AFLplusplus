@@ -43,6 +43,27 @@ static void coqui_error_exit(j_common_ptr cinfo) {
 // libjpeg-turbo internal structures, fitting comfortably.
 #define COQUI_MAX_DIM 64
 
+// Bounded skip_input_data override: libjpeg-turbo's stock skip_input_data
+// (jdatasrc.c:159) loops calling fill_input_buffer when num_bytes exceeds
+// bytes_in_buffer. For mem source under malformed input (corrupt APPn or
+// DRI marker length up to 64K), each iteration is an indirect call through
+// cinfo->src->fill_input_buffer — ~32K calls per pathological JPEG. Across
+// 8192 GPU threads with thread divergence on the indirect-call dispatch,
+// this drives multi-second batch wall time and triggers coqui's force-reset.
+// This override clamps to bytes_in_buffer in one step and zeroes the
+// remainder; the next read returns the static EOI marker, parser rejects.
+static void coqui_safe_skip_input_data(j_decompress_ptr cinfo, long num_bytes) {
+    struct jpeg_source_mgr *src = cinfo->src;
+    if (num_bytes <= 0) return;
+    if ((size_t)num_bytes <= src->bytes_in_buffer) {
+        src->next_input_byte += (size_t)num_bytes;
+        src->bytes_in_buffer -= (size_t)num_bytes;
+    } else {
+        src->next_input_byte += src->bytes_in_buffer;
+        src->bytes_in_buffer = 0;
+    }
+}
+
 int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
     if (size < 2) return 0;
 
@@ -68,6 +89,7 @@ int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
 #endif
 
     jpeg_mem_src(&cinfo, data, size);
+    cinfo.src->skip_input_data = coqui_safe_skip_input_data;
 
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(&cinfo);
