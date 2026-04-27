@@ -1,46 +1,30 @@
 /*
  * coqui_memory.c --- per-thread heap allocator for coqui mode coqui_mode.
  *
- * Freelist-first, bump-fallback allocator with O(1) backward + O(N)
- * forward coalescing on free. Per-thread heap region (set up by
- * MemoryLayout transform; accessed via __coqui_heap_base).
+ * Freelist-first, bump-fallback allocator over the per-thread heap
+ * region (set up by MemoryLayout transform; accessed via __coqui_heap_base).
  *
  * Block layout:
- *   [size_flags: u32][prev_size: u32][user data...]
- *   - size_flags: total block size including 8-byte header. Always
- *     a multiple of 8 (alloc payload is align-up-to-8, header is 8),
- *     so bit 0 is repurposed as the in-use flag.
- *   - prev_size: size of the physically previous block in this heap
- *     (0 = first block, or block immediately after the heap header).
- *     Lets free coalesce backward in O(1).
- *
- * On free, both adjacent blocks are checked: if free, they're spliced
- * out of the freelist and merged into a single larger free block. The
- * combined block is reinserted size-sorted into the freelist.
+ *   [size: u32][pad: u32][user data...]
+ *   size includes the 8-byte header.
  *
  * Per-thread state (lives at start of heap region):
- *   free_head     (u64) — absolute pointer to first free block
- *   bump_top      (u32) — current bump position within heap region
- *   prev_bump_top (u32) — size of last bump-allocated block (for prev_size)
+ *   free_head (u64) — absolute pointer to first free block
+ *   bump_top  (u32) — current bump position within heap region
  */
 
 #include "coqui_runtime.h"
 
 /* Per-thread control header at the start of the heap region. */
 typedef struct heap_hdr {
-    void *free_head;       /* singly-linked list of free blocks, largest first */
-    u32   bump_top;        /* bump allocator position */
-    u32   prev_bump_size;  /* size of last bump-allocated block (for prev_size on next bump) */
+    void *free_head;   /* singly-linked list of free blocks, largest first */
+    u32   bump_top;    /* bump allocator position */
+    u32   _pad;
 } heap_hdr_t;
 
 #define HEAP_MIN_ALLOC 8u
 #define HEAP_HDR_SIZE  sizeof(heap_hdr_t)   /* 16 bytes */
-#define BLOCK_HDR_SIZE 8u                   /* [size_flags:u32][prev_size:u32] */
-#define BLOCK_IN_USE   1u                   /* bit 0 of size_flags */
-
-/* Block header overlay. We don't dereference this struct directly because
- * legacy callers wrote the size as a bare u32; instead we treat the block
- * pointer as u8* and access size_flags / prev_size via aligned u32 loads. */
+#define BLOCK_HDR_SIZE 8u                   /* [size:u32][pad:u32] */
 
 /* Align up to 8 bytes. `const, always_inline, nothrow` — pure arithmetic. */
 __attribute__((const, always_inline, nothrow))
@@ -53,13 +37,6 @@ __attribute__((pure, always_inline, nothrow))
 static heap_hdr_t *heap_hdr(void) {
     return (heap_hdr_t *)__coqui_heap_base();
 }
-
-/* Block-header field accessors. Bit 0 of size_flags holds in_use. */
-__attribute__((const, always_inline, nothrow))
-static u32 blk_size(u32 size_flags) { return size_flags & ~BLOCK_IN_USE; }
-
-__attribute__((const, always_inline, nothrow))
-static u32 blk_in_use(u32 size_flags) { return size_flags & BLOCK_IN_USE; }
 
 /* Slab pool globals -- defined in coqui_slab.c when linked; weak decls
  * here so __coqui_memory_init can zero the per-thread stack-chain head
@@ -78,7 +55,6 @@ void __coqui_memory_init(void) {
     heap_hdr_t *hdr = heap_hdr();
     hdr->free_head = (void *)0;
     hdr->bump_top  = HEAP_HDR_SIZE;
-    hdr->prev_bump_size = 0;
 
     /* Zero the stack-spill chain head (slab_pool[tid*32+24]). Loaded lazily
      * by __coqui_stack_alloc on the first call from this thread; if no spill
@@ -90,27 +66,6 @@ void __coqui_memory_init(void) {
                                   + COQUI_SLAB_STACK_HEAD_OFFSET);
         *stack_head = 0;
     }
-}
-
-/* Remove a specific block from the freelist by walking the chain.
- * Bounded by FL_REMOVE_MAX iterations to avoid pathological loops on
- * a corrupted list. Returns 1 if removed, 0 if not found / capped. */
-#define FL_REMOVE_MAX 32
-
-__attribute__((always_inline, nothrow))
-static int fl_remove(heap_hdr_t *hdr, u8 *target) {
-    void **prev_next = &hdr->free_head;
-    void *cur = hdr->free_head;
-    int iters = FL_REMOVE_MAX;
-    while (cur && iters-- > 0) {
-        if ((u8 *)cur == target) {
-            *prev_next = *(void **)((u8 *)cur + BLOCK_HDR_SIZE);
-            return 1;
-        }
-        prev_next = (void **)((u8 *)cur + BLOCK_HDR_SIZE);
-        cur = *prev_next;
-    }
-    return 0;
 }
 
 /* The actual allocator lives in __coqui_malloc_raw / __coqui_free_raw so that
@@ -137,13 +92,9 @@ void *__coqui_malloc_raw(unsigned long size) {
     void *cur = hdr->free_head;
     int iters = 8;
     while (cur && iters-- > 0) {
-        u32 cur_sf = *(u32 *)cur;
-        u32 cur_sz = blk_size(cur_sf);
-        if (likely(cur_sz >= need)) {
-            /* Splice out of freelist. */
+        u32 blk_sz = *(u32 *)cur;
+        if (likely(blk_sz >= need)) {
             *prev_next = *(void **)((u8 *)cur + BLOCK_HDR_SIZE);
-            /* Mark in-use; preserve prev_size (already at offset 4). */
-            *(u32 *)cur = cur_sz | BLOCK_IN_USE;
             return (u8 *)cur + BLOCK_HDR_SIZE;
         }
         prev_next = (void **)((u8 *)cur + BLOCK_HDR_SIZE);
@@ -160,28 +111,9 @@ void *__coqui_malloc_raw(unsigned long size) {
     }
 
     u8 *block = __coqui_heap_base() + hdr->bump_top;
-    *(u32 *)block = need | BLOCK_IN_USE;            /* size_flags */
-    *(u32 *)(block + 4) = hdr->prev_bump_size;       /* prev_size */
+    *(u32 *)block = need;
     hdr->bump_top += need;
-    hdr->prev_bump_size = need;
     return block + BLOCK_HDR_SIZE;
-}
-
-/* Insert `block` (already sized via *(u32*)block) into the freelist
- * size-sorted (largest first), 8-iter scan limit. */
-__attribute__((always_inline, nothrow))
-static void fl_insert_sized(heap_hdr_t *hdr, u8 *block, u32 blk_sz) {
-    void **prev_next = &hdr->free_head;
-    void *cur = hdr->free_head;
-    int iters = 8;
-    while (cur && iters-- > 0) {
-        u32 cur_sz = blk_size(*(u32 *)cur);
-        if (blk_sz >= cur_sz) break;   /* insert before smaller */
-        prev_next = (void **)((u8 *)cur + BLOCK_HDR_SIZE);
-        cur = *prev_next;
-    }
-    *(void **)(block + BLOCK_HDR_SIZE) = cur;
-    *prev_next = block;
 }
 
 __attribute__((nothrow))
@@ -210,60 +142,21 @@ void __coqui_free_raw(void *ptr) {
     if (unlikely(block < heap_lo || block >= heap_hi)) return;
 
     heap_hdr_t *hdr = heap_hdr();
-    u32 size_flags = *(u32 *)block;
-    u32 blk_sz = blk_size(size_flags);
+    u32 blk_sz = *(u32 *)block;
 
-    /* Mark this block free first. */
-    *(u32 *)block = blk_sz;
-
-    /* --- Forward coalesce: if next block is free, splice & merge. --- */
-    u8 *next = block + blk_sz;
-    u8 *bump_end = heap_lo + hdr->bump_top;
-    if (next < bump_end) {
-        u32 nsf = *(u32 *)next;
-        u32 nsz = blk_size(nsf);
-        if (!blk_in_use(nsf) && nsz != 0) {
-            if (fl_remove(hdr, next)) {
-                blk_sz += nsz;
-                *(u32 *)block = blk_sz;
-            }
-        }
+    /* Size-sorted insert (8-iter limit, largest first) */
+    void **prev_next = &hdr->free_head;
+    void *cur = hdr->free_head;
+    int iters = 8;
+    while (cur && iters-- > 0) {
+        u32 cur_sz = *(u32 *)cur;
+        if (blk_sz >= cur_sz) break;   /* insert before smaller */
+        prev_next = (void **)((u8 *)cur + BLOCK_HDR_SIZE);
+        cur = *prev_next;
     }
 
-    /* --- Backward coalesce: if previous block is free, splice & merge. --- */
-    u32 prev_size = *(u32 *)(block + 4);
-    if (prev_size > 0 && prev_size <= (u32)(block - heap_lo)) {
-        u8 *prev = block - prev_size;
-        if (prev >= heap_lo + HEAP_HDR_SIZE) {
-            u32 psf = *(u32 *)prev;
-            u32 psz = blk_size(psf);
-            if (!blk_in_use(psf) && psz == prev_size) {
-                if (fl_remove(hdr, prev)) {
-                    psz += blk_sz;
-                    *(u32 *)prev = psz;
-                    block = prev;
-                    blk_sz = psz;
-                }
-            }
-        }
-    }
-
-    /* --- Update successor's prev_size after coalesce. --- */
-    u8 *after = block + blk_sz;
-    if (after < bump_end) {
-        *(u32 *)(after + 4) = blk_sz;
-    } else if (after == bump_end) {
-        /* Free block reaches the bump frontier: reclaim by rewinding bump_top.
-         * The previous block's size was `*(u32*)(block+4)`; restore that as
-         * the new prev_bump_size so the next bump alloc gets the right
-         * predecessor link. */
-        hdr->bump_top = (u32)(block - heap_lo);
-        hdr->prev_bump_size = *(u32 *)(block + 4);
-        return;
-    }
-
-    /* Add the (possibly merged) block to the freelist. */
-    fl_insert_sized(hdr, block, blk_sz);
+    *(void **)((u8 *)block + BLOCK_HDR_SIZE) = cur;
+    *prev_next = block;
 }
 
 /* Public allocator names. After the Asan pass's RAUW these have no callers
@@ -345,8 +238,7 @@ void *__coqui_realloc(void *ptr, unsigned long size) {
     }
 
     u8 *block = (u8 *)ptr - BLOCK_HDR_SIZE;
-    /* Mask off the in-use flag when reading total block size. */
-    u32 old_size = blk_size(*(u32 *)block) - BLOCK_HDR_SIZE;
+    u32 old_size = *(u32 *)block - BLOCK_HDR_SIZE;
 
     if (old_size >= size) return ptr;   /* no-op shrink */
 
