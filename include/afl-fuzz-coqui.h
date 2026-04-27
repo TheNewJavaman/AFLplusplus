@@ -274,7 +274,10 @@ typedef struct coqui_ctx {
 #define COQUI_LAT_MIN_SAMPLES   32
 #define COQUI_LAT_P95_PCT       95
 #define COQUI_LAT_MULT          3ULL
-#define COQUI_LAT_FLOOR_US      500000ULL    /* 500 ms */
+#define COQUI_LAT_FLOOR_US      200000ULL    /* 200 ms — tightened from 500ms
+                                                     so adaptive can hit
+                                                     low-latency targets
+                                                     (cjson healthy ~50ms) */
 #define COQUI_LAT_CEIL_US       3000000ULL   /* 3 s */
 
 /* ------------------------------------------------------------------------

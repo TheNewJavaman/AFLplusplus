@@ -956,16 +956,26 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   unsigned long long start_us =
     ((unsigned long long)tv.tv_sec * 1000000 + tv.tv_usec);
   unsigned long long cull_deadline_us = start_us + ctx->batch_timeout_us;
-  /* Hard ceiling: if the kernel hasn't finished 1s after culling, assume an
-   * infinite loop and force-reset (kills the kernel). Reset costs ~1s, which
-   * is cheaper than waiting longer for a pathological kernel to finish.
+  /* Hard ceiling: if the kernel hasn't finished GRACE_US after culling,
+   * assume an infinite loop and force-reset (kills the kernel). Reset costs
+   * ~1s, which is cheaper than waiting longer for a pathological kernel.
    *
-   * iter17 tightening: was 5s. Profile evidence (P1 iter6) showed truly-
-   * pathological cjson kernels hang 5–22+ seconds, well beyond any plausible
-   * grace window; the 5s grace was almost never recovering legitimately-slow
-   * batches and was costing ~4s per pathology cycle. 1s grace gives near-done
-   * kernels a fair chance to complete while keeping recovery latency low. */
-  unsigned long long hard_deadline_us = cull_deadline_us + 1000000ULL;
+   * History:
+   *   iter1   — 5s  grace (initial conservative default)
+   *   iter17  — 1s  grace (cjson pathological kernels hang 5-22+ s; 5s
+   *                        grace almost never recovered legit-slow batches)
+   *   iter18  — 250ms grace. Image-format targets (libjpeg-turbo, stb_image)
+   *             have *unbounded* slow paths from adversarial Huffman /
+   *             marker-length inputs — the kernel never finishes naturally,
+   *             so the grace is pure wait. Healthy batches finish before
+   *             cull_deadline anyway and never touch this grace. The 250ms
+   *             window covers the rare "kernel near done at cull moment"
+   *             case while keeping recovery latency low.
+   *
+   * Tunable via AFL_COQUI_TIMEOUT_GRACE_US (default 250000). */
+  unsigned long long grace_us =
+      getenv_u64("AFL_COQUI_TIMEOUT_GRACE_US", 250000ULL);
+  unsigned long long hard_deadline_us = cull_deadline_us + grace_us;
 
   int culled = 0;
   unsigned long long wait_end_us = 0;  /* set when cuStreamQuery reports success */
