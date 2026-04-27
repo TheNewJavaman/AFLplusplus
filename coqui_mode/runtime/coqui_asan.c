@@ -751,8 +751,10 @@ void __coqui_asan_free(void *ptr) {
     u8 *heap_hi = heap_lo + __coqui_heap_size();
     if (unlikely(block < heap_lo || block >= heap_hi)) return;
 
-    /* Read the original total block size from the header (includes BLOCK_HDR_SIZE). */
-    u32 full_sz = *(u32 *)block;
+    /* Read the original total block size from the header (includes
+     * BLOCK_HDR_SIZE). Bit 0 of size_flags is the in-use flag set by the
+     * heap allocator (see coqui_memory.c); mask it off to recover size. */
+    u32 full_sz = *(u32 *)block & ~1u;
     if (unlikely(full_sz < BLOCK_HDR_SIZE)) return;   /* sanity */
 
     /* Poison the entire payload (left_redzone + user + right_redzone). */
@@ -870,7 +872,9 @@ void *__coqui_asan_realloc(void *ptr, unsigned long new_size) {
         u8 *heap_lo = __coqui_heap_base();
         u8 *heap_hi = heap_lo + __coqui_heap_size();
         if (unlikely(block < heap_lo || block >= heap_hi)) return (void *)0;
-        u32 full_sz = *(u32 *)block;
+        /* Mask off the in-use flag (bit 0 of size_flags); see
+         * coqui_memory.c for the heap block layout. */
+        u32 full_sz = *(u32 *)block & ~1u;
         if (unlikely(full_sz < BLOCK_HDR_SIZE + ASAN_LEFT_REDZONE + ASAN_RIGHT_REDZONE))
             return (void *)0;
         old_size = (unsigned long)(full_sz - BLOCK_HDR_SIZE)
