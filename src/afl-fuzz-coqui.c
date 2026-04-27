@@ -308,18 +308,21 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->byte_budget = (unsigned int)budget64;
   ctx->map_size = 65536;
 
-  /* 7. Create streams */
-  CUstream sa, sb;
-  CUCHECK(cuStreamCreate(&sa, CU_STREAM_NON_BLOCKING));
-  CUCHECK(cuStreamCreate(&sb, CU_STREAM_NON_BLOCKING));
-  ctx->stream_a = (void *)sa;
-  ctx->stream_b = (void *)sb;
+  /* 7. Create N streams (N = COQUI_PIPELINE_SLOTS) */
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    CUstream s;
+    CUCHECK(cuStreamCreate(&s, CU_STREAM_NON_BLOCKING));
+    ctx->streams[i] = (void *)s;
+  }
 
-  /* 8. Allocate ping-pong pair */
-  alloc_batch_half_cuda(&ctx->ping, ctx, sa);
-  alloc_batch_half_cuda(&ctx->pong, ctx, sb);
-  ctx->pending   = &ctx->ping;
-  ctx->executing = &ctx->pong;
+  /* 8. Allocate N pipeline slots */
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    alloc_batch_half_cuda(&ctx->slots[i], ctx,
+                          (CUstream)ctx->streams[i]);
+  }
+  ctx->fill_idx  = 0;
+  ctx->pending   = &ctx->slots[0];
+  ctx->executing = &ctx->slots[COQUI_PIPELINE_SLOTS - 1];
 
   /* 9. Statics pool — allocate AND bind to the cubin's pool-base symbol.
    *    StaticGlobals pass emits per-thread accesses as `pool_base + tid * size + offset`,
@@ -523,8 +526,9 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   memset(ctx->batch_latency_ring, 0, sizeof(ctx->batch_latency_ring));
   ctx->batch_latency_count  = 0;
   ctx->batch_latency_head   = 0;
-  ctx->ping.launch_start_us = 0;
-  ctx->pong.launch_start_us = 0;
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    ctx->slots[i].launch_start_us = 0;
+  }
 
   afl->coqui = ctx;
 
@@ -1318,16 +1322,20 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
     /* Launch the full batch async */
     coqui_launch_batch(afl, b);
 
-    /* Flip ping-pong */
-    coqui_batch_t *tmp = ctx->pending;
-    ctx->pending = ctx->executing;
-    ctx->executing = tmp;
+    /* Mark this slot as "most recent done" for rate-log telemetry. */
+    ctx->executing = b;
+
+    /* Advance to next slot in the round-robin pipeline */
+    ctx->fill_idx = (ctx->fill_idx + 1) % COQUI_PIPELINE_SLOTS;
+    ctx->pending = &ctx->slots[ctx->fill_idx];
 
     b = ctx->pending;
     off = 0;
 
-    /* If the new pending has in-flight work from a previous flip, drain it
-       before reusing */
+    /* If the new pending has in-flight work from a previous round, drain
+     * it before reusing. With N=3 slots, this slot was launched 2 flips
+     * ago; its kernel has had 2*mut_time of head start, so on GPU-bound
+     * targets the await is often zero. */
     if (b->n_inputs > 0) {
       if (coqui_await_and_process(afl, b) == 1) {
         /* Context was reset under us; ctx/b are stale. Drop this input —
@@ -1351,19 +1359,26 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
 void coqui_flush_batch(afl_state_t *afl) {
   coqui_ctx_t *ctx = afl->coqui;
 
-  /* Drain the executing batch if it has in-flight work */
-  if (ctx->executing->n_inputs > 0) {
-    if (coqui_await_and_process(afl, ctx->executing) == 1) return;
-    ctx->executing->n_inputs = 0;
-    ctx->executing->bytes_used = 0;
+  /* With N slots, drain in fill-order starting AFTER the currently-being-
+   * filled slot. The slots launched longest ago (2 flips before) finish
+   * first, so awaiting in-order minimizes the queued time. */
+  for (u32 step = 1; step < COQUI_PIPELINE_SLOTS; step++) {
+    u32 idx = (ctx->fill_idx + step) % COQUI_PIPELINE_SLOTS;
+    coqui_batch_t *b = &ctx->slots[idx];
+    if (b->n_inputs > 0) {
+      if (coqui_await_and_process(afl, b) == 1) return;
+      b->n_inputs = 0;
+      b->bytes_used = 0;
+    }
   }
 
-  /* Launch + drain pending if partial */
-  if (ctx->pending->n_inputs > 0) {
-    coqui_launch_batch(afl, ctx->pending);
-    if (coqui_await_and_process(afl, ctx->pending) == 1) return;
-    ctx->pending->n_inputs = 0;
-    ctx->pending->bytes_used = 0;
+  /* Launch + drain the currently-being-filled slot if partial */
+  coqui_batch_t *p = ctx->pending;
+  if (p->n_inputs > 0) {
+    coqui_launch_batch(afl, p);
+    if (coqui_await_and_process(afl, p) == 1) return;
+    p->n_inputs = 0;
+    p->bytes_used = 0;
   }
 }
 
@@ -1401,16 +1416,13 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
 
   /* Host pinned buffers are independent of context lifecycle. */
-  if (ctx->ping.h_input_bytes) cuMemFreeHost(ctx->ping.h_input_bytes);
-  if (ctx->ping.h_offsets)     cuMemFreeHost(ctx->ping.h_offsets);
-  if (ctx->ping.h_input_lens)  cuMemFreeHost(ctx->ping.h_input_lens);
-  if (ctx->ping.h_novelty)     cuMemFreeHost(ctx->ping.h_novelty);
-  if (ctx->ping.h_status)      cuMemFreeHost(ctx->ping.h_status);
-  if (ctx->pong.h_input_bytes) cuMemFreeHost(ctx->pong.h_input_bytes);
-  if (ctx->pong.h_offsets)     cuMemFreeHost(ctx->pong.h_offsets);
-  if (ctx->pong.h_input_lens)  cuMemFreeHost(ctx->pong.h_input_lens);
-  if (ctx->pong.h_novelty)     cuMemFreeHost(ctx->pong.h_novelty);
-  if (ctx->pong.h_status)      cuMemFreeHost(ctx->pong.h_status);
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    if (ctx->slots[i].h_input_bytes) cuMemFreeHost(ctx->slots[i].h_input_bytes);
+    if (ctx->slots[i].h_offsets)     cuMemFreeHost(ctx->slots[i].h_offsets);
+    if (ctx->slots[i].h_input_lens)  cuMemFreeHost(ctx->slots[i].h_input_lens);
+    if (ctx->slots[i].h_novelty)     cuMemFreeHost(ctx->slots[i].h_novelty);
+    if (ctx->slots[i].h_status)      cuMemFreeHost(ctx->slots[i].h_status);
+  }
 
   ck_free(ctx);
   afl->coqui = NULL;
@@ -1483,12 +1495,14 @@ void coqui_shutdown(afl_state_t *afl) {
    * we exit immediately. The full unbounded cuStreamSynchronize was a
    * SIGTERM trap when a pathological kernel was in flight at the moment
    * the user expected fast exit. */
-  coqui_drain_stream_bounded(afl, (CUstream)ctx->stream_a, 2000000ULL);
-  coqui_drain_stream_bounded(afl, (CUstream)ctx->stream_b, 2000000ULL);
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    coqui_drain_stream_bounded(afl, (CUstream)ctx->streams[i], 2000000ULL);
+  }
 
   /* Free ping-pong */
-  free_batch_half_cuda(&ctx->ping);
-  free_batch_half_cuda(&ctx->pong);
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    free_batch_half_cuda(&ctx->slots[i]);
+  }
 
   /* Free persistent device buffers */
   if (ctx->d_global_statics_pool)
@@ -1508,8 +1522,9 @@ void coqui_shutdown(afl_state_t *afl) {
     ck_free(ctx->h_trace_t0_buf);
 
   /* Destroy streams, unload module, destroy context */
-  if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);
-  if (ctx->stream_b) cuStreamDestroy((CUstream)ctx->stream_b);
+  for (u32 i = 0; i < COQUI_PIPELINE_SLOTS; i++) {
+    if (ctx->streams[i]) cuStreamDestroy((CUstream)ctx->streams[i]);
+  }
   if (ctx->cu_module) cuModuleUnload((CUmodule)ctx->cu_module);
   if (ctx->cu_ctx) cuCtxDestroy((CUcontext)ctx->cu_ctx);
 

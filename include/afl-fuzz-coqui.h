@@ -93,12 +93,26 @@ typedef struct coqui_batch {
   unsigned long long launch_start_us;
 } coqui_batch_t;
 
+/* Pipeline depth: number of in-flight batches.
+ *
+ * 2 = classic ping-pong (fills slot A while slot B's kernel runs).
+ * 3+ = deeper pipeline; hides up to (N-1)*mut_time of kernel latency.
+ *
+ * GPU-bound targets (libyaml, cmark with batch=512) where kernel_time >>
+ * mut_time benefit from N>=3: when AFL gets back to slot K its kernel has
+ * already finished, so the await is zero. Trade: N-1 extra pinned input
+ * buffers (32 MB / slot at default batch_size).
+ *
+ * Set conservatively at 3 — tested win on cjson + libyaml; deeper N showed
+ * diminishing returns. */
+#define COQUI_PIPELINE_SLOTS 3
+
 /* Per-afl-state coqui context. */
 typedef struct coqui_ctx {
-  coqui_batch_t  ping;
-  coqui_batch_t  pong;
-  coqui_batch_t *pending;    /* filling now (CPU side) */
-  coqui_batch_t *executing;  /* on GPU (or most recent done) */
+  coqui_batch_t  slots[COQUI_PIPELINE_SLOTS];
+  u32            fill_idx;   /* slot being filled now (round-robin) */
+  coqui_batch_t *pending;    /* = &slots[fill_idx]; convenience pointer */
+  coqui_batch_t *executing;  /* most recent done slot (rate-log helper) */
 
   u32 batch_size;      /* snapshot of afl->coqui_batch_size */
   u32 max_input_size;  /* snapshot of afl->max_length (with fallback) */
@@ -190,8 +204,7 @@ typedef struct coqui_ctx {
   void *cu_ctx;       /* CUcontext */
   void *cu_module;    /* CUmodule */
   void *cu_kernel;    /* CUfunction */
-  void *stream_a;     /* CUstream */
-  void *stream_b;     /* CUstream */
+  void *streams[COQUI_PIPELINE_SLOTS];   /* CUstream per slot */
 
   /* Device-persistent buffers (CUdeviceptr = u64) */
   unsigned long long d_virgin_map;
