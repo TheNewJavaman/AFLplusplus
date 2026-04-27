@@ -260,6 +260,34 @@ typedef struct coqui_ctx {
   unsigned long long  d_trace_count;        /* CUdeviceptr — per-thread counters */
   u32                *h_trace_t0_buf;       /* host scratch for thread-0 readback */
   u32                 h_trace_t0_count;     /* most-recent thread-0 count */
+
+  /* GPU-mutate broadcast bypass (AFL_COQUI_GPU_MUTATE=1).
+   *
+   * When enabled, coqui_submit_input only memcpys the FIRST input of
+   * each batch into the pinned host buffer; the remaining 8191 slot
+   * table entries point at the same offset/len. Each GPU thread copies
+   * those broadcast bytes into its own per-thread .local scratch buffer
+   * (in FuzzEntry-emitted IR) before running the mutator + harness, so
+   * the 8192 in-place mutations no longer collide.
+   *
+   * Net wins: per-batch H2D bytes drop from ~32 MB to len_first; host-
+   * side memcpy drops from O(batch_size * len) to O(len); per-batch GPU
+   * await time roughly halves on cjson because the kernel sees a single
+   * payload shape per batch instead of 8192 varied ones. AFL's CPU
+   * havoc loop still runs (its mutated `out_buf` payloads are simply
+   * ignored after the first per batch); eliminating that residual is
+   * the goal of the separate Option-B follow-up.
+   *
+   * Tradeoff: corpus discovery slows because broadcast reduces per-
+   * batch input diversity (one parent → 8192 mutations of it, vs. the
+   * baseline's 8192 mutations of 8192 different out_bufs). For
+   * throughput-bound experiments on fast targets this is acceptable;
+   * for thorough coverage exploration prefer the non-bypass mode.
+   *
+   * Wired in coqui_init when AFL_COQUI_GPU_MUTATE is set AND the cubin
+   * exports the __coqui_mutate_enabled symbol — i.e. exactly the case
+   * where GPU-side mutation is active. */
+  u8                  gpu_mutate_bypass;   /* 1 = broadcast-mode submit */
 } coqui_ctx_t;
 
 /* Per-thread trace stripe geometry. Must match

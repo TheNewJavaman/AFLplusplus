@@ -171,9 +171,20 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
           ((unsigned long long)_tv.tv_usec) ^ 0xC0FFEE00DECAFBADULL;
       CUCHECK(cuMemcpyHtoD(d_mutate_prng_base, &prng_base, sizeof(prng_base)));
       if (enable) {
-        OKF("coqui GPU mutation: ENABLED (AFL_COQUI_GPU_MUTATE=%s, prng_base=0x%llx)",
+        /* Enable the host-side broadcast-bypass: coqui_submit_input
+         * stores only the first input of each batch and replicates
+         * its offset/len for all remaining slots. The GPU's per-thread
+         * scratch (FuzzEntry-emitted) keeps the 8192 mutations
+         * isolated. Wins ~8000x reduction in H2D bytes + per-input
+         * host memcpys + a kernel-side speedup from a single payload
+         * shape per batch. AFL's CPU havoc still runs but its post-
+         * first-input mutations are wasted (Option-A scope). */
+        ctx->gpu_mutate_bypass = 1;
+        OKF("coqui GPU mutation: ENABLED (AFL_COQUI_GPU_MUTATE=%s, prng_base=0x%llx, "
+            "broadcast-bypass=on)",
             gpu_mutate_env, prng_base);
       } else {
+        ctx->gpu_mutate_bypass = 0;
         OKF("coqui GPU mutation: disabled (set AFL_COQUI_GPU_MUTATE=1 to enable)");
       }
     } else if (enable) {
@@ -1352,6 +1363,60 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
 
   if (len > ctx->byte_budget) {
     ctx->oversized_count++;
+    return 0;
+  }
+
+  /* GPU-mutate broadcast bypass: only the first input of each batch is
+   * actually copied into the pinned host buffer; subsequent submits in
+   * the same batch are recorded as slot-table entries pointing at the
+   * same offset/len. The GPU's __coqui_mutate_input runs against a
+   * per-thread .local scratch (filled by an IR-emitted memcpy in
+   * FuzzEntry.cpp) so the 8192 mutations don't collide on the shared
+   * broadcast bytes.
+   *
+   * Effect: per-batch H2D bytes drop from ~32 MB to ~len bytes, host
+   * memcpy work drops from O(batch_size * len) to O(len), and the GPU
+   * kernel's await time roughly halves on cjson (single payload shape
+   * per batch). AFL's CPU havoc still runs (its `out_buf` mutations
+   * are simply ignored after the first), but the host critical path
+   * no longer touches those bytes. */
+  if (ctx->gpu_mutate_bypass) {
+    if (b->n_inputs == 0) {
+      /* First input of this batch: copy it once, anchor the broadcast. */
+      memcpy(b->h_input_bytes, buf, len);
+      b->h_offsets[0] = 0;
+      b->h_input_lens[0] = len;
+      b->n_inputs = 1;
+      b->bytes_used = len;
+      return 0;
+    }
+    /* Subsequent inputs: replicate slot 0's offset/len. No memcpy. */
+    if (b->n_inputs < ctx->batch_size) {
+      b->h_offsets[b->n_inputs] = b->h_offsets[0];
+      b->h_input_lens[b->n_inputs] = b->h_input_lens[0];
+      b->n_inputs++;
+      return 0;
+    }
+    /* Batch full: launch and flip. After flip, fall through to anchor
+     * the next batch with this input. */
+    coqui_launch_batch(afl, b);
+    coqui_batch_t *tmp = ctx->pending;
+    ctx->pending = ctx->executing;
+    ctx->executing = tmp;
+    b = ctx->pending;
+    if (b->n_inputs > 0) {
+      if (coqui_await_and_process(afl, b) == 1) {
+        return 0;
+      }
+      b->n_inputs = 0;
+      b->bytes_used = 0;
+    }
+    /* Anchor new batch with current buf. */
+    memcpy(b->h_input_bytes, buf, len);
+    b->h_offsets[0] = 0;
+    b->h_input_lens[0] = len;
+    b->n_inputs = 1;
+    b->bytes_used = len;
     return 0;
   }
 

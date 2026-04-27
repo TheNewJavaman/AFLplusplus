@@ -296,26 +296,89 @@ bool runFuzzEntry(Module &M) {
   /* len64 = zext len to i64 */
   Value *len64 = Builder.CreateZExt(len, i64, "len64");
 
-  /* GPU-side havoc: emit a call to __coqui_mutate_input(input_ptr, len64,
-   * max_size). The function gates on a runtime flag so disabled runs pay
-   * one load + branch in the runtime. We pass max_size = len64 (no growth
-   * allowed) for safety: the host packs inputs at 8B-aligned offsets so
-   * each slot only has 0-7 bytes of slack, and exposing the exact slot
-   * capacity would require a new kernel argument. DELETE-style mutations
-   * still work (size shrinks); CLONE_BLOCK falls back to flip_bit when
-   * size + clone_len > max_size. The host writes 1 to the runtime gate
-   * global only when AFL_COQUI_GPU_MUTATE is set so we keep the same
-   * cubin compatible with both modes. */
+  /* GPU-side havoc with per-thread scratch.
+   *
+   * When the host's broadcast-bypass mode is on (AFL_COQUI_GPU_MUTATE=1
+   * → coqui_submit_input replicates slot 0's offset for all 8192
+   * threads), every thread's input_ptr aliases the same global-memory
+   * bytes. Mutating in place would cause 8192 concurrent writes to the
+   * same buffer — a textbook race that corrupts every thread's view of
+   * the input. The fix is per-thread stack scratch: each thread copies
+   * input bytes into its own .local scratch buffer, mutates there, and
+   * runs the harness against the scratch — eliminating cross-thread
+   * interference on the broadcast input.
+   *
+   * Pure GPU-mutate (no broadcast) would also benefit because in-place
+   * mutation pollutes the global input buffer for any subsequent reads,
+   * but currently no other reads exist after mutate.
+   *
+   * Stack budget: scratch is COQUI_MUTATE_SCRATCH_SIZE bytes (sized to
+   * max_input_size on cjson; tunable). On NVPTX the alloca lives in
+   * .local memory which is part of the per-thread stack — well within
+   * the 128 KB stack budget.
+   *
+   * Non-bypass / mutate-disabled path: the runtime mutate gate
+   * (__coqui_mutate_enabled) is checked first; if 0, we run the harness
+   * directly against the original input pointer (no extra memcpy). The
+   * scratch alloca is hoisted unconditionally for codegen simplicity,
+   * but unused when the gate is 0 — NVPTX register/stack allocator
+   * handles dead .local cells cheaply. */
+  static constexpr unsigned COQUI_MUTATE_SCRATCH_SIZE = 4096;
+  ArrayType *ScratchTy = ArrayType::get(i8, COQUI_MUTATE_SCRATCH_SIZE);
+  Value *scratchArr = Builder.CreateAlloca(ScratchTy, nullptr, "mutate_scratch");
+  Value *scratchPtr = Builder.CreatePointerCast(scratchArr, i8p, "mutate_scratch_ptr");
+
+  /* Cap len64 at COQUI_MUTATE_SCRATCH_SIZE so an oversize input gets
+   * truncated rather than overrunning the stack. */
+  Value *lenCap = ConstantInt::get(i64, COQUI_MUTATE_SCRATCH_SIZE);
+  Value *cmpCap = Builder.CreateICmpULT(len64, lenCap, "len_lt_cap");
+  Value *copyLen = Builder.CreateSelect(cmpCap, len64, lenCap, "copy_len");
+
+  /* Branch on __coqui_mutate_enabled to keep the disabled path cost-free. */
+  GlobalVariable *MutGate = M.getGlobalVariable("__coqui_mutate_enabled");
+  if (!MutGate) {
+    MutGate = new GlobalVariable(
+        M, i8, false, GlobalValue::ExternalLinkage,
+        nullptr, "__coqui_mutate_enabled");
+  }
+  Value *gateLoad = Builder.CreateLoad(i8, MutGate, "mut_gate");
+  Value *gateOn = Builder.CreateICmpNE(gateLoad,
+                                        ConstantInt::get(i8, 0), "mut_on");
+
+  Function *F = Builder.GetInsertBlock()->getParent();
+  BasicBlock *MutBB    = BasicBlock::Create(C, "fz.mut",      F);
+  BasicBlock *NoMutBB  = BasicBlock::Create(C, "fz.nomut",    F);
+  BasicBlock *ExecBB   = BasicBlock::Create(C, "fz.exec",     F);
+  Builder.CreateCondBr(gateOn, MutBB, NoMutBB);
+
+  /* Mutate path: copy to scratch, mutate scratch, exec on scratch. */
+  Builder.SetInsertPoint(MutBB);
+  Builder.CreateMemCpy(scratchPtr, MaybeAlign(1), inputPtr, MaybeAlign(1),
+                        copyLen);
   FunctionType *MutateType = FunctionType::get(i64, {i8p, i64, i64}, false);
   FunctionCallee MutateInput = M.getOrInsertFunction(
       "__coqui_mutate_input", MutateType);
   Value *mutLen64 = Builder.CreateCall(MutateInput,
-                                       {inputPtr, len64, len64},
+                                       {scratchPtr, copyLen, copyLen},
                                        "mut_len");
+  Builder.CreateBr(ExecBB);
 
-  /* __coqui_fuzz_execute(input_ptr, mut_len64) */
+  /* No-mutate path: skip alloca-write, exec on the original input. */
+  Builder.SetInsertPoint(NoMutBB);
+  Builder.CreateBr(ExecBB);
+
+  /* Join: pick the right (ptr, len) pair for the harness. */
+  Builder.SetInsertPoint(ExecBB);
+  PHINode *execPtr = Builder.CreatePHI(i8p, 2, "exec_ptr");
+  execPtr->addIncoming(scratchPtr, MutBB);
+  execPtr->addIncoming(inputPtr,   NoMutBB);
+  PHINode *execLen = Builder.CreatePHI(i64, 2, "exec_len");
+  execLen->addIncoming(mutLen64, MutBB);
+  execLen->addIncoming(len64,    NoMutBB);
+
+  /* __coqui_fuzz_execute(exec_ptr, exec_len) */
   FunctionType *ExecType = FunctionType::get(i32, {i8p, i64}, false);
-  Builder.CreateCall(ExecType, User, {inputPtr, mutLen64});
+  Builder.CreateCall(ExecType, User, {execPtr, execLen});
 
   /* clk_c: after fuzz_execute (user harness) */
   Value *clkC = Builder.CreateCall(Clock64, {}, "clk_c");
