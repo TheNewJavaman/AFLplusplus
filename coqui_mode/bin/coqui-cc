@@ -165,7 +165,7 @@ def main():
     #   0   — disabled (default, matches current behavior).
     # Only applied when explicitly set to a non-empty, non-"0" value.
     # Requires CUDA 13.2+ ptxas; coqui itself does not use this flag.
-    ptxas_opt = os.environ.get("COQUI_PTXAS_OPT", "-O1")
+    ptxas_opt = os.environ.get("COQUI_PTXAS_OPT", "-O2")
     ptxas_ofc = os.environ.get("COQUI_PTXAS_OFC", "").strip()
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
     ptxas_cmd = ["ptxas", f"-arch={arch}"]
