@@ -364,6 +364,22 @@ int __coqui_fuzz_execute(const unsigned char *data, unsigned long size);
 /* Device-global virgin map (allocated at module load, accessed via cuModuleGetGlobal) */
 extern u8 __coqui_virgin_map[COQUI_COV_MAP_SIZE];
 
+/* -- GPU-side mutation runtime (coqui_mutate.c) --
+ *
+ * The FuzzEntry pass emits a call to __coqui_mutate_input before invoking
+ * the user harness so each thread can independently havoc-mutate its input.
+ * The function itself short-circuits when __coqui_mutate_enabled == 0, so
+ * runs without AFL_COQUI_GPU_MUTATE pay only one load + branch.
+ *
+ * Host wires AFL_COQUI_GPU_MUTATE → write 1 to __coqui_mutate_enabled at
+ * coqui_init time, and may re-roll __coqui_mutate_prng_base per batch so
+ * different launches see different mutation patterns.
+ */
+extern u8  __coqui_mutate_enabled;        /* gate: 0 = no-op, 1 = mutate */
+extern u64 __coqui_mutate_prng_base;      /* per-thread PRNG seed material */
+unsigned long __coqui_mutate_input(unsigned char *input, unsigned long size,
+                                   unsigned long max_size);
+
 /* -- Line-trace runtime (oracle mode; coqui_trace.c) --
  *
  * Per-line execution recorder gated by the `-coqui-line-trace` opt flag.

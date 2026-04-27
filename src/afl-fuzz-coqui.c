@@ -140,6 +140,48 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   memset(ctx->k_cycles, 0, sizeof(ctx->k_cycles));
   ctx->k_batch_count = 0;
 
+  /* Bind GPU-mutate gate globals (coqui_mutate.c). When AFL_COQUI_GPU_MUTATE
+   * is set, write 1 to the device-side __coqui_mutate_enabled flag so each
+   * GPU thread runs stacked havoc on its input before invoking the user
+   * harness. Disabled by default; cubins built before this runtime landed
+   * simply won't export the symbols, in which case we silently no-op. The
+   * PRNG base is seeded from the host's monotonic clock so different runs
+   * see different mutation patterns. */
+  {
+    const char *gpu_mutate_env = getenv("AFL_COQUI_GPU_MUTATE");
+    unsigned char enable = (gpu_mutate_env && gpu_mutate_env[0] != '0') ? 1 : 0;
+    CUdeviceptr d_mutate_enabled, d_mutate_prng_base;
+    size_t mutate_enabled_sz, mutate_prng_sz;
+    CUresult r1 = cuModuleGetGlobal(&d_mutate_enabled, &mutate_enabled_sz, mod,
+                                     "__coqui_mutate_enabled");
+    CUresult r2 = cuModuleGetGlobal(&d_mutate_prng_base, &mutate_prng_sz, mod,
+                                     "__coqui_mutate_prng_base");
+    if (r1 == CUDA_SUCCESS && r2 == CUDA_SUCCESS) {
+      if (mutate_enabled_sz != 1) {
+        FATAL("__coqui_mutate_enabled symbol size %zu != 1B", mutate_enabled_sz);
+      }
+      if (mutate_prng_sz != 8) {
+        FATAL("__coqui_mutate_prng_base symbol size %zu != 8B", mutate_prng_sz);
+      }
+      CUCHECK(cuMemcpyHtoD(d_mutate_enabled, &enable, sizeof(enable)));
+      struct timeval _tv;
+      gettimeofday(&_tv, NULL);
+      unsigned long long prng_base =
+          ((unsigned long long)_tv.tv_sec << 20) ^
+          ((unsigned long long)_tv.tv_usec) ^ 0xC0FFEE00DECAFBADULL;
+      CUCHECK(cuMemcpyHtoD(d_mutate_prng_base, &prng_base, sizeof(prng_base)));
+      if (enable) {
+        OKF("coqui GPU mutation: ENABLED (AFL_COQUI_GPU_MUTATE=%s, prng_base=0x%llx)",
+            gpu_mutate_env, prng_base);
+      } else {
+        OKF("coqui GPU mutation: disabled (set AFL_COQUI_GPU_MUTATE=1 to enable)");
+      }
+    } else if (enable) {
+      WARNF("AFL_COQUI_GPU_MUTATE set but cubin exports no "
+            "__coqui_mutate_enabled — rebuild with the GPU-mutate runtime");
+    }
+  }
+
   /* 4. Probe the device for its maximum allowed per-thread stack size.
    *    CUDA's cuCtxSetLimit accepts values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must

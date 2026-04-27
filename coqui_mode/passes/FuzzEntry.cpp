@@ -296,9 +296,26 @@ bool runFuzzEntry(Module &M) {
   /* len64 = zext len to i64 */
   Value *len64 = Builder.CreateZExt(len, i64, "len64");
 
-  /* __coqui_fuzz_execute(input_ptr, len64) */
+  /* GPU-side havoc: emit a call to __coqui_mutate_input(input_ptr, len64,
+   * max_size). The function gates on a runtime flag so disabled runs pay
+   * one load + branch in the runtime. We pass max_size = len64 (no growth
+   * allowed) for safety: the host packs inputs at 8B-aligned offsets so
+   * each slot only has 0-7 bytes of slack, and exposing the exact slot
+   * capacity would require a new kernel argument. DELETE-style mutations
+   * still work (size shrinks); CLONE_BLOCK falls back to flip_bit when
+   * size + clone_len > max_size. The host writes 1 to the runtime gate
+   * global only when AFL_COQUI_GPU_MUTATE is set so we keep the same
+   * cubin compatible with both modes. */
+  FunctionType *MutateType = FunctionType::get(i64, {i8p, i64, i64}, false);
+  FunctionCallee MutateInput = M.getOrInsertFunction(
+      "__coqui_mutate_input", MutateType);
+  Value *mutLen64 = Builder.CreateCall(MutateInput,
+                                       {inputPtr, len64, len64},
+                                       "mut_len");
+
+  /* __coqui_fuzz_execute(input_ptr, mut_len64) */
   FunctionType *ExecType = FunctionType::get(i32, {i8p, i64}, false);
-  Builder.CreateCall(ExecType, User, {inputPtr, len64});
+  Builder.CreateCall(ExecType, User, {inputPtr, mutLen64});
 
   /* clk_c: after fuzz_execute (user harness) */
   Value *clkC = Builder.CreateCall(Clock64, {}, "clk_c");
