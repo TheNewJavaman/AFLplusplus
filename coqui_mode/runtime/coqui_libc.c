@@ -606,16 +606,16 @@ int __coqui_snprintf(char *buf, unsigned long size, const char *fmt, ...)
  * ===========================================================================*/
 
 __attribute__((noreturn)) void __coqui_abort(void) {
-    __coqui_trap(); __builtin_unreachable();
+    __coqui_trap_with_reason(COQUI_TRAP_ABORT); __builtin_unreachable();
 }
 __attribute__((noreturn)) void __coqui_assert_fail(const char *expr, const char *file,
                                                    unsigned int line, const char *func) {
     (void)expr; (void)file; (void)line; (void)func;
-    __coqui_trap(); __builtin_unreachable();
+    __coqui_trap_with_reason(COQUI_TRAP_ABORT); __builtin_unreachable();
 }
 
-__attribute__((noreturn)) void exit(int s)  { (void)s; __coqui_trap(); __builtin_unreachable(); }
-__attribute__((noreturn)) void _exit(int s) { (void)s; __coqui_trap(); __builtin_unreachable(); }
+__attribute__((noreturn)) void exit(int s)  { (void)s; __coqui_trap_with_reason(COQUI_TRAP_ABORT); __builtin_unreachable(); }
+__attribute__((noreturn)) void _exit(int s) { (void)s; __coqui_trap_with_reason(COQUI_TRAP_ABORT); __builtin_unreachable(); }
 
 /* ===========================================================================
  * errno — per-thread slot, addressed via __coqui_errno_location().

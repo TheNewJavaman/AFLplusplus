@@ -79,6 +79,7 @@ typedef uint64_t u64;
 #define COQUI_TRAP_SYSCALL_KILL  15
 #define COQUI_TRAP_SYSCALL_FORK  16
 #define COQUI_TRAP_SYSCALL_EXEC  17
+#define COQUI_TRAP_ABORT         18
 #define COQUI_TRAP_UNSUPPORTED   255
 
 /* Stack-canary sentinel. Written once into an alloca at the outermost kernel
