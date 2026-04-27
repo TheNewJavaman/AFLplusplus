@@ -68,6 +68,17 @@ if ! grep -q "stb_image" "$STB_CACHE"; then
 fi
 echo "  stb_image.h: $(wc -l <"$STB_CACHE") lines, $(wc -c <"$STB_CACHE") bytes"
 
+# Apply local patches if present. Idempotent: a "coqui patch:" marker is
+# baked into every patched site, so re-runs short-circuit cleanly.
+PATCH_DIR="${SCRIPT_DIR}/patches"
+if [[ -d "$PATCH_DIR" ]] && ! grep -q "coqui patch:" "$STB_CACHE"; then
+  for p in "$PATCH_DIR"/*.patch; do
+    [[ -f "$p" ]] || continue
+    echo "  applying patch: $(basename "$p")"
+    patch -p1 -d "$(dirname "$STB_CACHE")" --no-backup-if-mismatch <"$p"
+  done
+fi
+
 # --- [2/3] Build AFL++ CPU binary -------------------------------------------
 echo "=== [2/3] Build AFL++ CPU binary with afl-clang-fast ==="
 CPU_OUT="${HARNESS_BASENAME}_cpu"

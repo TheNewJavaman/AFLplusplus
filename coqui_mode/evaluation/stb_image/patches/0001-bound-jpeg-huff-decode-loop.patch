@@ -1,0 +1,58 @@
+From cuAFL <coqui@local> Mon Apr 27 00:50:00 2026 +0000
+Subject: [PATCH] bound stbi__jpeg_huff_decode slow-path loop
+
+stb_image.h's stbi__jpeg_huff_decode contains an unbounded slow-path
+loop that walks the maxcode[] array looking for a sentinel. The
+sentinel (maxcode[17] = 0xFFFFFFFF) is set by stbi__build_huffman only
+for tables that were properly DHT'd. SOS sections that reference an
+undefined Huffman table reach this loop with maxcode[] all-zeros and
+the loop walks past the array (size 18) into adjacent struct memory,
+taking up to ~2^31 iterations before stochastically exiting via OOB
+read.
+
+On the GPU under coqui-mode fuzzing, this manifests as 8192 threads
+all running the same pathological mutation, taking multiple seconds
+per batch and triggering coqui's kernel-stuck force-reset (4 s
+deadline). Across libjpeg-turbo and stb_image benchmarks, this is one
+of the dominant force-reset triggers; reducing it improves throughput
+by ~27% on stb_image (838 → 1062 exec/s on a 3-min RTX Titan run).
+
+Fix: cap the loop at k <= 17 and treat any k > 16 exit as a decode
+failure, returning -1. Valid (DHT'd) tables still hit the natural
+maxcode[17] sentinel exit; undefined tables produce a single bounded
+sweep + return -1, which stbi__jpeg_decode_block correctly propagates
+as decode failure → image rejection.
+
+Same shape as PR #22's strtod cap.
+
+---
+ stb_image.h | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/stb_image.h b/stb_image.h
+--- a/stb_image.h
++++ b/stb_image.h
+@@ -2120,11 +2120,20 @@
+    // end; in other words, regardless of the number of bits, it
+    // wants to be compared against something shifted to have 16;
+    // that way we don't need to shift inside the loop.
+    temp = j->code_buffer >> 16;
+-   for (k=FAST_BITS+1 ; ; ++k)
++   /* coqui patch: bound the slow-path loop. maxcode[17] is set to
++    * 0xFFFFFFFF by stbi__build_huffman as a sentinel for tables that
++    * were properly DHT'd. SOS that references an undefined Huffman
++    * table reaches here with maxcode[] all-zeros; without the bound
++    * the loop walks past the array into adjacent struct memory,
++    * taking up to ~2^31 iterations per pathological GPU thread (8192
++    * threads = multiple seconds per batch → kernel-stuck force-reset).
++    * Cap at k <= 17 so undefined-table SOS produces a single bounded
++    * sweep + return -1; valid tables still hit maxcode[17] sentinel. */
++   for (k=FAST_BITS+1 ; k <= 17 ; ++k)
+       if (temp < h->maxcode[k])
+          break;
+-   if (k == 17) {
++   if (k > 16) {
+       // error! code not found
+       j->code_bits -= 16;
+       return -1;
+    }
