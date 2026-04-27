@@ -23,6 +23,7 @@
 #include <setjmp.h>
 #endif
 #include "jpeglib.h"
+#include "jerror.h"
 
 // oss-fuzz error handler: longjmp on error instead of exit().
 #ifndef __COQUI_DEVICE__
@@ -64,6 +65,26 @@ static void coqui_safe_skip_input_data(j_decompress_ptr cinfo, long num_bytes) {
     }
 }
 
+// EOF-fail fill_input_buffer override: libjpeg-turbo's stock
+// fill_mem_input_buffer (jdatasrc.c:124) returns a fake EOI marker each
+// call once the real buffer is exhausted, encouraging the parser to keep
+// reading past EOF. Each subsequent read past EOF is another indirect call
+// through cinfo->src->fill_input_buffer — invoked from MAKE_BYTE_AVAIL in
+// jdmarker.c:143 and jpeg_fill_bit_buffer in jdhuff.c:307,324. Dozens-to-
+// hundreds of post-EOF calls per pathological GPU thread × 8192 threads
+// with indirect-dispatch divergence → second-scale batch wall time →
+// kernel-stuck force-reset. This override fails fast on the first overrun
+// (libjpeg's standard ERREXIT path → thread dies cleanly via __coqui_exit
+// on GPU; longjmps back via coqui_error_exit on CPU). The cost is that
+// truncated-but-recoverable JPEGs are now rejected rather than partially
+// decoded — acceptable for fuzzing where truncation isn't an interesting
+// bug surface.
+static boolean coqui_eof_fill_input_buffer(j_decompress_ptr cinfo) {
+    cinfo->err->msg_code = JERR_INPUT_EMPTY;
+    (*cinfo->err->error_exit)((j_common_ptr)cinfo);   // never returns
+    return FALSE;                                      // unreachable
+}
+
 int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
     if (size < 2) return 0;
 
@@ -90,6 +111,7 @@ int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
 
     jpeg_mem_src(&cinfo, data, size);
     cinfo.src->skip_input_data = coqui_safe_skip_input_data;
+    cinfo.src->fill_input_buffer = coqui_eof_fill_input_buffer;
 
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(&cinfo);
