@@ -230,7 +230,15 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   /* Derive heap and stack regions from the budget.
    *    Layout (per spec §4.2):
    *      [coverage 64 KB][heap H][shadow H/8][real stack S]
-   *      where H = (total - 64K - S) * 8/9 and shadow = H/8 */
+   *      where H = (total - 64K - S) * 8/9 and shadow = H/8.
+   *
+   * AFL_COQUI_HEAP_SIZE overrides H if set; the auto-derived value is used
+   * otherwise. The override is rounded down to the nearest multiple of 8
+   * (shadow = H/8 must be byte-exact) and bounded above by what fits in the
+   * remaining budget after cov and stack. Useful for targets where the
+   * auto-derived heap is wrong-sized: cmark needs more than the default
+   * leaves; libjpeg-turbo benefits from a smaller heap (frees the rest for
+   * call-chain headroom). */
   unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 65536);
   unsigned int cov = 65536;
   if (stack_size + cov >= total_budget) {
@@ -239,6 +247,18 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   }
   unsigned int remaining = total_budget - cov - stack_size;
   unsigned int heap = (remaining * 8) / 9;
+  unsigned int heap_override = getenv_u32("AFL_COQUI_HEAP_SIZE", 0);
+  if (heap_override) {
+    heap_override = (heap_override / 8) * 8;
+    if (heap_override + heap_override / 8 > remaining) {
+      FATAL("AFL_COQUI_HEAP_SIZE=%u + shadow %u > remaining %u (budget %u "
+            "- cov 64K - stack %u). Reduce AFL_COQUI_HEAP_SIZE or grow the "
+            "per-thread budget by reducing AFL_COQUI_SLAB_SIZE.",
+            heap_override, heap_override / 8, remaining, total_budget,
+            stack_size);
+    }
+    heap = heap_override;
+  }
   ctx->real_stack_size = stack_size;
 
   /* 5. Diagnostic: report static stack usage vs budget.
