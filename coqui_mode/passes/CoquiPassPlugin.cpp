@@ -76,6 +76,16 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runAsanGlobals(M);
     Changed |= coqui::runAsan(M);
     Changed |= coqui::runExternalSymbolGatekeeper(M);
+    /* IndirectCall: devirtualize indirect function-pointer calls into
+     * direct icmp/branch dispatch chains over the address-taken candidates
+     * with a compatible signature. NVPTX has no branch prediction across
+     * function-pointer dispatch and warps serialize on divergent callees;
+     * giving ptxas direct calls lets it lower into selp/setp.eq predicated
+     * sequences and lets the inliner reach into each arm. Runs AFTER
+     * ExternalSymbolGatekeeper so the final set of address-taken functions
+     * is stable. Introduces uses of __coqui_trap_with_reason (already
+     * runtime-resolved); does not introduce new external declarations. */
+    Changed |= coqui::runIndirectCall(M);
     /* AddressSpace runs last: promote surviving AS=0 module-level globals
      * to NVPTX `.global` (AS=1) so ptxas can emit `ld.global` / `st.global`
      * directly. Skips __coqui_* (host-bound runtime symbols), llvm.*,
