@@ -970,6 +970,14 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   int culled = 0;
   unsigned long long wait_end_us = 0;  /* set when cuStreamQuery reports success */
   while (1) {
+    /* Honor Ctrl-C / SIGTERM: if afl->stop_soon is set, abandon this batch
+     * and let the caller propagate the signal up to coqui_shutdown. The
+     * in-flight kernel may still be running on the GPU; we don't wait for
+     * it. coqui_shutdown drains streams with a similar signal-aware bound,
+     * so process exit happens within tens of ms instead of blocking for
+     * the full cull/hard-deadline cycle (3-4 s). */
+    if (afl->stop_soon) return 1;
+
     CUresult r = cuStreamQuery(s);
     if (r == CUDA_SUCCESS) {
       struct timeval _tv_wait_end;
@@ -1429,13 +1437,44 @@ static void free_batch_half_cuda(coqui_batch_t *b) {
   memset(b, 0, sizeof(*b));
 }
 
+/* Bounded stream drain: poll cuStreamQuery for up to drain_max_us, returning
+ * early if the stream completes or if afl->stop_soon is asserted (Ctrl-C).
+ * Falls back to abandoning the stream — the CUDA context teardown that
+ * follows shutdown reclaims the kernel/memory, but does NOT guarantee the
+ * in-flight kernel actually finishes. Acceptable for shutdown: we're tearing
+ * down anyway, no observers care about partial-batch output. */
+static void coqui_drain_stream_bounded(afl_state_t *afl, CUstream s,
+                                       unsigned long long drain_max_us) {
+  if (!s) return;
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  unsigned long long start_us =
+    ((unsigned long long)tv.tv_sec * 1000000ULL) + tv.tv_usec;
+  unsigned long long deadline_us = start_us + drain_max_us;
+  while (1) {
+    if (afl->stop_soon) return;
+    CUresult r = cuStreamQuery(s);
+    if (r == CUDA_SUCCESS) return;
+    if (r != CUDA_ERROR_NOT_READY) return;  /* genuine error or stream gone */
+    gettimeofday(&tv, NULL);
+    unsigned long long now =
+      ((unsigned long long)tv.tv_sec * 1000000ULL) + tv.tv_usec;
+    if (now >= deadline_us) return;
+    usleep(1000);
+  }
+}
+
 void coqui_shutdown(afl_state_t *afl) {
   if (!afl->coqui) return;
   coqui_ctx_t *ctx = afl->coqui;
 
-  /* Drain streams */
-  if (ctx->stream_a) cuStreamSynchronize((CUstream)ctx->stream_a);
-  if (ctx->stream_b) cuStreamSynchronize((CUstream)ctx->stream_b);
+  /* Drain streams with a 2-second bound and stop_soon awareness. On clean
+   * shutdown the streams typically complete within tens of ms; on Ctrl-C
+   * we exit immediately. The full unbounded cuStreamSynchronize was a
+   * SIGTERM trap when a pathological kernel was in flight at the moment
+   * the user expected fast exit. */
+  coqui_drain_stream_bounded(afl, (CUstream)ctx->stream_a, 2000000ULL);
+  coqui_drain_stream_bounded(afl, (CUstream)ctx->stream_b, 2000000ULL);
 
   /* Free ping-pong */
   free_batch_half_cuda(&ctx->ping);
