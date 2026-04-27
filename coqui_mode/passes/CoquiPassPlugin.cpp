@@ -75,6 +75,15 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
      * descriptor scan (asan_check_global in coqui_asan.c). */
     Changed |= coqui::runAsanGlobals(M);
     Changed |= coqui::runAsan(M);
+    /* Align: relax declared load/store alignment to what's provably true
+     * from the pointer's source. NVPTX traps multi-byte loads with
+     * CUDA_ERROR_MISALIGNED_ADDRESS when the actual alignment is below
+     * what llc encoded; this pass walks the pointer SSA graph and lowers
+     * the asserted alignment when needed. Runs after runAsan so the
+     * load/store instrumentation has already been emitted (its own
+     * probes use safe alignment) and before runExternalSymbolGatekeeper
+     * so that pass remains the last whole-module sanity check. */
+    Changed |= coqui::runAlign(M);
     Changed |= coqui::runExternalSymbolGatekeeper(M);
     /* AddressSpace runs last: promote surviving AS=0 module-level globals
      * to NVPTX `.global` (AS=1) so ptxas can emit `ld.global` / `st.global`

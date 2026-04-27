@@ -34,6 +34,7 @@ set(COQUI_PASS_SOURCES
     Asan.cpp
     ExternalSymbolGatekeeper.cpp
     AddressSpace.cpp
+    Align.cpp
     LineTrace.cpp
 )
 

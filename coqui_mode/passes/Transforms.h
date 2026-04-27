@@ -77,6 +77,17 @@ bool runExternalSymbolGatekeeper(llvm::Module &M);
  * has already run by the time we sweep. */
 bool runAddressSpace(llvm::Module &M);
 
+/* Align: relax over-optimistic clang-emitted alignments on loads/stores
+ * to a value we can actually prove from the pointer's source. Avoids
+ * CUDA_ERROR_MISALIGNED_ADDRESS when llc emits multi-byte loads
+ * (ld.b32 / ld.b64) for pointers that the cuAFL runtime can only
+ * guarantee alignment 8 (heap) or 16 (stack pool) for. Skips __coqui_*
+ * and llvm.* functions (runtime helpers + intrinsic stubs have hand-
+ * tuned alignment invariants). Runs after runAsan so the load/store
+ * instrumentation's own probe accesses have already been emitted; the
+ * pass leaves Asan-injected accesses with safe alignment alone. */
+bool runAlign(llvm::Module &M);
+
 /* Line-trace pass (oracle mode). Gated by the `-coqui-line-trace` opt flag.
  * Returns false (no-op) when the flag is unset, so production runs pay
  * nothing. See LineTrace.cpp for the (file, line) ID assignment scheme +
