@@ -76,6 +76,13 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     Changed |= coqui::runAsanGlobals(M);
     Changed |= coqui::runAsan(M);
     Changed |= coqui::runExternalSymbolGatekeeper(M);
+    /* AddressSpace runs last: promote surviving AS=0 module-level globals
+     * to NVPTX `.global` (AS=1) so ptxas can emit `ld.global` / `st.global`
+     * directly. Skips __coqui_* (host-bound runtime symbols), llvm.*,
+     * declarations, and thread-locals. Must run after every pass that
+     * may create new globals (Static/MemoryLayout/Asan/Coverage/...) so
+     * they all get caught in the sweep. */
+    Changed |= coqui::runAddressSpace(M);
 
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
