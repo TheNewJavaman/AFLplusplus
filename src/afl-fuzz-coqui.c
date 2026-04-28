@@ -1298,6 +1298,23 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
   return 0;
 }
 
+/* Periodic fuzzer_stats writer for coqui-mode.
+ *
+ * AFL's normal show_stats / write_stats_file path is gated on fuzz_one()
+ * completing one mutation pass. On slow-kernel coqui targets (cmark at
+ * BATCH=8192 has ~30s per-batch wall) a single fuzz_one round can take
+ * minutes, leaving fuzzer_stats stuck at execs_done=100, run_time=0 even
+ * though the GPU is pumping ~1M submits/s. Bench scrapers reading that
+ * file see no progress and misdiagnose hangs.
+ *
+ * Tick the file write directly from the submit-input pump every ~10s of
+ * wall time. write_stats_file(afl, 0, 0, 0, 0) is the same snapshot call
+ * already used at shutdown in src/afl-fuzz.c:3420 — the zero args fall
+ * back to last-cached bitmap_cvg/stability/eps. The check fires once per
+ * batch flip (after the previous batch's coverage has been merged), so
+ * cost is ~120 cheap branches/sec on fast targets, 1 file write per 10s. */
+static u64 coqui_last_stats_tick_ms = 0;
+
 u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
   coqui_ctx_t *ctx = afl->coqui;
   coqui_batch_t *b = ctx->pending;
@@ -1337,6 +1354,17 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
       }
       b->n_inputs = 0;
       b->bytes_used = 0;
+    }
+
+    /* Periodic fuzzer_stats refresh (see comment above
+     * coqui_last_stats_tick_ms). Hook fires at most once per batch flip,
+     * just after coverage from the prior batch has been merged. */
+    if (likely(!afl->non_instrumented_mode)) {
+      u64 now_ms = get_cur_time();
+      if (now_ms - coqui_last_stats_tick_ms >= 10000) {
+        write_stats_file(afl, 0, 0, 0, 0);
+        coqui_last_stats_tick_ms = now_ms;
+      }
     }
   }
 
