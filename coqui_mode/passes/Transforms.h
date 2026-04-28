@@ -77,6 +77,19 @@ bool runExternalSymbolGatekeeper(llvm::Module &M);
  * has already run by the time we sweep. */
 bool runAddressSpace(llvm::Module &M);
 
+/* IndirectCall: devirtualize indirect function-pointer calls into bounded
+ * dispatch chains (icmp + cond-branch over each address-taken candidate
+ * with a compatible signature, with a final trap arm). NVPTX has no branch
+ * prediction across function-pointer dispatch, warps serialize across
+ * divergent callees, and function-pointer dispatch is essentially
+ * uncacheable on the GPU. Devirt'ing into direct calls lets ptxas lower
+ * the chain to selp/setp.eq sequences and lets the inliner reach into
+ * each arm. Per-FunctionType type matching, narrowed by a struct-field /
+ * global-variable store-set analysis to avoid quadratic blowup. Runs
+ * AFTER ExternalSymbolGatekeeper so the final set of address-taken
+ * functions is stable, and before AddressSpace. */
+bool runIndirectCall(llvm::Module &M);
+
 /* Line-trace pass (oracle mode). Gated by the `-coqui-line-trace` opt flag.
  * Returns false (no-op) when the flag is unset, so production runs pay
  * nothing. See LineTrace.cpp for the (file, line) ID assignment scheme +

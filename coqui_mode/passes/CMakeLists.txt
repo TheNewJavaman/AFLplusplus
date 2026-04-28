@@ -33,6 +33,7 @@ set(COQUI_PASS_SOURCES
     Coverage.cpp
     Asan.cpp
     ExternalSymbolGatekeeper.cpp
+    IndirectCall.cpp
     AddressSpace.cpp
     LineTrace.cpp
 )
