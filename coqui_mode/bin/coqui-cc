@@ -152,21 +152,24 @@ def main():
     # broke under SIGKILL of a waiter and left the lock file held
     # indefinitely.
     #
-    # COQUI_PTXAS_OFC (default unset = off) enables CUDA 13.2+ ptxas
-    # --Ofast-compile, which trades runtime performance for compile speed
-    # by disabling certain optimizations. Useful for huge ASan-instrumented
-    # PTX (libxml2-style) where the 50-90 min ptxas run is the bottleneck.
+    # COQUI_PTXAS_OFC enables CUDA 13.2+ ptxas --Ofast-compile, which
+    # trades runtime performance for compile speed by disabling certain
+    # optimizations.
     # Values:
     #   min — minimal impact on both compile and runtime; disables some
-    #         expensive opts. Best safety-to-speed tradeoff per NVIDIA docs.
+    #         expensive opts. **DEFAULT** per the bench in task #73:
+    #         cjson 282s → 7s ptxas (40×), libpng >5min hang → 100s (>3×),
+    #         bzip2 26s → 16s; runtime cost <2% on cjson canonical guardrail.
+    #         Note: libxml2's compile pain is in llc (not ptxas) so OFC
+    #         doesn't help that target — separate COQUI_LLC_OPT lever.
     #   mid — balance compile and runtime; disables more expensive opts.
-    #   max — fastest compile; disables many opts. Expect runtime (exec/s)
-    #         regression under fuzzing.
-    #   0   — disabled (default, matches current behavior).
-    # Only applied when explicitly set to a non-empty, non-"0" value.
+    #         Same compile speed as min but -14% runtime on bzip2 (n=2).
+    #         Don't use unless `min` proves insufficient on a specific target.
+    #   max — fastest compile; disables many opts. Expect runtime regression.
+    #   0   — disabled. Use to opt out and get the slow but optimal -O2 path.
     # Requires CUDA 13.2+ ptxas; coqui itself does not use this flag.
     ptxas_opt = os.environ.get("COQUI_PTXAS_OPT", "-O2")
-    ptxas_ofc = os.environ.get("COQUI_PTXAS_OFC", "").strip()
+    ptxas_ofc = os.environ.get("COQUI_PTXAS_OFC", "min").strip()
     cubin = out.with_suffix(".cubin") if out.suffix else Path(str(out) + ".cubin")
     ptxas_cmd = ["ptxas", f"-arch={arch}"]
     # ptxas rejects -O<n> combined with --Ofast-compile=<level>; the OFC
