@@ -127,13 +127,16 @@ def main():
 
     # 4. llc -> .ptx
     #
-    # COQUI_LLC_OPT can override the opt level (default: llc's implicit, which
-    # is -O2). On huge ASan-instrumented modules (libxml2: 211k outlined call
-    # sites) llc -O2 register allocation stalls; -O1 is what coqui's driver
-    # uses and completes. Scoped to env-var so normal targets stay at -O2.
+    # COQUI_LLC_OPT controls the LLVM IR → PTX optimization level. **Default
+    # is `-O1`** (matching legacy coqui's driver). llc -O2 was previously the
+    # implicit default; on huge ASan-instrumented modules (libxml2: 211k
+    # outlined call sites) -O2 register allocation stalls past the dev-iter
+    # budget (>5 min for libxml2, observed in task #74 bench). -O1 is the
+    # next opt level down and what legacy coqui's driver uses by default.
+    # Override with COQUI_LLC_OPT=-O2 / -O0 / "" to opt out.
     ptx_path = out.with_suffix(".ptx") if args.emit_ptx else workdir / "out.ptx"
     llc_cmd = ["llc", f"-march=nvptx64", f"-mcpu={arch}"]
-    llc_opt = os.environ.get("COQUI_LLC_OPT", "")
+    llc_opt = os.environ.get("COQUI_LLC_OPT", "-O1")
     if llc_opt:
         llc_cmd.append(llc_opt)
     llc_cmd += [str(transformed_bc), "-o", str(ptx_path)]
