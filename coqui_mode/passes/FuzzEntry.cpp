@@ -276,6 +276,15 @@ bool runFuzzEntry(Module &M) {
   /* PHASE_START = 1 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 1)});
 
+  /* Per-thread budget poison init (Exp #51). Stamps clock64() into
+   * __coqui_thread_budget_start[tid]. The runtime helper is
+   * always_inline and short-circuits when the host hasn't enabled the
+   * budget (cycles_cap == 0), so production-default cost is a single
+   * global load + branch-not-taken per thread. */
+  FunctionCallee BudgetInit = M.getOrInsertFunction(
+      "__coqui_thread_budget_init", VoidNoArg);
+  Builder.CreateCall(BudgetInit, {});
+
   /* clk_a: start of instrumented body */
   Value *clkA = Builder.CreateCall(Clock64, {}, "clk_a");
 

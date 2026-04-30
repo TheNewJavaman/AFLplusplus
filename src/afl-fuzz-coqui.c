@@ -140,6 +140,50 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   memset(ctx->k_cycles, 0, sizeof(ctx->k_cycles));
   ctx->k_batch_count = 0;
 
+  /* Per-thread clock64 budget poison (Exp #51). When AFL_COQUI_THREAD_BUDGET_US
+   * is set, write the cycle ceiling into __coqui_thread_budget_cycles. The
+   * Coverage pass emits a budget check at every Nth static BB; on overrun
+   * the runtime calls __coqui_trap_with_reason(THREAD_BUDGET_EXHAUSTED) so
+   * the thread exits cleanly instead of stalling the batch's healthy work.
+   * Default 0 = disabled (host-side cull/grace stays as the sole mechanism).
+   *
+   * Cycle conversion uses the device's reported clock_rate (kHz). On
+   * RTX Titan that's ~1545000 kHz → 1545 cycles/us → 200ms ≈ 309M cycles. */
+  unsigned long long thread_budget_us =
+      getenv_u64("AFL_COQUI_THREAD_BUDGET_US", 0);
+  if (thread_budget_us > 0) {
+    int clock_khz = 0;
+    CUCHECK(cuDeviceGetAttribute(&clock_khz,
+                                  CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev));
+    if (clock_khz <= 0) clock_khz = 1500000; /* defensive default */
+    /* cycles = us * (kHz / 1000) */
+    unsigned long long cycles_per_us =
+        (unsigned long long)clock_khz / 1000ULL;
+    unsigned long long budget_cycles = thread_budget_us * cycles_per_us;
+
+    CUdeviceptr d_budget;
+    size_t d_budget_sz;
+    CUCHECK(cuModuleGetGlobal(&d_budget, &d_budget_sz, mod,
+                               "__coqui_thread_budget_cycles"));
+    if (d_budget_sz != sizeof(unsigned long long)) {
+      FATAL("__coqui_thread_budget_cycles symbol size %zu != 8B", d_budget_sz);
+    }
+    CUCHECK(cuMemcpyHtoD(d_budget, &budget_cycles,
+                          sizeof(unsigned long long)));
+
+    /* Zero-init the per-thread start array — kernel writes its own per
+     * launch but a clean default avoids any tail-of-batch surprises. */
+    CUdeviceptr d_budget_start;
+    size_t d_budget_start_sz;
+    CUCHECK(cuModuleGetGlobal(&d_budget_start, &d_budget_start_sz, mod,
+                               "__coqui_thread_budget_start"));
+    CUCHECK(cuMemsetD8(d_budget_start, 0, d_budget_start_sz));
+    OKF("coqui per-thread budget: %llu us = %llu cycles "
+        "(@ %d kHz; %u-stride BB checks)",
+        thread_budget_us, budget_cycles, clock_khz,
+        64u);
+  }
+
   /* 4. Probe the device for its maximum allowed per-thread stack size.
    *    CUDA's cuCtxSetLimit accepts values that fit within the device's
    *    .local memory budget (per_thread × max-resident-threads × #SMs must
@@ -499,6 +543,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   ctx->oom_reruns_completed = 0;
   ctx->stack_overflow_inputs_found = 0;
   ctx->cpu_rerun_crashes = 0;
+  ctx->thread_budget_inputs_found = 0;
 
   /* Persistent cross-batch crash-sig dedup set (1M slots = ~5 MB host RAM).
    * Saturates after ~500 s at the observed 2k-new-sigs/s rate for cjson; for
@@ -893,6 +938,7 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                 "crash_dedup_hits=%llu avg=%.1f/batch, "
                 "crash_verify_calls=%llu avg=%.1f/batch, "
                 "persist_dedup=%llu avg=%.1f/batch cap=%u/%u, "
+                "thread_budget_traps=%llu, "
                 "host_us/batch: wall=%.0f mut_other=%.0f submit=%.0f "
                 "[htod=%.0f launch=%.0f dtoh=%.0f] await=%.0f verify=%.0f, "
                 "kern: init=%.0f%% exec=%.0f%% classify=%.0f%% virgin=%.0f%%)\n",
@@ -908,6 +954,7 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                 avg_persist_per_batch,
                 ctx->crash_sig_seen_count,
                 ctx->crash_sig_seen_cap,
+                (unsigned long long)ctx->thread_budget_inputs_found,
                 wall_per_batch_us,
                 avg_mut_other_us_batch,
                 avg_submit_us_batch,
@@ -1074,6 +1121,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     u64 oom_this_batch = 0;
     u64 oom_reruns_this_batch = 0;
     u64 stack_ovf_this_batch = 0;
+    u64 budget_this_batch = 0;
     coqui_status_t *hs_trap = b->h_status;
     for (u32 i = 0; i < ctx->batch_size; i++) {
       if (b->h_input_lens[i] == 0) continue;
@@ -1093,18 +1141,31 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
         u8 fault = rerun_gpu_failed_input(afl, input, len);
         if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
         oom_reruns_this_batch++;
+      } else if (tr == COQUI_TRAP_THREAD_BUDGET_EXHAUSTED) {
+        /* This thread exceeded AFL_COQUI_THREAD_BUDGET_US on the GPU.
+         * NOT a crash — the input simply ran past the per-thread time
+         * cap. Rerun on the CPU forkserver where the budget doesn't
+         * apply; the CPU will either complete normally (cheap) or
+         * also time out (FSRV_RUN_TMOUT — recorded normally). */
+        budget_this_batch++;
+        u8 fault = rerun_gpu_failed_input(afl, input, len);
+        if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
+        oom_reruns_this_batch++;
       }
     }
     ctx->oom_inputs_found += oom_this_batch;
     ctx->stack_overflow_inputs_found += stack_ovf_this_batch;
     ctx->oom_reruns_completed += oom_reruns_this_batch;
+    ctx->thread_budget_inputs_found += budget_this_batch;
     /* Debug-build correctness assertion: every trap_reason entry that
      * isn't len==0 must have been rerun. Intentionally not a FATAL in
      * release builds — a logged mismatch is preferable to killing a
      * long fuzz session over a counting bug. */
-    if (oom_this_batch + stack_ovf_this_batch != oom_reruns_this_batch) {
+    if (oom_this_batch + stack_ovf_this_batch + budget_this_batch
+        != oom_reruns_this_batch) {
       WARNF("coqui: OOM counter mismatch: %llu found / %llu reran",
-            (unsigned long long)(oom_this_batch + stack_ovf_this_batch),
+            (unsigned long long)(oom_this_batch + stack_ovf_this_batch
+                                  + budget_this_batch),
             (unsigned long long)oom_reruns_this_batch);
     }
   }

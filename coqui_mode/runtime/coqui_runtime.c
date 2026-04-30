@@ -140,3 +140,71 @@ int pthread_once(int *once_control, void (*init)(void)) {
     }
     return 0;
 }
+
+/* Per-thread clock64 budget poison (Exp #51).
+ *
+ * `__coqui_thread_budget_cycles` is the ceiling, in SM clock cycles, that
+ * any single thread may spend on the kernel. Host writes it via
+ * cuModuleGetGlobal+HtoD before the first launch. Value 0 disables the
+ * mechanism entirely (production-safe default; existing host-side cull
+ * timeout still applies as a backstop).
+ *
+ * `__coqui_thread_budget_start[BATCH]` records each thread's clock64()
+ * snapshot at FuzzEntry. The Coverage pass emits a periodic
+ * __coqui_check_thread_budget() call (once every N static BBs) along
+ * the user code path; only the slow thread trips, peer threads in the
+ * same warp/block keep running, and the kernel finishes naturally
+ * before the host cull deadline — avoiding the force-reset that loses
+ * the entire 8000-input batch.
+ *
+ * We size the start array to 8192 (BATCH_SIZE_FOR_COVERAGE in
+ * Coverage.cpp) — must match. */
+__attribute__((visibility("default")))
+__attribute__((used))
+u64 __coqui_thread_budget_cycles = 0;
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u64 __coqui_thread_budget_start[8192];
+
+/* Stamp clock64() at kernel entry. `always_inline` — emitted exactly
+ * once per thread (FuzzEntry inserts the call after slab-init, before
+ * user code). `nothrow`. */
+__attribute__((always_inline, nothrow))
+void __coqui_thread_budget_init(void) {
+    /* Only stamp when budget is enabled — saves a global store per
+     * thread on the disabled-default path. */
+    if (__coqui_thread_budget_cycles == 0) return;
+    u32 tid = __coqui_fuzz_tid();
+    __coqui_thread_budget_start[tid] = (u64)__nvvm_read_ptx_sreg_clock64();
+}
+
+/* Periodic budget check. Coverage pass calls this every N static BBs.
+ *
+ * Disabled-default fast path: a single ld.global.u64 of cycles + setp.eq
+ * + early-return branch — costs ~5 PTX ops. The branch is uniform across
+ * the warp when budget is unset (typical) so warps stay synchronized.
+ *
+ * `always_inline, nothrow`: aggressive inlining at every call site avoids
+ * the per-call stack-frame setup (NVPTX pushes/pops .local, ~10 SASS ops
+ * each) that dominates the disabled-default case. The trap path only ever
+ * runs once per offending thread so its (cold) inline cost is irrelevant.
+ *
+ * Note: clock64() on NVPTX is the *SM* clock (advances even when the
+ * thread is stalled waiting for a warp slot), not a per-thread counter.
+ * `now - start` therefore measures wall-time-on-SM, including time the
+ * thread spent suspended. Set AFL_COQUI_THREAD_BUDGET_US large enough
+ * that legit work doesn't trip; the goal is to catch true 3-s+ runaways
+ * before the host cull deadline does. */
+__attribute__((always_inline, nothrow))
+void __coqui_check_thread_budget(void) {
+    u64 cycles_cap = __coqui_thread_budget_cycles;
+    if (likely(cycles_cap == 0)) return;
+    u32 tid = __coqui_fuzz_tid();
+    u64 start = __coqui_thread_budget_start[tid];
+    u64 now = (u64)__nvvm_read_ptx_sreg_clock64();
+    if (unlikely(now - start > cycles_cap)) {
+        __coqui_trap_with_reason(COQUI_TRAP_THREAD_BUDGET_EXHAUSTED);
+        __builtin_unreachable();
+    }
+}

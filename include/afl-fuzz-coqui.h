@@ -60,6 +60,11 @@ typedef struct coqui_status {
 #define COQUI_TRAP_NONE          0
 #define COQUI_TRAP_OOM           11
 #define COQUI_TRAP_STACK_OVERFLOW 12
+/* Per-thread clock64 budget exhausted (Exp #51): the Coverage pass emits
+ * periodic budget checks; a thread that exceeds AFL_COQUI_THREAD_BUDGET_US
+ * exits via __coqui_trap_with_reason. Host treats it like OOM/stack —
+ * rerun on CPU forkserver. Default OFF (env unset → cycles_cap=0). */
+#define COQUI_TRAP_THREAD_BUDGET_EXHAUSTED 19
 
 /* One ping-pong half: packed input bytes + metadata + device mirrors. */
 typedef struct coqui_batch {
@@ -207,6 +212,10 @@ typedef struct coqui_ctx {
   u64 oom_reruns_completed;
   u64 stack_overflow_inputs_found;
   u64 cpu_rerun_crashes;
+  /* Per-thread clock64 budget exhaustions (Exp #51). Counts threads that
+   * tripped __coqui_check_thread_budget; each is rerun on the CPU
+   * forkserver and counted in oom_reruns_completed alongside OOM/stack. */
+  u64 thread_budget_inputs_found;
 
   /* Config from .conf sidecar */
   unsigned int real_stack_size;
