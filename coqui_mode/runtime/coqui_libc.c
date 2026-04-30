@@ -347,13 +347,104 @@ static int __coqui_scan_sign(const char **pp) {
     return neg;
 }
 
-/* strtod — parses sign, digits, optional '.', exponent. No hex, no locale.
- * Matches existing cuAFL behavior; good enough for cJSON / XPath floats. */
+/* strtod — parses sign, digits, optional '.', exponent. Hex (0x1.fp10),
+ * inf/infinity, and nan recognized as separate prefix-gated branches before
+ * the decimal path. Decimal path retains PR #22's exponent saturation at 400
+ * + zero short-circuit; do NOT touch the decimal walk without re-running
+ * cjson kernel-stuck regression check. */
 double __coqui_strtod(const char *nptr, char **endptr) {
     const char *p = nptr;
     int neg = __coqui_scan_sign(&p);
-    double val = 0.0;
 
+    /* Inf / Infinity (case-insensitive). Optional "inity" tail. */
+    if ((p[0] == 'i' || p[0] == 'I') &&
+        (p[1] == 'n' || p[1] == 'N') &&
+        (p[2] == 'f' || p[2] == 'F')) {
+        p += 3;
+        if ((p[0] == 'i' || p[0] == 'I') && (p[1] == 'n' || p[1] == 'N') &&
+            (p[2] == 'i' || p[2] == 'I') && (p[3] == 't' || p[3] == 'T') &&
+            (p[4] == 'y' || p[4] == 'Y'))
+            p += 5;
+        if (endptr) *endptr = (char *)p;
+        return neg ? -__builtin_inf() : __builtin_inf();
+    }
+
+    /* NaN (case-insensitive). Optional payload "(...)" not parsed. */
+    if ((p[0] == 'n' || p[0] == 'N') &&
+        (p[1] == 'a' || p[1] == 'A') &&
+        (p[2] == 'n' || p[2] == 'N')) {
+        p += 3;
+        if (endptr) *endptr = (char *)p;
+        return neg ? -__builtin_nan("") : __builtin_nan("");
+    }
+
+    /* Hex float: 0x or 0X, only if followed by hex digit or '.'. */
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        char c2 = p[2];
+        int c2_hex = (c2 >= '0' && c2 <= '9') || (c2 >= 'a' && c2 <= 'f') ||
+                     (c2 >= 'A' && c2 <= 'F') || c2 == '.';
+        if (c2_hex) {
+            const char *hp = p + 2;
+            double val = 0.0;
+            int has_digits = 0;
+            /* Hex integer part. */
+            while (1) {
+                int d;
+                if (*hp >= '0' && *hp <= '9') d = *hp - '0';
+                else if (*hp >= 'a' && *hp <= 'f') d = *hp - 'a' + 10;
+                else if (*hp >= 'A' && *hp <= 'F') d = *hp - 'A' + 10;
+                else break;
+                val = val * 16.0 + d;
+                has_digits = 1;
+                hp++;
+            }
+            /* Hex fractional part. */
+            if (*hp == '.') {
+                hp++;
+                double frac = 1.0 / 16.0;
+                while (1) {
+                    int d;
+                    if (*hp >= '0' && *hp <= '9') d = *hp - '0';
+                    else if (*hp >= 'a' && *hp <= 'f') d = *hp - 'a' + 10;
+                    else if (*hp >= 'A' && *hp <= 'F') d = *hp - 'A' + 10;
+                    else break;
+                    val += d * frac;
+                    frac /= 16.0;
+                    has_digits = 1;
+                    hp++;
+                }
+            }
+            /* Binary exponent (p/P). Same saturation philosophy as decimal:
+             * cap at 1100 (DBL_MAX_EXP=1024) to bound the iterative loop on
+             * pathological inputs like "0x1p99999999999". Zero short-circuit
+             * preserved — if mantissa is 0, skip the multiplication loop. */
+            if (has_digits && (*hp == 'p' || *hp == 'P')) {
+                hp++;
+                int en = 0;
+                if (*hp == '-') { en = 1; hp++; }
+                else if (*hp == '+') { hp++; }
+                int e = 0;
+                while (*hp >= '0' && *hp <= '9') {
+                    if (e < 2000) { e = e * 10 + (*hp - '0'); }
+                    hp++;
+                }
+                if (e > 1100) e = 1100;
+                if (val != 0.0) {
+                    double base = en ? 0.5 : 2.0;
+                    while (e--) val *= base;
+                }
+            }
+            if (has_digits) {
+                if (endptr) *endptr = (char *)hp;
+                return neg ? -val : val;
+            }
+            /* No hex digits after 0x — fall through; endptr will point at
+             * nptr (no conversion) since p still points at '0'. */
+        }
+    }
+
+    /* --- Decimal path (PR #22 perf-critical; do not modify) --- */
+    double val = 0.0;
     while (*p >= '0' && *p <= '9') {
         val = val * 10.0 + (*p - '0');
         p++;
