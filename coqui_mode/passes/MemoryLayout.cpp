@@ -15,7 +15,7 @@
  *   offset 16 .. 23  : shadow_base ptr (i8*, 8 bytes)
  *   offset 24 .. 31  : reserved
  *
- * Total footprint: 32 bytes/thread × 8192 threads = 256 KB in .global section.
+ * Total footprint: 32 bytes/thread × 65536 threads = 2 MB in .global section.
  *
  * Configuration: the real-stack budget is controlled via the
  * -coqui-stack-size=N opt flag (default 32768 B). coqui-cc forwards its
@@ -59,7 +59,7 @@ static cl::opt<unsigned> RealStackSizeOpt(
 
 /* Per-thread slot pool constants — must match host launcher batch size. */
 static constexpr unsigned SLOT_STRIDE = 32;
-static constexpr unsigned BATCH_SIZE  = 8192;
+static constexpr unsigned BATCH_SIZE  = 65536;
 
 /* Offset of each field within a thread's SLOT_STRIDE-byte slot. */
 static constexpr unsigned OFF_COV_BASE    = 0;

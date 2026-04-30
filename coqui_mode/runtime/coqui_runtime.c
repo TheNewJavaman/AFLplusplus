@@ -157,7 +157,7 @@ int pthread_once(int *once_control, void (*init)(void)) {
  * before the host cull deadline — avoiding the force-reset that loses
  * the entire 8000-input batch.
  *
- * We size the start array to 8192 (BATCH_SIZE_FOR_COVERAGE in
+ * We size the start array to 65536 (BATCH_SIZE_FOR_COVERAGE in
  * Coverage.cpp) — must match. */
 __attribute__((visibility("default")))
 __attribute__((used))
@@ -165,7 +165,7 @@ u64 __coqui_thread_budget_cycles = 0;
 
 __attribute__((visibility("default")))
 __attribute__((used))
-u64 __coqui_thread_budget_start[8192];
+u64 __coqui_thread_budget_start[65536];
 
 /* Stamp clock64() at kernel entry. `always_inline` — emitted exactly
  * once per thread (FuzzEntry inserts the call after slab-init, before
