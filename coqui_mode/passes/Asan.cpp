@@ -38,15 +38,16 @@
  * Ported from /coqui/src/AsanTransform.cpp with LLVM 18 opaque-pointer
  * adjustments.
  *
- * Instrumentation emits a call to a size-specialized outlined fast-path
- * helper (__coqui_asan_check_fast_{load,store}_{1,2,4,8}) at each
- * eligible load/store site.  The helper body does the range check +
- * shadow byte check inline (with branch-weight metadata for llc -O2
- * layout) and calls into the existing __coqui_asan_slowpath_*
- * functions on miss.  This outlining avoids the per-site 3x basic block
- * bloat that the previous inline-always approach created, which caused
- * catastrophic ptxas-O1 pathology on larger targets (cmark with 12k
- * loads: 55 min / 53 GB RSS before port).
+ * Instrumentation emits a call to a size-specialized always-inline
+ * fast-path helper (__coqui_asan_check_fast_{load,store}_{1,2,4,8}) at
+ * each eligible load/store site.  The helper body (range check + shadow
+ * byte load + branch-on-zero, ~3 SASS instructions) is inlined at every
+ * call site.  Only the cold slow path (__coqui_asan_slowpath_*, ~50+
+ * instructions) stays outlined (noinline+cold).  This split avoids the
+ * function-call overhead (NVPTX stack push/pop) at every load/store
+ * while keeping IR growth bounded -- only the cheap check is replicated,
+ * not the full report+trap machinery.  With OFC=min + llc -O1 in trunk,
+ * ptxas handles the larger IR without pathological build times.
  */
 
 #include "Transforms.h"
@@ -123,8 +124,8 @@ static llvm::MDNode *createBranchWeightMD(llvm::LLVMContext &Ctx,
   return MDB.createBranchWeights(TrueWeight, FalseWeight);
 }
 
-/// Create an outlined fast-path helper (Task 2 signature with precomputed
-/// heap/shadow bases):
+/// Create an inline fast-path helper (Exp #57: split inline fast + outlined
+/// slow):
 ///
 ///   void __coqui_asan_check_fast_{load|store}_N(ptr addr,
 ///                                                i64 heap_base,
@@ -137,17 +138,17 @@ static llvm::MDNode *createBranchWeightMD(llvm::LLVMContext &Ctx,
 ///     __coqui_asan_slowpath_{load|store}_N(addr);
 ///   }
 ///
-/// NoInline + NoUnwind — keep the helper body OUT of every access site.
-/// Inlining the fast path at thousands of load/store sites recreates the
-/// 3× basic-block bloat (entry / shadow / ok / slow) per access, which
-/// drives ptxas-O1 into hours-long compiles + tens of GB RSS on larger
-/// targets (cmark, libpng, libxml2 — see coqui_mode/docs/coqui_delta.md
-/// §1). With NoInline, every access site becomes a single `call` to a
-/// size-specialized helper, and the helper body is compiled once. Total
-/// .text shrinks dramatically; ptxas-O1 finishes in minutes. Branch-
-/// weight metadata on the helper's internal conditional branches still
-/// keeps the cold slow-path call out of the helper's own icache hot
-/// stream. The helper itself must NOT be instrumented (`__coqui_` prefix
+/// AlwaysInline + NoUnwind — inline the cheap shadow-check fast path at
+/// every access site. The shadow==0 check (range check + shadow load +
+/// branch-on-zero) is ~3 SASS instructions. The expensive slow path
+/// (shadow!=0 -> report) stays outlined as noinline+cold in the runtime.
+/// This avoids the function-call overhead (stack push/pop on NVPTX) at
+/// every load/store while keeping IR growth bounded — only the 3-instr
+/// fast path is replicated, not the 50+ instr slow path.
+///
+/// Risk: IR size grows vs NoInline (one check per load/store site). With
+/// OFC=min + llc -O1 now in trunk, ptxas handles larger IR better.
+/// The helper itself must NOT be instrumented (`__coqui_` prefix
 /// skip in the main instrumentation loop covers that); body never throws.
 static llvm::Function *createSizedFastHelper(llvm::Module &M,
                                              llvm::StringRef HelperName,
@@ -166,6 +167,14 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   // calls within that function share one result.
   FunctionType *SlowTy = FunctionType::get(VoidTy, {PtrTy}, false);
   FunctionCallee SlowFn = M.getOrInsertFunction(SlowpathName, SlowTy);
+  // Ensure the slowpath declaration carries noinline+cold so that after
+  // the fast helper is inlined at each call site, the optimizer does not
+  // also inline the slowpath body (which would recreate the IR bloat).
+  if (auto *SlowF = dyn_cast<Function>(SlowFn.getCallee())) {
+    SlowF->addFnAttr(Attribute::NoInline);
+    SlowF->addFnAttr(Attribute::Cold);
+    SlowF->addFnAttr(Attribute::NoUnwind);
+  }
 
   // __coqui_heap_size() returns i32 — the usable heap size as a
   // compile-time constant (see MemoryLayout.cpp). We zext to i64 for
@@ -194,16 +203,13 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Function *F = Function::Create(HelperTy, GlobalValue::InternalLinkage,
                                  HelperName, M);
   F->setCallingConv(CallingConv::C);
-  // NoInline: each access site emits a single `call` to this helper; the
-  // helper body lives once in the kernel module instead of being re-
-  // expanded at every load/store. This is the whole point of outlining
-  // the fast path — see the function-level doc comment for why
-  // AlwaysInline here defeats the design and burns ptxas-O1 on large
-  // targets. NoUnwind: nothing in the body can throw, so the call site
-  // stays free of EH metadata. The slab-check + slowpath branches
-  // internal to the helper still carry branch-weight metadata so llc
-  // lays them out cold.
-  F->addFnAttr(Attribute::NoInline);
+  // AlwaysInline (Exp #57): inline the cheap shadow-check at every
+  // access site. The range check + shadow load + branch-on-zero is ~3
+  // SASS instructions — small enough that even 200k+ call sites stay
+  // within IR budget (with OFC=min + llc -O1). The cold slowpath call
+  // stays outlined (noinline+cold in coqui_asan.c). NoUnwind: nothing
+  // in the body can throw.
+  F->addFnAttr(Attribute::AlwaysInline);
   F->addFnAttr(Attribute::NoUnwind);
   F->getArg(0)->setName("addr");
   F->getArg(1)->setName("heap.base");
