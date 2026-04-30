@@ -80,6 +80,13 @@ typedef uint64_t u64;
 #define COQUI_TRAP_SYSCALL_FORK  16
 #define COQUI_TRAP_SYSCALL_EXEC  17
 #define COQUI_TRAP_ABORT         18
+/* Per-thread clock64 budget exhausted: this thread spent more than
+ * AFL_COQUI_THREAD_BUDGET_US cycles on the GPU. The Coverage pass emits
+ * periodic checks; on overrun, __coqui_check_thread_budget calls
+ * __coqui_trap_with_reason(THREAD_BUDGET_EXHAUSTED) and clean-exits the
+ * thread. Host treats it like OOM/STACK_OVERFLOW: re-run the input on
+ * the CPU forkserver so the per-thread time constraint doesn't apply. */
+#define COQUI_TRAP_THREAD_BUDGET_EXHAUSTED 19
 #define COQUI_TRAP_UNSUPPORTED   255
 
 /* Stack-canary sentinel. Written once into an alloca at the outermost kernel

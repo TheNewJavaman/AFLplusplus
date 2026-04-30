@@ -14,6 +14,14 @@
  * prev_loc lives in __coqui_prev_loc_pool[BATCH_SIZE] (addrspace 0 / .global),
  * indexed by tid. PTX disallows module-scope variables in .local (addrspace 5),
  * so the per-thread state uses a tid-indexed .global array instead.
+ *
+ * Per-thread budget poison (Exp #51): every Nth static BB (N=64) emits a
+ * call to __coqui_check_thread_budget() — a runtime helper that compares
+ * clock64() - per-thread start against a host-set ceiling and traps the
+ * thread (only) on overrun. Disabled-default by host (cycles_cap=0); when
+ * disabled the helper is a single global-load + cmp + ret. Targets the
+ * force-reset bottleneck class: one slow thread no longer stalls the
+ * entire 8000-input batch.
  */
 
 #include "Transforms.h"
@@ -29,15 +37,29 @@ namespace coqui {
 
 static constexpr unsigned BATCH_SIZE_FOR_COVERAGE = 8192;
 
+/* Frequency of __coqui_check_thread_budget() emission. Once every N
+ * static BBs (counted across the entire module's user functions). N=64
+ * trades dynamic check granularity vs IR/PTX size: 1.5% of BBs add a
+ * 1-instruction call site; on a 30k-BB target that's ~470 extra calls,
+ * which adds <1% to cubin size. */
+static constexpr uint32_t BUDGET_CHECK_STRIDE = 64;
+
 bool runCoverage(Module &M) {
   LLVMContext &C = M.getContext();
   Type *i8  = Type::getInt8Ty(C);
   Type *i32 = Type::getInt32Ty(C);
+  Type *voidT = Type::getVoidTy(C);
   Type *i8p = PointerType::get(C, 0);
 
   /* Declare __coqui_cov_base() -> ptr */
   FunctionType *GetBaseType = FunctionType::get(i8p, false);
   FunctionCallee CovBase = M.getOrInsertFunction("__coqui_cov_base", GetBaseType);
+
+  /* Declare __coqui_check_thread_budget() -> void. The runtime defines it
+   * with `noinline` so call sites compile to a single bl/ret. */
+  FunctionType *VoidNoArg = FunctionType::get(voidT, false);
+  FunctionCallee CheckBudget = M.getOrInsertFunction(
+      "__coqui_check_thread_budget", VoidNoArg);
 
   /* Declare __coqui_prev_loc_pool as u32[BATCH_SIZE] in addrspace 0 (.global).
    * Each thread accesses element [tid]. PTX does not allow module-scope
@@ -59,6 +81,10 @@ bool runCoverage(Module &M) {
 
   /* Stable per-module seed: hash the module name once */
   uint64_t moduleSeed = llvm::xxh3_64bits(M.getName());
+
+  /* Module-wide static BB counter — increments across functions so the
+   * stride is stable regardless of function ordering. */
+  uint32_t globalBBIdx = 0;
 
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
@@ -110,6 +136,15 @@ bool runCoverage(Module &M) {
 
       /* store i32 (cur_loc >> 1), prevPtr */
       B.CreateStore(ConstantInt::get(i32, curLoc >> 1), prevPtr);
+
+      /* Per-thread budget check at every Nth static BB. The runtime
+       * helper is a no-op when the host hasn't set
+       * __coqui_thread_budget_cycles (production-default), so the
+       * runtime cost is one bl + the helper's early-out compare. */
+      if ((globalBBIdx % BUDGET_CHECK_STRIDE) == 0) {
+        B.CreateCall(CheckBudget, {});
+      }
+      globalBBIdx++;
     }
   }
 
