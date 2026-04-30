@@ -35,7 +35,7 @@ using namespace llvm;
 
 namespace coqui {
 
-static constexpr unsigned BATCH_SIZE_FOR_COVERAGE = 8192;
+static constexpr unsigned BATCH_SIZE_FOR_COVERAGE = 65536;
 
 /* Frequency of __coqui_check_thread_budget() emission. Once every N
  * static BBs (counted across the entire module's user functions). N=64

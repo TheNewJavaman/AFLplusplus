@@ -19,7 +19,7 @@
 struct afl_state;  /* forward */
 
 /* Tunable defaults. Override with env vars at runtime. */
-#define COQUI_DEFAULT_BATCH_SIZE 8192
+#define COQUI_DEFAULT_BATCH_SIZE 8192  /* keep default; cap raised to 65536 */
 #define COQUI_MAX_INPUT_DEFAULT  4096
 
 /* ------------------------------------------------------------------------
