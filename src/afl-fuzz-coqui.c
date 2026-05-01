@@ -140,17 +140,18 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   memset(ctx->k_cycles, 0, sizeof(ctx->k_cycles));
   ctx->k_batch_count = 0;
 
-  /* Per-thread clock64 budget poison (Exp #51). When AFL_COQUI_THREAD_BUDGET_US
-   * is set, write the cycle ceiling into __coqui_thread_budget_cycles. The
-   * Coverage pass emits a budget check at every Nth static BB; on overrun
-   * the runtime calls __coqui_trap_with_reason(THREAD_BUDGET_EXHAUSTED) so
-   * the thread exits cleanly instead of stalling the batch's healthy work.
-   * Default 0 = disabled (host-side cull/grace stays as the sole mechanism).
+  /* Per-thread clock64 budget poison. Write the cycle ceiling into
+   * __coqui_thread_budget_cycles. The Coverage pass emits a budget check at
+   * every Nth static BB; on overrun the runtime calls
+   * __coqui_trap_with_reason(THREAD_BUDGET_EXHAUSTED) so the thread exits
+   * cleanly instead of stalling the batch's healthy work.
+   *
+   * Default 200ms. Set AFL_COQUI_THREAD_BUDGET_US=0 to disable.
    *
    * Cycle conversion uses the device's reported clock_rate (kHz). On
    * RTX Titan that's ~1545000 kHz → 1545 cycles/us → 200ms ≈ 309M cycles. */
   unsigned long long thread_budget_us =
-      getenv_u64("AFL_COQUI_THREAD_BUDGET_US", 0);
+      getenv_u64("AFL_COQUI_THREAD_BUDGET_US", 200000);
   if (thread_budget_us > 0) {
     int clock_khz = 0;
     CUCHECK(cuDeviceGetAttribute(&clock_khz,
