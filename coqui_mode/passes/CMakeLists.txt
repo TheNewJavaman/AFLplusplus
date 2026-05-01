@@ -25,6 +25,7 @@ set(COQUI_PASS_SOURCES
     Libc.cpp
     Variadic.cpp
     Reloc.cpp
+    MemIntrinsics.cpp
     Math.cpp
     Complex.cpp
     StaticGlobals.cpp

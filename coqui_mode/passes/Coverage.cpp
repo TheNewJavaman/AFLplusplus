@@ -88,8 +88,10 @@ bool runCoverage(Module &M) {
 
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
-    /* Skip runtime helpers — they must not be instrumented */
+    /* Skip runtime helpers and libdevice — they must not be instrumented */
     if (F.getName().starts_with("__coqui_")) continue;
+    if (F.getName().starts_with("__nv_")) continue;
+    if (F.getName().starts_with("__internal_")) continue;
 
     uint64_t fnSeed = llvm::xxh3_64bits(F.getName());
 

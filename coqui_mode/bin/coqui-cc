@@ -102,7 +102,23 @@ def main():
     #     those definitions must be present when the pass runs (for InternalLinkage
     #     function creation) and when ptxas resolves the final PTX.
     with_runtime_bc = workdir / "with_runtime.bc"
-    run(["llvm-link", str(pruned_bc), RUNTIME_BC, "-o", str(with_runtime_bc)])
+    link_inputs = [str(pruned_bc), RUNTIME_BC]
+
+    # 3b-libdevice. Link NVIDIA's libdevice for optimized math (__nv_exp,
+    # __nv_sin, etc.). Opt-in via COQUI_LIBDEVICE=path (not default yet:
+    # libdevice uses NVPTX intrinsics that require llc sm_75+ to lower).
+    libdevice_bc = os.environ.get("COQUI_LIBDEVICE", "")
+    if libdevice_bc and os.path.isfile(libdevice_bc):
+        link_inputs.append(libdevice_bc)
+
+    run(["llvm-link", *link_inputs, "-o", str(with_runtime_bc)])
+
+    # Resolve __nvvm_reflect calls injected by libdevice (feature detection).
+    if libdevice_bc and os.path.isfile(libdevice_bc):
+        resolved_bc = workdir / "resolved.bc"
+        run(["opt", "-passes=nvvm-reflect", str(with_runtime_bc),
+             "-o", str(resolved_bc)])
+        with_runtime_bc = resolved_bc
 
     # 3c. opt with coqui pipeline
     # Forward --stack-size to the pass via -coqui-stack-size so the IR

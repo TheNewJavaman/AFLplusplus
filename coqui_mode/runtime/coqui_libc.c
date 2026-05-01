@@ -204,7 +204,7 @@ void *__coqui_memchr(const void *s, int c, unsigned long n) {
 }
 
 /* ===========================================================================
- * memcpy / memmove / memset
+ * memcpy / memmove / memset — byte-loop versions (legacy, explicit calls)
  * ===========================================================================*/
 
 void *__coqui_memcpy(void *dst, const void *src, unsigned long n) {
@@ -228,6 +228,96 @@ void *__coqui_memmove(void *dst, const void *src, unsigned long n) {
 void *__coqui_memset(void *s, int c, unsigned long n) {
     unsigned char *p = (unsigned char *)s;
     for (unsigned long i = 0; i < n; i++) p[i] = (unsigned char)c;
+    return s;
+}
+
+/* ===========================================================================
+ * memcpy_fast / memmove_fast / memset_fast — word-aligned transfers
+ *
+ * Used by the MemIntrinsics pass to replace llvm.memcpy/memset/memmove
+ * intrinsics which LLVM's NVPTX backend otherwise lowers to byte loops.
+ * Uses 8-byte transfers for the aligned body (8× fewer instructions).
+ * ===========================================================================*/
+
+void *__coqui_memcpy_fast(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+
+    /* Byte-copy head until dst is 8-byte aligned. */
+    while (n > 0 && ((unsigned long)d & 7)) {
+        *d++ = *s++;
+        --n;
+    }
+
+    /* Word copy (8 bytes at a time). */
+    unsigned long *dw = (unsigned long *)d;
+    const unsigned long *sw = (const unsigned long *)s;
+    unsigned long words = n >> 3;
+    for (unsigned long i = 0; i < words; i++)
+        dw[i] = sw[i];
+
+    /* Byte-copy tail. */
+    d = (unsigned char *)(dw + words);
+    s = (const unsigned char *)(sw + words);
+    unsigned long tail = n & 7;
+    for (unsigned long i = 0; i < tail; i++)
+        d[i] = s[i];
+
+    return dst;
+}
+
+void *__coqui_memmove_fast(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+
+    if (d < s || d >= s + n) {
+        return __coqui_memcpy_fast(dst, src, n);
+    }
+
+    /* Backward copy for overlapping regions. */
+    d += n;
+    s += n;
+
+    unsigned long tail = n & 7;
+    for (unsigned long i = 0; i < tail; i++)
+        *--d = *--s;
+
+    unsigned long words = n >> 3;
+    unsigned long *dw = (unsigned long *)d;
+    const unsigned long *sw = (const unsigned long *)s;
+    for (unsigned long i = words; i > 0; i--)
+        *--dw = *--sw;
+
+    return dst;
+}
+
+void *__coqui_memset_fast(void *s, int c, unsigned long n) {
+    unsigned char *p = (unsigned char *)s;
+    unsigned char val = (unsigned char)c;
+
+    /* Byte-fill head until 8-byte aligned. */
+    while (n > 0 && ((unsigned long)p & 7)) {
+        *p++ = val;
+        --n;
+    }
+
+    /* Word fill (broadcast byte to 8 bytes). */
+    unsigned long fill = val;
+    fill |= fill << 8;
+    fill |= fill << 16;
+    fill |= fill << 32;
+
+    unsigned long *pw = (unsigned long *)p;
+    unsigned long words = n >> 3;
+    for (unsigned long i = 0; i < words; i++)
+        pw[i] = fill;
+
+    /* Byte-fill tail. */
+    p = (unsigned char *)(pw + words);
+    unsigned long tail = n & 7;
+    for (unsigned long i = 0; i < tail; i++)
+        p[i] = val;
+
     return s;
 }
 

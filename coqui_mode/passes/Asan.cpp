@@ -719,8 +719,12 @@ bool runAsan(Module &M) {
     if (F.isDeclaration())
       continue;
 
-    // Skip runtime functions: __coqui_* prefix or coqui.noasan attribute.
+    // Skip runtime and libdevice functions.
     if (F.getName().starts_with("__coqui_"))
+      continue;
+    if (F.getName().starts_with("__nv_"))
+      continue;
+    if (F.getName().starts_with("__internal_"))
       continue;
     if (F.hasFnAttribute("coqui.noasan"))
       continue;

@@ -39,6 +39,7 @@ bool runExternalSymbolGatekeeper(Module &M) {
 
     /* Prefix-based allow */
     if (name.rfind("__coqui_", 0) == 0) continue;
+    if (name.rfind("__nv_", 0) == 0) continue;    /* libdevice math */
     if (name.rfind("__llvm_", 0) == 0) continue;
     if (name.rfind("llvm.", 0) == 0) continue;   /* defense-in-depth */
 
