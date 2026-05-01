@@ -148,8 +148,12 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
    *
    * Default 200ms. Set AFL_COQUI_THREAD_BUDGET_US=0 to disable.
    *
-   * Cycle conversion uses the device's reported clock_rate (kHz). On
-   * RTX Titan that's ~1545000 kHz → 1545 cycles/us → 200ms ≈ 309M cycles. */
+   * Cycle conversion: CU_DEVICE_ATTRIBUTE_CLOCK_RATE returns the SM base
+   * clock (kHz). clock64() on-device ticks at the ACTUAL SM frequency
+   * (including boost), so the real timeout varies ±15% with GPU boost state.
+   * This is fine — budget poison is a coarse safety net, not a precision
+   * timer. There's no CUDA driver API to query the live boost clock; nvidia-
+   * smi can report it but the value changes continuously under load. */
   unsigned long long thread_budget_us =
       getenv_u64("AFL_COQUI_THREAD_BUDGET_US", 200000);
   if (thread_budget_us > 0) {
