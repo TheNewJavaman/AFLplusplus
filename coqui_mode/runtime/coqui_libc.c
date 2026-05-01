@@ -239,16 +239,98 @@ void *__coqui_memset(void *s, int c, unsigned long n) {
  * Uses 8-byte transfers for the aligned body (8× fewer instructions).
  * ===========================================================================*/
 
-void *__coqui_memcpy_fast(void *dst, const void *src, unsigned long n) {
-    return __coqui_memcpy(dst, src, n);
+/* --- 8-byte aligned variants (compiler proved both ptrs ≥ 8-aligned) --- */
+
+void *__coqui_memcpy_a8(void *dst, const void *src, unsigned long n) {
+    unsigned long *d8 = (unsigned long *)dst;
+    const unsigned long *s8 = (const unsigned long *)src;
+    unsigned long words = n >> 3;
+    for (unsigned long i = 0; i < words; i++)
+        d8[i] = s8[i];
+    unsigned char *dt = (unsigned char *)(d8 + words);
+    const unsigned char *st = (const unsigned char *)(s8 + words);
+    for (unsigned long i = 0; i < (n & 7); i++)
+        dt[i] = st[i];
+    return dst;
 }
 
-void *__coqui_memmove_fast(void *dst, const void *src, unsigned long n) {
-    return __coqui_memmove(dst, src, n);
+void *__coqui_memmove_a8(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    if (d < s || d >= s + n)
+        return __coqui_memcpy_a8(dst, src, n);
+    /* backward 8-byte copy */
+    unsigned long tail = n & 7;
+    d += n; s += n;
+    for (unsigned long i = 0; i < tail; i++)
+        *--d = *--s;
+    unsigned long *d8 = (unsigned long *)d;
+    const unsigned long *s8 = (const unsigned long *)s;
+    for (unsigned long i = (n >> 3); i > 0; i--)
+        *--d8 = *--s8;
+    return dst;
 }
 
-void *__coqui_memset_fast(void *s, int c, unsigned long n) {
-    return __coqui_memset(s, c, n);
+void *__coqui_memset_a8(void *s, int c, unsigned long n) {
+    unsigned char val = (unsigned char)c;
+    unsigned long fill = val;
+    fill |= fill << 8;
+    fill |= fill << 16;
+    fill |= fill << 32;
+    unsigned long *p8 = (unsigned long *)s;
+    unsigned long words = n >> 3;
+    for (unsigned long i = 0; i < words; i++)
+        p8[i] = fill;
+    unsigned char *pt = (unsigned char *)(p8 + words);
+    for (unsigned long i = 0; i < (n & 7); i++)
+        pt[i] = val;
+    return s;
+}
+
+/* --- 4-byte aligned variants (compiler proved both ptrs ≥ 4-aligned) --- */
+
+void *__coqui_memcpy_a4(void *dst, const void *src, unsigned long n) {
+    unsigned int *d4 = (unsigned int *)dst;
+    const unsigned int *s4 = (const unsigned int *)src;
+    unsigned long words = n >> 2;
+    for (unsigned long i = 0; i < words; i++)
+        d4[i] = s4[i];
+    unsigned char *dt = (unsigned char *)(d4 + words);
+    const unsigned char *st = (const unsigned char *)(s4 + words);
+    for (unsigned long i = 0; i < (n & 3); i++)
+        dt[i] = st[i];
+    return dst;
+}
+
+void *__coqui_memmove_a4(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    if (d < s || d >= s + n)
+        return __coqui_memcpy_a4(dst, src, n);
+    unsigned long tail = n & 3;
+    d += n; s += n;
+    for (unsigned long i = 0; i < tail; i++)
+        *--d = *--s;
+    unsigned int *d4 = (unsigned int *)d;
+    const unsigned int *s4 = (const unsigned int *)s;
+    for (unsigned long i = (n >> 2); i > 0; i--)
+        *--d4 = *--s4;
+    return dst;
+}
+
+void *__coqui_memset_a4(void *s, int c, unsigned long n) {
+    unsigned char val = (unsigned char)c;
+    unsigned int fill = val;
+    fill |= fill << 8;
+    fill |= fill << 16;
+    unsigned int *p4 = (unsigned int *)s;
+    unsigned long words = n >> 2;
+    for (unsigned long i = 0; i < words; i++)
+        p4[i] = fill;
+    unsigned char *pt = (unsigned char *)(p4 + words);
+    for (unsigned long i = 0; i < (n & 3); i++)
+        pt[i] = val;
+    return s;
 }
 
 /* ===========================================================================
