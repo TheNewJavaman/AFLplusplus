@@ -276,15 +276,6 @@ bool runFuzzEntry(Module &M) {
   /* PHASE_START = 1 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 1)});
 
-  /* Per-thread budget poison init (Exp #51). Stamps clock64() into
-   * __coqui_thread_budget_start[tid]. The runtime helper is
-   * always_inline and short-circuits when the host hasn't enabled the
-   * budget (cycles_cap == 0), so production-default cost is a single
-   * global load + branch-not-taken per thread. */
-  FunctionCallee BudgetInit = M.getOrInsertFunction(
-      "__coqui_thread_budget_init", VoidNoArg);
-  Builder.CreateCall(BudgetInit, {});
-
   /* clk_a: start of instrumented body */
   Value *clkA = Builder.CreateCall(Clock64, {}, "clk_a");
 
@@ -301,6 +292,64 @@ bool runFuzzEntry(Module &M) {
      off is i32; widen to i64 for pointer arithmetic */
   Value *off64    = Builder.CreateZExt(off, i64, "off64");
   Value *inputPtr = Builder.CreateGEP(i8, inputBytes, {off64}, "input_ptr");
+
+  /* GPU-side mutation — fixed-size per-thread slots.
+   *
+   * If __coqui_gpu_mutate_enabled is set (AFL_COQUI_GPU_MUTATE=1), each
+   * thread applies havoc mutations to its input buffer BEFORE calling the
+   * harness. The mutation operates in-place on the global memory input
+   * buffer. `len` is stored to a stack alloca so the mutation function
+   * can modify it via pointer; afterwards we reload the (potentially
+   * changed) length for the harness call.
+   *
+   * max_len: read from the device-global __coqui_mutate_max_input_size
+   * (set by the host at init). With fixed-size per-thread slots, each
+   * thread owns max_input_size bytes, so grow mutations (clone, insert)
+   * can safely expand into the slot padding without overwriting adjacent
+   * threads' data. */
+  {
+    /* Declare __coqui_mutate_input(u32 tid, u8* buf, u32* len_ptr, u32 max_len) */
+    FunctionCallee MutateInput = M.getOrInsertFunction(
+        "__coqui_mutate_input",
+        FunctionType::get(voidT, {i32, i8p, i8p, i32}, false));
+
+    /* Read max_input_size from device global (set by host at coqui_init). */
+    GlobalVariable *MaxInputSize =
+        M.getGlobalVariable("__coqui_mutate_max_input_size", true);
+    if (!MaxInputSize) {
+      MaxInputSize = new GlobalVariable(
+          M, i32, /*isConstant=*/false, GlobalValue::ExternalLinkage,
+          nullptr, "__coqui_mutate_max_input_size");
+    }
+    Value *maxLen = Builder.CreateLoad(i32, MaxInputSize, "max_input_size");
+
+    /* Alloca for len so mutation can modify it via pointer. */
+    IRBuilder<> AllocaBuilder(&Kernel->getEntryBlock(),
+                               Kernel->getEntryBlock().getFirstInsertionPt());
+    Value *lenSlot = AllocaBuilder.CreateAlloca(i32, nullptr, "mutate_len_slot");
+
+    /* Store current len, call mutate, reload.
+     * max_len = max_input_size: grow mutations expand within the fixed slot. */
+    Builder.CreateStore(len, lenSlot);
+    Builder.CreateCall(MutateInput, {tid, inputPtr, lenSlot, maxLen});
+    len = Builder.CreateLoad(i32, lenSlot, "len_post_mutate");
+
+    /* Write the mutated length back to the device lens array so the host
+     * can D2H copy it after kernel completion. Without this, the host
+     * reads the original (pre-mutation) length and saves the wrong bytes
+     * when exporting novel inputs. */
+    Builder.CreateStore(len, lensPtr);
+  }
+
+  /* Per-thread budget poison init (Exp #51). Stamps clock64() into
+   * __coqui_thread_budget_start[tid]. Placed AFTER GPU mutation so the
+   * budget clock only polices harness execution time, not mutation time.
+   * The runtime helper is always_inline and short-circuits when the host
+   * hasn't enabled the budget (cycles_cap == 0), so production-default
+   * cost is a single global load + branch-not-taken per thread. */
+  FunctionCallee BudgetInit = M.getOrInsertFunction(
+      "__coqui_thread_budget_init", VoidNoArg);
+  Builder.CreateCall(BudgetInit, {});
 
   /* len64 = zext len to i64 */
   Value *len64 = Builder.CreateZExt(len, i64, "len64");

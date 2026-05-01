@@ -2085,6 +2085,12 @@ custom_mutator_stage:
 
 havoc_stage:
 
+  /* GPU mutation: tell the device to mutate during havoc/splice stages.
+   * The host sends unmutated parents; the GPU applies per-thread havoc. */
+  if (afl->coqui && afl->coqui->gpu_mutate_enabled) {
+    afl->coqui->gpu_mutate_active = 1;
+  }
+
 #ifdef INTROSPECTION
 
   if (!is_logged) {
@@ -3496,7 +3502,19 @@ havoc_stage:
 
     }
 
-    if (common_fuzz_stuff(afl, out_buf, temp_len)) { goto abandon_entry; }
+    /* GPU mutation (power-schedule mode): submit the unmutated parent ONCE.
+     * coqui_submit_input broadcasts it to round_up_32(stage_max) consecutive
+     * slots; each GPU thread independently applies 1+rand_below(stack_max)
+     * stacked havoc mutations from its own PRNG. After the single submit,
+     * fast-forward stage_cur to skip remaining host-side havoc iterations
+     * (the GPU handles them all in parallel). */
+    if (afl->coqui && afl->coqui->gpu_mutate_active) {
+      if (common_fuzz_stuff(afl, in_buf, len)) { goto abandon_entry; }
+      /* Fast-forward: all stage_max iterations are parallelized on GPU. */
+      afl->stage_cur = afl->stage_max;
+    } else {
+      if (common_fuzz_stuff(afl, out_buf, temp_len)) { goto abandon_entry; }
+    }
 
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
@@ -3674,6 +3692,11 @@ retry_splicing:
 
 /* we are through with this queue entry - for this iteration */
 abandon_entry:
+
+  /* Clear GPU mutation active flag when leaving havoc/splice. */
+  if (afl->coqui && afl->coqui->gpu_mutate_active) {
+    afl->coqui->gpu_mutate_active = 0;
+  }
 
   /* IJON queue protection only - memory cleanup handled normally */
   if (unlikely(afl->is_doing_ijon)) {
@@ -5232,6 +5255,11 @@ skip_extras:
 havoc_stage:
 pacemaker_fuzzing:
 
+  /* GPU mutation: activate during MOpt havoc/splice. */
+  if (afl->coqui && afl->coqui->gpu_mutate_enabled) {
+    afl->coqui->gpu_mutate_active = 1;
+  }
+
   afl->stage_cur_byte = -1;
 
   /* The havoc stage mutation code is also invoked when splicing files; if the
@@ -5966,10 +5994,17 @@ pacemaker_fuzzing:
 
         u64 temp_total_found = afl->queued_items + afl->saved_crashes;
 
-        if (common_fuzz_stuff(afl, out_buf, temp_len)) {
-
-          goto abandon_entry_puppet;
-
+        /* GPU mutation (power-schedule mode): submit unmutated parent once,
+         * fast-forward stage_cur -- GPU handles all iterations in parallel. */
+        if (afl->coqui && afl->coqui->gpu_mutate_active) {
+          if (common_fuzz_stuff(afl, in_buf, len)) {
+            goto abandon_entry_puppet;
+          }
+          afl->stage_cur = afl->stage_max;
+        } else {
+          if (common_fuzz_stuff(afl, out_buf, temp_len)) {
+            goto abandon_entry_puppet;
+          }
         }
 
         /* out_buf might have been mangled a bit, so let's restore it to its
@@ -6140,6 +6175,11 @@ pacemaker_fuzzing:
 
     abandon_entry:
     abandon_entry_puppet:
+
+      /* Clear GPU mutation active flag when leaving MOpt havoc/splice. */
+      if (afl->coqui && afl->coqui->gpu_mutate_active) {
+        afl->coqui->gpu_mutate_active = 0;
+      }
 
       if ((s64)splice_cycle >= afl->SPLICE_CYCLES_puppet) {
 
