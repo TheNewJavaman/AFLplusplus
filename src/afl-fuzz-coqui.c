@@ -336,19 +336,28 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
           static_usage, CALL_HEADROOM_BYTES, total_budget, deficit);
   }
 
-  /* 6. Batch sizing (with u64 overflow protection from coqui mode T3.6 fixup) */
+  /* 6. Batch sizing -- fixed-size per-thread slots.
+   *
+   * Each GPU thread gets a fixed max_input_size slot so grow mutations
+   * (clone, insert -- 8 of 37 havoc cases) can expand into padding.
+   * Total device buffer = batch_size * max_input_size per batch half.
+   * At defaults (8192 * 4096) this is 32 MB -- well within GPU VRAM. */
   ctx->batch_size = getenv_u32("AFL_COQUI_BATCH_SIZE", COQUI_DEFAULT_BATCH_SIZE);
   /* Kernel grid = batch_size/128 (block-size 128 threads). batch_size must be
    * a positive multiple of 128, capped to keep ping-pong buffers reasonable. */
   if (ctx->batch_size < 128) ctx->batch_size = 128;
   if (ctx->batch_size > 65536) ctx->batch_size = 65536;
   ctx->batch_size = (ctx->batch_size / 128) * 128;
-  ctx->max_input_size = afl->max_length ? afl->max_length : 4096;
-  unsigned long long budget64 = ((unsigned long long)ctx->batch_size
-                                  * ctx->max_input_size) / 4;
-  unsigned long long floor64 = (unsigned long long)ctx->max_input_size * 256;
-  if (budget64 < floor64) budget64 = floor64;
-  if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;  /* MAX_ALLOC cap */
+  /* Per-thread slot size for GPU buffers. Defaults to COQUI_MAX_INPUT_DEFAULT
+   * (4096). Inputs larger than max_input_size are skipped (oversized_count++).
+   * Overridable via AFL_COQUI_MAX_INPUT_SIZE. */
+  ctx->max_input_size = getenv_u32("AFL_COQUI_MAX_INPUT_SIZE",
+                                    COQUI_MAX_INPUT_DEFAULT);
+  if (ctx->max_input_size < 16) ctx->max_input_size = 16;
+  /* Fixed-size slots: each thread owns max_input_size bytes. */
+  unsigned long long budget64 = (unsigned long long)ctx->batch_size
+                                  * ctx->max_input_size;
+  if (budget64 > 0x40000000ULL) budget64 = 0x40000000ULL;  /* 1 GB cap */
   ctx->byte_budget = (unsigned int)budget64;
   ctx->map_size = 65536;
 
@@ -529,6 +538,167 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
       OKF("coqui oracle: trace buffer %llu B (%u threads × %u B), "
           "counts %llu B; bound to __coqui_trace_buffer/count",
           buf_bytes, ctx->batch_size, COQUI_TRACE_BUFFER_BYTES, count_bytes);
+    }
+  }
+
+  /* GPU-side mutation (Phase 2+3). When AFL_COQUI_GPU_MUTATE=1, enable
+   * per-thread havoc mutations on the GPU before calling the harness.
+   * The host seeds per-thread PRNG state before each batch launch.
+   *
+   * Power-schedule mode: the host broadcasts each parent to
+   * round_up_32(stage_max) consecutive slots. Each thread picks its own
+   * stacking depth from its PRNG: steps = 1 + rand_below(stack_max).
+   * stack_max starts at 4, bumped to 8 after 10 minutes (mirrors AFL). */
+  ctx->gpu_mutate_enabled = 0;
+  ctx->gpu_mutate_active = 0;
+  ctx->d_mutate_flag = 0;
+  ctx->d_mutate_prng = 0;
+  ctx->d_mutate_prng_sz = 0;
+  ctx->h_mutate_prng = NULL;
+  ctx->d_mutate_stack_max = 0;
+  {
+    const char *gm_env = getenv("AFL_COQUI_GPU_MUTATE");
+    if (gm_env && atoi(gm_env) == 1) {
+      ctx->gpu_mutate_enabled = 1;
+
+      /* Get device symbol pointers for PRNG, enable flag, stack_max, max_input. */
+      CUdeviceptr d_prng_sym;
+      size_t prng_sz;
+      CUCHECK(cuModuleGetGlobal(&d_prng_sym, &prng_sz, mod,
+                                 "__coqui_mutate_prng"));
+      ctx->d_mutate_prng = (unsigned long long)d_prng_sym;
+      ctx->d_mutate_prng_sz = prng_sz;
+
+      /* Store enable-flag device address for per-batch toggling.
+       * Flag starts at 0; set to 1 only during havoc/splice batches. */
+      CUdeviceptr d_flag;
+      size_t flag_sz;
+      CUCHECK(cuModuleGetGlobal(&d_flag, &flag_sz, mod,
+                                 "__coqui_gpu_mutate_enabled"));
+      ctx->d_mutate_flag = (unsigned long long)d_flag;
+      u8 zero = 0;
+      CUCHECK(cuMemcpyHtoD(d_flag, &zero, 1));
+
+      /* Per-thread stacking depth ceiling. Each GPU thread computes
+       * steps = 1 + rand_below(stack_max). Initial value = 4 (matches
+       * AFL's havoc_stack_pow2=1 -> stack_max = 1<<(1+1) = 4). Updated
+       * to 8 after 10 min by the host pump (see coqui_launch_batch). */
+      CUdeviceptr d_stack_max;
+      size_t stack_max_sz;
+      CUCHECK(cuModuleGetGlobal(&d_stack_max, &stack_max_sz, mod,
+                                 "__coqui_mutate_stack_max"));
+      ctx->d_mutate_stack_max = (unsigned long long)d_stack_max;
+      u32 initial_stack_max = 4;
+      CUCHECK(cuMemcpyHtoD(d_stack_max, &initial_stack_max, sizeof(u32)));
+
+      /* Set max_input_size on device so mutation knows the buffer bound. */
+      u32 mis = ctx->max_input_size;
+      CUdeviceptr d_mis;
+      size_t mis_sz;
+      CUCHECK(cuModuleGetGlobal(&d_mis, &mis_sz, mod,
+                                 "__coqui_mutate_max_input_size"));
+      CUCHECK(cuMemcpyHtoD(d_mis, &mis, sizeof(u32)));
+
+      /* Allocate pinned host buffer for per-batch PRNG seeds. */
+      CUCHECK(cuMemHostAlloc((void**)&ctx->h_mutate_prng,
+                              ctx->batch_size * 2 * sizeof(u64), 0));
+
+      /* Per-parent H2D parent table (Change 1: sparse H2D).
+       *
+       * Allocate device buffers for the compact parent table and bind
+       * their addresses into the cubin's pointer-sized globals. The host
+       * packs unique parents into h_parent_bytes before each batch and
+       * H2D-copies only the compact data; the GPU mutation wrapper reads
+       * from the parent table instead of from per-thread input slots. */
+      {
+        /* Parent bytes buffer -- same size as one batch half's input buffer
+         * (byte_budget). In practice, unique parents << batch_size so the
+         * actual H2D will be much smaller. */
+        CUdeviceptr dp;
+        CUCHECK(cuMemAlloc(&dp, ctx->byte_budget));
+        ctx->d_parent_bytes = (unsigned long long)dp;
+
+        /* Bind pointer into cubin global. */
+        CUdeviceptr sym; size_t sym_sz;
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_parent_bytes"));
+        CUCHECK(cuMemcpyHtoD(sym, &dp, sizeof(CUdeviceptr)));
+
+        /* Parent offsets -- one u32 per potential parent (max = batch_size). */
+        CUCHECK(cuMemAlloc(&dp, ctx->batch_size * sizeof(u32)));
+        ctx->d_parent_offsets = (unsigned long long)dp;
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_parent_offsets"));
+        CUCHECK(cuMemcpyHtoD(sym, &dp, sizeof(CUdeviceptr)));
+
+        /* Parent lens -- one u32 per potential parent. */
+        CUCHECK(cuMemAlloc(&dp, ctx->batch_size * sizeof(u32)));
+        ctx->d_parent_lens = (unsigned long long)dp;
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_parent_lens"));
+        CUCHECK(cuMemcpyHtoD(sym, &dp, sizeof(CUdeviceptr)));
+
+        /* Per-thread parent index -- one u32 per thread. */
+        CUCHECK(cuMemAlloc(&dp, ctx->batch_size * sizeof(u32)));
+        ctx->d_parent_idx = (unsigned long long)dp;
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_parent_idx"));
+        CUCHECK(cuMemcpyHtoD(sym, &dp, sizeof(CUdeviceptr)));
+
+        /* Host pinned buffers for parent table staging. */
+        CUCHECK(cuMemHostAlloc((void**)&ctx->h_parent_bytes,
+                                ctx->byte_budget, 0));
+        CUCHECK(cuMemHostAlloc((void**)&ctx->h_parent_offsets,
+                                ctx->batch_size * sizeof(u32), 0));
+        CUCHECK(cuMemHostAlloc((void**)&ctx->h_parent_lens,
+                                ctx->batch_size * sizeof(u32), 0));
+        CUCHECK(cuMemHostAlloc((void**)&ctx->h_parent_idx,
+                                ctx->batch_size * sizeof(u32), 0));
+        ctx->parent_count = 0;
+        ctx->parent_bytes_used = 0;
+      }
+
+      /* Bind __coqui_parent_count device global (for splice: GPU threads need
+       * to know how many parents are in the current batch). */
+      {
+        CUdeviceptr sym; size_t sym_sz;
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_parent_count"));
+        ctx->d_parent_count = (unsigned long long)sym;
+        u32 zero_pc = 0;
+        CUCHECK(cuMemcpyHtoD(sym, &zero_pc, sizeof(u32)));
+      }
+
+      /* Dictionary (extras) device-global binding.
+       *
+       * The device-side arrays are fixed-size (declared in coqui_runtime.c as
+       * arrays, not pointers). We just need their addresses to cuMemcpyHtoD
+       * packed data before each batch. No cuMemAlloc needed — the globals are
+       * baked into the cubin's .bss / .data. */
+      {
+        CUdeviceptr sym; size_t sym_sz;
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_extras_data"));
+        ctx->d_extras_data = (unsigned long long)sym;
+
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_extras_offsets"));
+        ctx->d_extras_offsets = (unsigned long long)sym;
+
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_extras_lens"));
+        ctx->d_extras_lens = (unsigned long long)sym;
+
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_extras_cnt"));
+        ctx->d_extras_cnt = (unsigned long long)sym;
+
+        CUCHECK(cuModuleGetGlobal(&sym, &sym_sz, mod, "__coqui_a_extras_cnt"));
+        ctx->d_a_extras_cnt = (unsigned long long)sym;
+
+        /* Initialize counts to zero on device. */
+        u32 zero = 0;
+        CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->d_extras_cnt, &zero, sizeof(u32)));
+        CUCHECK(cuMemcpyHtoD((CUdeviceptr)ctx->d_a_extras_cnt, &zero, sizeof(u32)));
+
+        ctx->last_extras_cnt = 0;
+        ctx->last_a_extras_cnt = 0;
+      }
+
+      OKF("coqui GPU mutation: ENABLED (power-schedule, stack_max=4, max_input=%u, "
+          "sparse H2D/D2H, dict+splice)",
+          mis);
     }
   }
 
@@ -728,16 +898,40 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
   unsigned long long _htod_t0;
   STAMP_US(_htod_t0);
 
-  /* H->D — only copy the live prefix of input_bytes. Kernel reads only
-   * input_bytes[offsets[tid]..+lens[tid]] and empty-slot threads
-   * (lens[tid]==0) short-circuit at FuzzEntry.cpp L112-113 before any
-   * read. Stale tail from previous batches is inert. Round up to
-   * 8-byte alignment to match the slot cursor maintained by
-   * coqui_submit_input (off = (bytes_used + 7) & ~7u). */
-  size_t input_bytes_len = (b->bytes_used + 7u) & ~(size_t)7u;
-  if (input_bytes_len > 0) {
-    CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_bytes,
-                               b->h_input_bytes, input_bytes_len, s));
+  /* H->D input data.
+   *
+   * GPU-mutate path (Change 1: per-parent H2D): instead of broadcasting
+   * each parent to all its thread slots (128 MB), upload the compact
+   * parent table: unique parent bytes + offsets + lens + per-thread index.
+   * Total H2D drops from ~128 MB to ~1 MB (n_parents * avg_len + 3 small
+   * metadata arrays).
+   *
+   * Non-mutate path: copy the used portion of input_bytes as before. */
+  if (ctx->gpu_mutate_active && ctx->parent_count > 0) {
+    /* Compact parent bytes -- only the packed unique parents. */
+    size_t parent_data_len = (ctx->parent_bytes_used + 7u) & ~(size_t)7u;
+    if (parent_data_len > 0) {
+      CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_parent_bytes,
+                                 ctx->h_parent_bytes, parent_data_len, s));
+    }
+    /* Parent offsets + lens -- one u32 per unique parent. */
+    CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_parent_offsets,
+                               ctx->h_parent_offsets,
+                               ctx->parent_count * sizeof(u32), s));
+    CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_parent_lens,
+                               ctx->h_parent_lens,
+                               ctx->parent_count * sizeof(u32), s));
+    /* Per-thread parent index -- one u32 per active thread. */
+    CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_parent_idx,
+                               ctx->h_parent_idx,
+                               b->n_inputs * sizeof(u32), s));
+  } else {
+    /* Non-mutate: copy input_bytes as before. */
+    size_t input_bytes_len = (b->bytes_used + 7u) & ~(size_t)7u;
+    if (input_bytes_len > 0) {
+      CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_input_bytes,
+                                 b->h_input_bytes, input_bytes_len, s));
+    }
   }
   CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)b->d_offsets,
                              b->h_offsets, ctx->batch_size * 4, s));
@@ -802,6 +996,126 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                              count_bytes, s));
   }
 
+  /* GPU mutation: toggle the device-side enable flag per batch.
+   * During havoc/splice the host sends unmutated parents and the GPU mutates;
+   * during deterministic stages the flag is 0 so the GPU runs the input
+   * as-is. */
+  if (ctx->gpu_mutate_enabled) {
+    u8 flag = ctx->gpu_mutate_active;
+    CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_mutate_flag,
+                               &flag, 1, s));
+
+    /* Update stack_max based on run_over10m (mirrors AFL's havoc_stack_pow2
+     * bump: 4 early, 8 after 10 min). Only HtoD when the value changes. */
+    if (flag && ctx->d_mutate_stack_max) {
+      u32 new_sm = afl->run_over10m ? 8 : 4;
+      /* Cheap: always write the 4-byte value. HtoD on stream is negligible
+       * vs the batch size, and avoids tracking a cached value. */
+      CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_mutate_stack_max,
+                                 &new_sm, sizeof(u32), s));
+    }
+
+    /* PRNG seeding: fill per-thread seed pairs and HtoD before kernel
+     * launch so each thread has unique, non-repeating havoc entropy.
+     * In power-schedule mode each parent group has n_threads slots; each
+     * thread gets a unique seed derived from the host PRNG + thread index. */
+    if (flag) {
+      for (u32 i = 0; i < b->n_inputs; i++) {
+        ctx->h_mutate_prng[i * 2]     = rand_next(afl) ^ (u64)i;
+        ctx->h_mutate_prng[i * 2 + 1] = rand_next(afl) ^ ((u64)i << 32);
+      }
+      CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_mutate_prng,
+                                 ctx->h_mutate_prng,
+                                 b->n_inputs * 2 * sizeof(u64), s));
+
+      /* Upload parent_count so splice mutations know how many parents
+       * are available in this batch. */
+      CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_parent_count,
+                                 &ctx->parent_count, sizeof(u32), s));
+
+      /* Dictionary sync: upload extras/a_extras to device when counts change.
+       *
+       * Regular extras (user dict, -x flag) and auto-extras (auto-discovered
+       * tokens) are packed contiguously in the device-global arrays:
+       *   slots [0, extras_cnt)         → regular extras
+       *   slots [extras_cnt, extras_cnt+a_extras_cnt) → auto-extras
+       *
+       * We check if either count changed since the last sync. Since extras
+       * are typically small and infrequently updated (a_extras stabilize
+       * after the first few minutes), this sync path is cold. */
+      if (afl->extras_cnt != ctx->last_extras_cnt ||
+          afl->a_extras_cnt != ctx->last_a_extras_cnt) {
+
+        u32 n_extras = afl->extras_cnt < COQUI_MAX_EXTRAS ?
+                       afl->extras_cnt : COQUI_MAX_EXTRAS;
+        u32 n_a_extras = afl->a_extras_cnt;
+        u32 total_slots = n_extras + n_a_extras;
+        if (total_slots > COQUI_MAX_EXTRAS) {
+          n_a_extras = COQUI_MAX_EXTRAS - n_extras;
+          total_slots = COQUI_MAX_EXTRAS;
+        }
+
+        /* Pack extras into staging buffers. The data buffer is 128KB which
+         * is too large for the stack; heap-allocate it. Offsets/lens are
+         * 16KB each — acceptable on the stack. */
+        u32 h_offsets[COQUI_MAX_EXTRAS];
+        u32 h_lens[COQUI_MAX_EXTRAS];
+        u8 *h_data = (u8 *)malloc(COQUI_MAX_EXTRAS_BYTES);
+        if (!h_data) { PFATAL("malloc extras staging"); }
+        u32 data_offset = 0;
+
+        /* Regular extras */
+        for (u32 i = 0; i < n_extras; i++) {
+          u32 elen = afl->extras[i].len;
+          if (data_offset + elen > COQUI_MAX_EXTRAS_BYTES) {
+            n_extras = i;  /* truncate */
+            total_slots = n_extras + n_a_extras;
+            break;
+          }
+          h_offsets[i] = data_offset;
+          h_lens[i] = elen;
+          memcpy(h_data + data_offset, afl->extras[i].data, elen);
+          data_offset += elen;
+        }
+
+        /* Auto-extras (appended after regular extras) */
+        for (u32 i = 0; i < n_a_extras; i++) {
+          u32 elen = afl->a_extras[i].len;
+          if (data_offset + elen > COQUI_MAX_EXTRAS_BYTES) {
+            n_a_extras = i;  /* truncate */
+            total_slots = n_extras + n_a_extras;
+            break;
+          }
+          h_offsets[n_extras + i] = data_offset;
+          h_lens[n_extras + i] = elen;
+          memcpy(h_data + data_offset, afl->a_extras[i].data, elen);
+          data_offset += elen;
+        }
+
+        /* Upload to device (synchronous — dict changes are rare). */
+        if (data_offset > 0) {
+          CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_extras_data,
+                                     h_data, data_offset, s));
+        }
+        if (total_slots > 0) {
+          CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_extras_offsets,
+                                     h_offsets, total_slots * sizeof(u32), s));
+          CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_extras_lens,
+                                     h_lens, total_slots * sizeof(u32), s));
+        }
+        CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_extras_cnt,
+                                   &n_extras, sizeof(u32), s));
+        CUCHECK(cuMemcpyHtoDAsync((CUdeviceptr)ctx->d_a_extras_cnt,
+                                   &n_a_extras, sizeof(u32), s));
+
+        free(h_data);
+
+        ctx->last_extras_cnt = afl->extras_cnt;
+        ctx->last_a_extras_cnt = afl->a_extras_cnt;
+      }
+    }
+  }
+
   unsigned long long _htod_t1;
   STAMP_US(_htod_t1);
   ctx->t_htod_us += (_htod_t1 - _htod_t0);
@@ -832,6 +1146,23 @@ static void coqui_launch_batch(afl_state_t *afl, coqui_batch_t *b) {
                              ctx->batch_size / 8, s));
   CUCHECK(cuMemcpyDtoHAsync(b->h_status, (CUdeviceptr)b->d_status,
                              ctx->batch_size * sizeof(coqui_status_t), s));
+
+  /* GPU-mutate novel-export (Change 2: sparse D2H).
+   *
+   * OLD: full D2H of n_inputs * max_input_size (~128 MB) + all lens.
+   * NEW: D2H only the lens array here (128 KB). The actual mutated bytes
+   * are fetched per-novel-thread in coqui_await_and_process AFTER the
+   * kernel completes, using synchronous cuMemcpyDtoH for only the novel
+   * threads (~0.1% of batch). This reduces D2H from ~128 MB to ~10 KB.
+   *
+   * The lens array must be read back in full because we need it for:
+   *   (a) the trap_reason scan (needs lens to know valid inputs)
+   *   (b) the crash-verify loop (needs lens for non-novel crashed inputs)
+   * Both run before we know which threads are novel. */
+  if (ctx->gpu_mutate_active) {
+    CUCHECK(cuMemcpyDtoHAsync(b->h_input_lens, (CUdeviceptr)b->d_input_lens,
+                               ctx->batch_size * sizeof(u32), s));
+  }
 
   CUCHECK(cuEventRecord((CUevent)b->completion_event, s));
   ctx->launch_count++;
@@ -1108,6 +1439,43 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
+  /* Sparse D2H for GPU-mutated inputs (Change 2).
+   *
+   * When GPU mutation is active, the mutated bytes live only on the device
+   * (the host never sent them -- it sent the compact parent table, and the
+   * GPU mutation wrapper populated per-thread output slots). We must D2H
+   * the mutated bytes for every thread whose input will be consumed by the
+   * host: novel threads, trapped threads, and crashed threads.
+   *
+   * Scan novelty bitmap + status to identify which threads need bytes,
+   * then issue per-thread synchronous D2H copies. At ~0.1% novelty rate,
+   * this fetches ~33 threads * ~100 bytes = ~3 KB instead of 128 MB.
+   *
+   * The synchronous cuMemcpyDtoH calls complete immediately (no need for
+   * additional sync). */
+  if (ctx->gpu_mutate_active) {
+    for (u32 i = 0; i < ctx->batch_size; i++) {
+      if (b->h_input_lens[i] == 0) continue;
+
+      /* Check if this thread's bytes are needed:
+       * - Novel (novelty bitmap bit set)
+       * - Trapped (trap_reason != NONE -- OOM/stack/budget)
+       * - Crashed (asan_error || ubsan_fatal || signal) */
+      u8 novel = (b->h_novelty[i / 8] >> (i % 8)) & 1;
+      u8 trapped = b->h_status[i].trap_reason != COQUI_TRAP_NONE;
+      u8 crashed = b->h_status[i].asan_error ||
+                   b->h_status[i].ubsan_fatal ||
+                   b->h_status[i].signal;
+      if (!novel && !trapped && !crashed) continue;
+
+      /* D2H this thread's mutated bytes. */
+      u32 off = b->h_offsets[i];
+      u32 len = b->h_input_lens[i];
+      CUCHECK(cuMemcpyDtoH(b->h_input_bytes + off,
+                            (CUdeviceptr)(b->d_input_bytes + off), len));
+    }
+  }
+
   /* Scan for inputs that caused the device runtime to call
    * __coqui_trap_with_reason() (OOM or stack overflow). These did NOT
    * record a crash or novelty on the GPU because they exited too
@@ -1115,7 +1483,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
    * memory constraint doesn't apply. This is the single place where
    * the correctness invariant "every input either completes on the
    * GPU with a recorded outcome OR is rerun on the CPU" is enforced
-   * — so the scan runs before the novelty + crash loops so dedup
+   * -- so the scan runs before the novelty + crash loops so dedup
    * (which is GPU-outcome based) can't suppress an OOM rerun. */
   {
     u64 oom_this_batch = 0;
@@ -1381,18 +1749,18 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
   coqui_batch_t *b = ctx->pending;
 
   ctx->total_submits++;
-  /* Count each submission as one exec — the corresponding increment in
+  /* Count each submission as one exec -- the corresponding increment in
    * afl_fsrv_run_target is suppressed in coqui_mode to avoid double-counting
    * GPU-flagged inputs that also run through CPU verification. */
   afl->fsrv.total_execs++;
 
-  if (len > ctx->byte_budget) {
+  if (len > ctx->max_input_size) {
     ctx->oversized_count++;
     return 0;
   }
 
-  u32 off = (b->bytes_used + 7) & ~7u;
-  if (off + len > ctx->byte_budget || b->n_inputs == ctx->batch_size) {
+  /* Fixed-size slots: slot i starts at i * max_input_size. */
+  if (b->n_inputs == ctx->batch_size) {
     /* Launch the full batch async */
     coqui_launch_batch(afl, b);
 
@@ -1402,19 +1770,22 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
     ctx->executing = tmp;
 
     b = ctx->pending;
-    off = 0;
 
     /* If the new pending has in-flight work from a previous flip, drain it
        before reusing */
     if (b->n_inputs > 0) {
       if (coqui_await_and_process(afl, b) == 1) {
-        /* Context was reset under us; ctx/b are stale. Drop this input —
+        /* Context was reset under us; ctx/b are stale. Drop this input --
          * the context is now functional but the old batch pointers are
          * freed. Caller (havoc loop) will retry on the next iteration. */
         return 0;
       }
       b->n_inputs = 0;
       b->bytes_used = 0;
+      if (ctx->gpu_mutate_enabled) {
+        ctx->parent_count = 0;
+        ctx->parent_bytes_used = 0;
+      }
     }
 
     /* Periodic fuzzer_stats refresh (see comment above
@@ -1429,6 +1800,58 @@ u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
     }
   }
 
+  /* Power-schedule mode: when gpu_mutate_active, pack the parent into
+   * the compact parent table (one copy) and assign n_threads to it via
+   * the parent index array. The GPU mutation wrapper reads from the
+   * parent table, copies to the per-thread output slot, and mutates.
+   * This replaces the old broadcast pattern (128 copies of same data). */
+  if (ctx->gpu_mutate_active && afl->stage_max > 0) {
+    u32 n_threads = ((afl->stage_max + 31) / 32) * 32;
+    /* If n_threads would exceed remaining capacity, cap to what fits
+     * (rounded down to multiple of 32 for warp alignment). */
+    u32 remaining = ctx->batch_size - b->n_inputs;
+    if (n_threads > remaining) {
+      n_threads = (remaining / 32) * 32;
+    }
+    if (n_threads == 0) {
+      /* No room even for 32 threads -- trigger a batch launch. The caller
+       * (havoc loop) will re-enter with a fresh batch. We treat this as
+       * a full batch by filling the single slot normally; the auto-launch
+       * at batch_size handles the rest. */
+      goto single_slot;
+    }
+
+    /* Pack parent into the compact parent table (one copy). */
+    u32 pidx = ctx->parent_count;
+    u32 poff = ctx->parent_bytes_used;
+    memcpy(ctx->h_parent_bytes + poff, buf, len);
+    ctx->h_parent_offsets[pidx] = poff;
+    ctx->h_parent_lens[pidx] = len;
+    ctx->parent_count++;
+    ctx->parent_bytes_used = poff + len;
+
+    /* Assign all n_threads to this parent and fill their slot metadata.
+     * Per-thread input slots are NOT filled with data -- the GPU mutation
+     * wrapper copies from the parent table. But we still need offsets and
+     * lens set so the harness/post-kernel reads work correctly. */
+    for (u32 t = 0; t < n_threads; t++) {
+      u32 slot = b->n_inputs;
+      u32 off = slot * ctx->max_input_size;
+      b->h_offsets[slot] = off;
+      b->h_input_lens[slot] = len;
+      ctx->h_parent_idx[slot] = pidx;
+      b->n_inputs++;
+      b->bytes_used = off + len;
+    }
+    /* Count all threads as execs (the GPU will run each). We already
+     * counted 1 in total_execs above; add the remaining n_threads-1. */
+    afl->fsrv.total_execs += (n_threads - 1);
+    ctx->total_submits += (n_threads - 1);
+    return 0;
+  }
+
+single_slot:;
+  u32 off = b->n_inputs * ctx->max_input_size;
   memcpy(b->h_input_bytes + off, buf, len);
   b->h_offsets[b->n_inputs] = off;
   b->h_input_lens[b->n_inputs] = len;
@@ -1453,6 +1876,11 @@ void coqui_flush_batch(afl_state_t *afl) {
     if (coqui_await_and_process(afl, ctx->pending) == 1) return;
     ctx->pending->n_inputs = 0;
     ctx->pending->bytes_used = 0;
+  }
+  /* Reset parent table state for the next stage. */
+  if (ctx->gpu_mutate_enabled) {
+    ctx->parent_count = 0;
+    ctx->parent_bytes_used = 0;
   }
 }
 
@@ -1500,6 +1928,12 @@ static void coqui_force_reset(afl_state_t *afl, const char *cubin_path) {
   if (ctx->pong.h_input_lens)  cuMemFreeHost(ctx->pong.h_input_lens);
   if (ctx->pong.h_novelty)     cuMemFreeHost(ctx->pong.h_novelty);
   if (ctx->pong.h_status)      cuMemFreeHost(ctx->pong.h_status);
+  /* Parent table host pinned buffers (GPU-mutate). Device-side parent
+   * buffers are freed by cuCtxDestroy above. */
+  if (ctx->h_parent_bytes)   cuMemFreeHost(ctx->h_parent_bytes);
+  if (ctx->h_parent_offsets) cuMemFreeHost(ctx->h_parent_offsets);
+  if (ctx->h_parent_lens)    cuMemFreeHost(ctx->h_parent_lens);
+  if (ctx->h_parent_idx)     cuMemFreeHost(ctx->h_parent_idx);
 
   ck_free(ctx);
   afl->coqui = NULL;
@@ -1595,6 +2029,23 @@ void coqui_shutdown(afl_state_t *afl) {
     cuMemFree((CUdeviceptr)ctx->d_trace_count);
   if (ctx->h_trace_t0_buf)
     ck_free(ctx->h_trace_t0_buf);
+  /* Free parent table buffers (GPU-mutate). */
+  if (ctx->d_parent_bytes)
+    cuMemFree((CUdeviceptr)ctx->d_parent_bytes);
+  if (ctx->d_parent_offsets)
+    cuMemFree((CUdeviceptr)ctx->d_parent_offsets);
+  if (ctx->d_parent_lens)
+    cuMemFree((CUdeviceptr)ctx->d_parent_lens);
+  if (ctx->d_parent_idx)
+    cuMemFree((CUdeviceptr)ctx->d_parent_idx);
+  if (ctx->h_parent_bytes)
+    cuMemFreeHost(ctx->h_parent_bytes);
+  if (ctx->h_parent_offsets)
+    cuMemFreeHost(ctx->h_parent_offsets);
+  if (ctx->h_parent_lens)
+    cuMemFreeHost(ctx->h_parent_lens);
+  if (ctx->h_parent_idx)
+    cuMemFreeHost(ctx->h_parent_idx);
 
   /* Destroy streams, unload module, destroy context */
   if (ctx->stream_a) cuStreamDestroy((CUstream)ctx->stream_a);

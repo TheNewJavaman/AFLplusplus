@@ -11,6 +11,7 @@
  */
 
 #include "coqui_runtime.h"
+#include "coqui_afl_mutate.h"
 
 /* Pointer to per-thread status array, set by kernel entry (FuzzEntry pass). */
 __attribute__((visibility("default")))
@@ -206,5 +207,168 @@ void __coqui_check_thread_budget(void) {
     if (unlikely(now - start > cycles_cap)) {
         __coqui_trap_with_reason(COQUI_TRAP_THREAD_BUDGET_EXHAUSTED);
         __builtin_unreachable();
+    }
+}
+
+/* ========================================================================
+ * GPU-side mutation support (Phase 2+3: GPU-mutate AFL integration).
+ *
+ * When AFL_COQUI_GPU_MUTATE=1, each GPU thread applies additional havoc
+ * mutations to its input buffer BEFORE calling the harness. The host
+ * writes per-thread PRNG seeds into __coqui_mutate_prng before each
+ * launch; the device reads them here.
+ *
+ * This is double-mutation MVP: host still sends host-mutated bytes, GPU
+ * applies ADDITIONAL mutations on top. Optimization to skip host mutation
+ * is a follow-up.
+ * ======================================================================== */
+
+/* Per-parent compact table (sparse H2D: Change 1).
+ *
+ * Instead of broadcasting each parent to 128 thread slots (128 copies of
+ * the same data), the host uploads each parent ONCE into a compact buffer.
+ * Per-thread __coqui_parent_idx[tid] maps each thread to its parent index;
+ * __coqui_parent_offsets[idx] and __coqui_parent_lens[idx] locate the parent
+ * in the compact buffer. The mutation wrapper copies from the parent table
+ * into the per-thread output slot before mutating.
+ *
+ * These are pointer-sized globals; the host allocates backing storage via
+ * cuMemAlloc and writes the device addresses here via cuMemcpyHtoD. */
+__attribute__((visibility("default")))
+__attribute__((used))
+u8  *__coqui_parent_bytes;       /* compact parent data (host-allocated) */
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 *__coqui_parent_offsets;     /* offset per parent (host-allocated) */
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 *__coqui_parent_lens;        /* length per parent (host-allocated) */
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 *__coqui_parent_idx;         /* per-thread parent index (host-allocated) */
+
+/* Per-thread PRNG seed pairs — max 65536 threads (matching BATCH_SIZE cap). */
+__attribute__((visibility("default")))
+__attribute__((used))
+u64 __coqui_mutate_prng[65536 * 2];
+
+/* Maximum stacking depth for per-thread PRNG-derived stacking.
+ * Each thread computes: steps = 1 + rand_below(stack_max).
+ * Host sets this to 4 (early) or 8 (after 10 min). */
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_mutate_stack_max;
+
+/* Master enable flag: 0=off (default), 1=on. */
+__attribute__((visibility("default")))
+__attribute__((used))
+u8 __coqui_gpu_mutate_enabled;
+
+/* Number of unique parents in the current batch (for splice mutations). */
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_parent_count;
+
+/* Dictionary (extras) device-side table.
+ *
+ * The host packs user-supplied dictionary tokens (extras) and auto-discovered
+ * tokens (a_extras) into a flat byte buffer with offset/len metadata.
+ * Auto-extras are appended after regular extras in the same data buffer;
+ * __coqui_a_extras_off gives their starting index in offsets/lens.
+ *
+ * Layout:
+ *   data[0..extras_total_bytes]: packed token bytes
+ *   offsets[i]: byte offset into data for token i
+ *   lens[i]: byte length of token i
+ *   i < extras_cnt: regular extras
+ *   extras_cnt <= i < extras_cnt + a_extras_cnt: auto-extras
+ *
+ * Limits: MAX_EXTRAS=4096 tokens, MAX_EXTRAS_BYTES=131072 total bytes.
+ * Tokens exceeding these caps are silently dropped by the host upload. */
+#define COQUI_MAX_EXTRAS       4096u
+#define COQUI_MAX_EXTRAS_BYTES 131072u
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u8  __coqui_extras_data[COQUI_MAX_EXTRAS_BYTES];
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_extras_offsets[COQUI_MAX_EXTRAS];
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_extras_lens[COQUI_MAX_EXTRAS];
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_extras_cnt;      /* number of regular extras */
+
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_a_extras_cnt;    /* number of auto-extras (starting after extras) */
+
+/* Maximum input size for mutation (host-configured, matches max_input_size). */
+__attribute__((visibility("default")))
+__attribute__((used))
+u32 __coqui_mutate_max_input_size;
+
+/* Apply GPU-side mutation to the per-thread input buffer.
+ *
+ * Per-parent H2D (Change 1): instead of reading from the per-thread
+ * input slot (which would contain a broadcast copy of the parent),
+ * read the parent from the compact parent table. The parent table has
+ * each unique parent stored once; __coqui_parent_idx[tid] maps this
+ * thread to its parent. Copy the parent into the per-thread output
+ * slot, mutate in-place, and the harness reads the mutated result
+ * from the same slot.
+ *
+ * Power-schedule mode: each thread derives its own stacking depth
+ * from its PRNG: steps = 1 + rand_below(stack_max). This mirrors
+ * AFL's havoc loop where each iteration picks a random stacking.
+ *
+ * `noinline` keeps the mutation body separate for debugging and avoids
+ * inflating the fast path when GPU mutation is disabled. Can be switched
+ * to `always_inline` later if call overhead matters.
+ *
+ * The scratch buffer is a local stack alloca (sized to max_input_size).
+ * Mutations that grow the buffer (clone, insert) need this as a temp. */
+__attribute__((noinline, nothrow))
+void __coqui_mutate_input(u32 tid, u8 *buf, u32 *len_ptr, u32 max_len) {
+    if (!__coqui_gpu_mutate_enabled) return;
+
+    /* Read parent from compact parent table and copy to per-thread slot. */
+    u32 pidx = __coqui_parent_idx[tid];
+    u32 poff = __coqui_parent_offsets[pidx];
+    u32 plen = __coqui_parent_lens[pidx];
+    u8 *parent_ptr = __coqui_parent_bytes + poff;
+    memcpy(buf, parent_ptr, plen);
+    *len_ptr = plen;
+
+    coqui_mutate_ctx_t ctx;
+    ctx.rand_seed[0] = __coqui_mutate_prng[tid * 2];
+    ctx.rand_seed[1] = __coqui_mutate_prng[tid * 2 + 1];
+
+    /* Per-thread stacking depth from PRNG, mirroring AFL's havoc loop:
+     *   use_stacking = 1 + rand_below(stack_max)
+     * stack_max is set by the host (4 early, 8 after 10 min). */
+    u32 sm = __coqui_mutate_stack_max;
+    if (sm == 0) sm = 4;  /* defensive default */
+    u32 steps = 1 + coqui_rand_below(&ctx, sm);
+
+    /* Scratch buffer on the per-thread stack. Cap at 4096 to stay within
+     * typical stack budgets; inputs larger than this will still mutate but
+     * mutations that need the scratch (clone/insert) will retry-to-havoc
+     * or be skipped for the oversized tail. */
+    u8 scratch[4096];
+    u32 scratch_max = max_len < 4096 ? max_len : 4096;
+
+    u32 new_len = coqui_afl_mutate(&ctx, buf, plen, steps,
+                                    scratch, scratch_max);
+    if (new_len > 0) {
+        *len_ptr = new_len;
     }
 }

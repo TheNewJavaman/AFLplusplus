@@ -19,8 +19,12 @@
 struct afl_state;  /* forward */
 
 /* Tunable defaults. Override with env vars at runtime. */
-#define COQUI_DEFAULT_BATCH_SIZE 8192  /* keep default; cap raised to 65536 */
+#define COQUI_DEFAULT_BATCH_SIZE 32768  /* legacy parity; cap 65536 */
 #define COQUI_MAX_INPUT_DEFAULT  4096
+
+/* Dictionary device-global limits (must match coqui_runtime.c). */
+#define COQUI_MAX_EXTRAS         4096u
+#define COQUI_MAX_EXTRAS_BYTES   131072u  /* 128 KB */
 
 /* ------------------------------------------------------------------------
  * Data types
@@ -269,6 +273,61 @@ typedef struct coqui_ctx {
   unsigned long long  d_trace_count;        /* CUdeviceptr — per-thread counters */
   u32                *h_trace_t0_buf;       /* host scratch for thread-0 readback */
   u32                 h_trace_t0_count;     /* most-recent thread-0 count */
+
+  /* GPU-side mutation (Phase 2+3). When AFL_COQUI_GPU_MUTATE=1, each GPU
+   * thread applies additional havoc mutations before calling the harness.
+   *
+   * Power-schedule mode: the host broadcasts each parent to
+   * round_up_32(stage_max) consecutive slots. Each thread independently
+   * picks stacking depth from its PRNG: steps = 1 + rand_below(stack_max).
+   * stack_max is 4 early, 8 after 10 minutes (mirrors AFL's havoc_stack_pow2). */
+  u8                  gpu_mutate_enabled;   /* 0=off, 1=on (env-level) */
+  u8                  gpu_mutate_active;    /* per-batch: 1 during havoc/splice, 0 otherwise */
+  unsigned long long  d_mutate_flag;        /* CUdeviceptr — __coqui_gpu_mutate_enabled */
+  unsigned long long  d_mutate_prng;        /* CUdeviceptr — per-thread PRNG seeds */
+  size_t              d_mutate_prng_sz;     /* size of PRNG symbol on device */
+  u64                *h_mutate_prng;        /* pinned host buffer for PRNG seeds */
+  unsigned long long  d_mutate_stack_max;   /* CUdeviceptr — __coqui_mutate_stack_max */
+
+  /* Per-parent H2D parent table (Change 1: sparse H2D).
+   *
+   * Instead of copying each parent's bytes to 128 thread slots (broadcasting
+   * the same data 128x), upload each parent ONCE into a compact parent table.
+   * GPU threads read from the table via __coqui_parent_offsets[parent_idx].
+   *
+   * h_parent_bytes: packed parent data, one copy per unique parent
+   * h_parent_offsets: byte offset into parent buffer for each parent
+   * h_parent_lens: byte length of each parent
+   * h_parent_idx: per-thread mapping — which parent index this thread uses
+   * d_parent_*: device-side globals bound at init */
+  u8                 *h_parent_bytes;      /* pinned host buffer for packed parents */
+  u32                *h_parent_offsets;     /* pinned: offset[parent_i] */
+  u32                *h_parent_lens;        /* pinned: len[parent_i] */
+  u32                *h_parent_idx;         /* pinned: per-thread parent index */
+  unsigned long long  d_parent_bytes;       /* CUdeviceptr — __coqui_parent_bytes */
+  unsigned long long  d_parent_offsets;     /* CUdeviceptr — __coqui_parent_offsets */
+  unsigned long long  d_parent_lens;        /* CUdeviceptr — __coqui_parent_lens */
+  unsigned long long  d_parent_idx;         /* CUdeviceptr — __coqui_parent_idx */
+  u32                 parent_count;         /* unique parents packed this batch */
+  u32                 parent_bytes_used;    /* bytes consumed in h_parent_bytes */
+
+  /* Device-side parent_count global (for splice: threads need to know how
+   * many parents exist in this batch to pick a splice source). */
+  unsigned long long  d_parent_count;      /* CUdeviceptr — __coqui_parent_count */
+
+  /* Dictionary (extras) device sync.
+   *
+   * The host packs AFL's extras[] + a_extras[] into flat device-global arrays
+   * (defined in coqui_runtime.c). Sync happens lazily: only when extras_cnt
+   * or a_extras_cnt changes between batches. The device-global arrays are
+   * fixed-size (COQUI_MAX_EXTRAS entries, COQUI_MAX_EXTRAS_BYTES bytes). */
+  unsigned long long  d_extras_data;       /* CUdeviceptr — __coqui_extras_data */
+  unsigned long long  d_extras_offsets;    /* CUdeviceptr — __coqui_extras_offsets */
+  unsigned long long  d_extras_lens;       /* CUdeviceptr — __coqui_extras_lens */
+  unsigned long long  d_extras_cnt;        /* CUdeviceptr — __coqui_extras_cnt */
+  unsigned long long  d_a_extras_cnt;      /* CUdeviceptr — __coqui_a_extras_cnt */
+  u32                 last_extras_cnt;     /* cached: last synced extras_cnt */
+  u32                 last_a_extras_cnt;   /* cached: last synced a_extras_cnt */
 } coqui_ctx_t;
 
 /* Per-thread trace stripe geometry. Must match
