@@ -719,8 +719,10 @@ bool runAsan(Module &M) {
     if (F.isDeclaration())
       continue;
 
-    // Skip all __coqui_* runtime functions; they must not be self-checked.
+    // Skip runtime functions: __coqui_* prefix or coqui.noasan attribute.
     if (F.getName().starts_with("__coqui_"))
+      continue;
+    if (F.hasFnAttribute("coqui.noasan"))
       continue;
 
     // Collect candidate instructions first — cannot modify IR while

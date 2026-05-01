@@ -180,17 +180,15 @@ bool runMemoryLayout(Module &M) {
 
   /* 4. Emit accessor getter functions.
    *
-   * Each getter computes: load ptr from Pool[tid * SLOT_STRIDE + Offset].
-   */
+   * Each getter loads a ptr from Pool[tid * SLOT_STRIDE + Offset].
+   * The slot pool is written at kernel entry above; getters are called
+   * from coverage + ASan instrumentation (inlined at each call site). */
   auto emitGetter = [&](StringRef Name, unsigned Offset) {
     FunctionType *FT = FunctionType::get(i8p, /*isVarArg=*/false);
-    /* getOrInsertFunction returns an existing decl or creates a new one. */
     Function *F = cast<Function>(
         M.getOrInsertFunction(Name, FT).getCallee());
-    /* If the function already has a body (defined earlier), skip. */
     if (!F->isDeclaration())
       return;
-    /* It is a forward declaration (from runtime.h or FuzzEntry) — fill it in. */
     F->setLinkage(GlobalValue::InternalLinkage);
     F->addFnAttr(Attribute::AlwaysInline);
     BasicBlock *BB = BasicBlock::Create(C, "entry", F);
