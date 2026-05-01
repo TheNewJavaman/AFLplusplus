@@ -274,13 +274,13 @@ typedef struct coqui_ctx {
   u32                *h_trace_t0_buf;       /* host scratch for thread-0 readback */
   u32                 h_trace_t0_count;     /* most-recent thread-0 count */
 
-  /* GPU-side mutation (Phase 2+3). When AFL_COQUI_GPU_MUTATE=1, each GPU
-   * thread applies additional havoc mutations before calling the harness.
+  /* GPU-side mutation. When AFL_COQUI_GPU_MUTATE=1, the host sends
+   * unmutated parents and the GPU applies per-thread havoc mutations.
    *
-   * Power-schedule mode: the host broadcasts each parent to
-   * round_up_32(stage_max) consecutive slots. Each thread independently
-   * picks stacking depth from its PRNG: steps = 1 + rand_below(stack_max).
-   * stack_max is 4 early, 8 after 10 minutes (mirrors AFL's havoc_stack_pow2). */
+   * Power-schedule mode: the host assigns round_up_32(stage_max) threads
+   * per parent. Each thread independently picks stacking depth from its
+   * PRNG: steps = 1 + rand_below(stack_max). stack_max is 4 early,
+   * 8 after 10 minutes (mirrors AFL's havoc_stack_pow2). */
   u8                  gpu_mutate_enabled;   /* 0=off, 1=on (env-level) */
   u8                  gpu_mutate_active;    /* per-batch: 1 during havoc/splice, 0 otherwise */
   unsigned long long  d_mutate_flag;        /* CUdeviceptr — __coqui_gpu_mutate_enabled */

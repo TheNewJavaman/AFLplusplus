@@ -213,14 +213,10 @@ void __coqui_check_thread_budget(void) {
 /* ========================================================================
  * GPU-side mutation support (Phase 2+3: GPU-mutate AFL integration).
  *
- * When AFL_COQUI_GPU_MUTATE=1, each GPU thread applies additional havoc
- * mutations to its input buffer BEFORE calling the harness. The host
- * writes per-thread PRNG seeds into __coqui_mutate_prng before each
- * launch; the device reads them here.
- *
- * This is double-mutation MVP: host still sends host-mutated bytes, GPU
- * applies ADDITIONAL mutations on top. Optimization to skip host mutation
- * is a follow-up.
+ * When AFL_COQUI_GPU_MUTATE=1, the host sends UNMUTATED parents and the
+ * GPU performs all mutation. Each thread picks its parent from the compact
+ * parent table, copies it to its output slot, applies AFL-exact havoc
+ * mutations using per-thread PRNG seeds, then calls the harness.
  * ======================================================================== */
 
 /* Per-parent compact table (sparse H2D: Change 1).
