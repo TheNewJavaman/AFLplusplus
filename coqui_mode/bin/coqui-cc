@@ -18,6 +18,8 @@ from pathlib import Path
 PREFIX = os.environ.get("COQUI_PREFIX", "/usr/local")
 RUNTIME_BC = f"{PREFIX}/lib/coqui-cc/runtime.bc"
 PASS_PLUGIN = f"{PREFIX}/lib/coqui-cc/CoquiPassPlugin.so"
+CUDA_PATH = os.environ.get("CUDA_PATH", "/usr/local/cuda")
+LIBDEVICE_DEFAULT = f"{CUDA_PATH}/nvvm/libdevice/libdevice.10.bc"
 
 
 def detect_arch(device: int) -> str:
@@ -69,6 +71,7 @@ def main():
         bc = workdir / (src_p.stem + ".bc")
         cmd = [
             "clang", "--target=nvptx64-nvidia-cuda",
+            f"-march={arch}",
             "-O2", "-emit-llvm", "-c",
             "-g0", "-fno-stack-protector", "-fno-pic",
             "-D__COQUI_DEVICE__=1",
@@ -97,27 +100,50 @@ def main():
         str(linked_bc), "-o", str(pruned_bc),
     ])
 
-    # 3b. Re-link runtime after prune so runtime symbols survive DCE.
-    #     The coqui passes inject calls to __coqui_fuzz_tid and other helpers;
-    #     those definitions must be present when the pass runs (for InternalLinkage
-    #     function creation) and when ptxas resolves the final PTX.
+    # 3b. Re-link runtime + libdevice after prune so runtime symbols survive DCE.
     with_runtime_bc = workdir / "with_runtime.bc"
     link_inputs = [str(pruned_bc), RUNTIME_BC]
 
-    # 3b-libdevice. Link NVIDIA's libdevice for optimized math (__nv_exp,
-    # __nv_sin, etc.). Opt-in via COQUI_LIBDEVICE=path (not default yet:
-    # libdevice uses NVPTX intrinsics that require llc sm_75+ to lower).
-    libdevice_bc = os.environ.get("COQUI_LIBDEVICE", "")
-    if libdevice_bc and os.path.isfile(libdevice_bc):
-        link_inputs.append(libdevice_bc)
+    # libdevice: NVIDIA's hardware-optimized math library. ON by default.
+    # Set COQUI_LIBDEVICE=0 to disable, or COQUI_LIBDEVICE=path to override.
+    libdevice_env = os.environ.get("COQUI_LIBDEVICE", LIBDEVICE_DEFAULT)
+    use_libdevice = libdevice_env != "0" and os.path.isfile(libdevice_env)
+    if use_libdevice:
+        link_inputs.append(libdevice_env)
 
     run(["llvm-link", *link_inputs, "-o", str(with_runtime_bc)])
 
-    # Resolve __nvvm_reflect calls injected by libdevice (feature detection).
-    if libdevice_bc and os.path.isfile(libdevice_bc):
+    if use_libdevice:
+        # nvvm-reflect: resolves __nvvm_reflect() feature-detection calls.
+        # internalize+globaldce: strips unreachable libdevice functions
+        # (e.g. __nv_fast_tanhf uses llvm.nvvm.tanh.approx which llc can't
+        # always lower). Internalize marks everything non-API as internal;
+        # globaldce removes unreachable internals.
+        #
+        # Preserve: LLVMFuzzerTestOneInput (user entry) + all __coqui_*
+        # (runtime, used by passes that run next). libdevice __nv_* functions
+        # that ARE reachable survive DCE; unreachable ones (like tanhf on a
+        # libpng build) get removed along with their problematic intrinsics.
+        #
+        # Build preserve list: scan the module for __coqui_* definitions.
+        import subprocess as _sp
+        preserve_out = _sp.check_output(
+            ["llvm-nm", "--defined-only", str(with_runtime_bc)],
+            text=True)
+        preserve = {"LLVMFuzzerTestOneInput"}
+        for line in preserve_out.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                sym = parts[-1]
+                if sym.startswith("__coqui_") or sym.startswith("llvm."):
+                    preserve.add(sym)
+        preserve_list = ",".join(sorted(preserve))
+
         resolved_bc = workdir / "resolved.bc"
-        run(["opt", "-passes=nvvm-reflect", str(with_runtime_bc),
-             "-o", str(resolved_bc)])
+        run(["opt",
+             "-passes=function(nvvm-reflect),internalize,globaldce",
+             f"-internalize-public-api-list={preserve_list}",
+             str(with_runtime_bc), "-o", str(resolved_bc)])
         with_runtime_bc = resolved_bc
 
     # 3c. opt with coqui pipeline

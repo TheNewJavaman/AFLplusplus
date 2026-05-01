@@ -8,6 +8,7 @@ set -euo pipefail
 
 COQUI_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PREFIX:-/usr/local}"
+COQUI_ARCH="${COQUI_ARCH:-sm_75}"
 
 echo "[*] Building coqui_mode LLVM pass plugin..."
 mkdir -p "$COQUI_DIR/passes/build"
@@ -16,8 +17,8 @@ cmake ..
 make -j"$(nproc)"
 cd "$COQUI_DIR"
 
-echo "[*] Compiling device runtime to bitcode..."
-RUNTIME_FLAGS="--target=nvptx64-nvidia-cuda -O2 -ffreestanding -emit-llvm -c -I $COQUI_DIR/runtime"
+echo "[*] Compiling device runtime to bitcode (arch=$COQUI_ARCH)..."
+RUNTIME_FLAGS="--target=nvptx64-nvidia-cuda -march=$COQUI_ARCH -O2 -ffreestanding -emit-llvm -c -I $COQUI_DIR/runtime"
 mkdir -p "$COQUI_DIR/runtime/build"
 for f in coqui_runtime coqui_coverage coqui_memory coqui_asan coqui_ubsan coqui_libc coqui_printf coqui_complex coqui_slab coqui_stack_spill coqui_trace coqui_global_init; do
     clang $RUNTIME_FLAGS "$COQUI_DIR/runtime/$f.c" -o "$COQUI_DIR/runtime/build/$f.bc"

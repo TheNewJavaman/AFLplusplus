@@ -33,14 +33,14 @@ struct MathEntry {
 };
 
 static const MathEntry Entries[] = {
-    {Intrinsic::pow,   "__coqui_powf",   "__coqui_pow",   2},
-    {Intrinsic::log,   "__coqui_logf",   "__coqui_log",   1},
-    {Intrinsic::log10, "__coqui_log10f", "__coqui_log10", 1},
-    {Intrinsic::log2,  "__coqui_log2f",  "__coqui_log2",  1},
-    {Intrinsic::exp,   "__coqui_expf",   "__coqui_exp",   1},
-    {Intrinsic::exp2,  "__coqui_exp2f",  "__coqui_exp2",  1},
-    {Intrinsic::sin,   "__coqui_sinf",   "__coqui_sin",   1},
-    {Intrinsic::cos,   "__coqui_cosf",   "__coqui_cos",   1},
+    {Intrinsic::pow,   "__nv_powf",   "__nv_pow",   2},
+    {Intrinsic::log,   "__nv_logf",   "__nv_log",   1},
+    {Intrinsic::log10, "__nv_log10f", "__nv_log10", 1},
+    {Intrinsic::log2,  "__nv_log2f",  "__nv_log2",  1},
+    {Intrinsic::exp,   "__nv_expf",   "__nv_exp",   1},
+    {Intrinsic::exp2,  "__nv_exp2f",  "__nv_exp2",  1},
+    {Intrinsic::sin,   "__nv_sinf",   "__nv_sin",   1},
+    {Intrinsic::cos,   "__nv_cosf",   "__nv_cos",   1},
 };
 
 bool runMath(Module &M) {
@@ -101,7 +101,7 @@ bool runMath(Module &M) {
     for (auto *BO : FRemOps) {
         Type *Ty = BO->getType();
         bool IsF32 = Ty->isFloatTy();
-        const char *Name = IsF32 ? "__coqui_fmodf" : "__coqui_fmod";
+        const char *Name = IsF32 ? "__nv_fmodf" : "__nv_fmod";
         FunctionType *FnTy = FunctionType::get(Ty, {Ty, Ty}, false);
         FunctionCallee Fn = M.getOrInsertFunction(Name, FnTy);
         IRBuilder<> Builder(BO);
