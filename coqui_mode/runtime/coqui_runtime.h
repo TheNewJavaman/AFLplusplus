@@ -177,6 +177,7 @@ void __coqui_classify_counts(u8 *map);
 u32  __coqui_classify_counts_and_sig(u8 *map);
 
 void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap);
+u32  __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap);
 
 /* Dedup hash of partial coverage at crash time (called from asan_report).
  * Uses the same FNV-1a algorithm as the classify_and_sig variant so

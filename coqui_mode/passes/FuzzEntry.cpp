@@ -71,12 +71,11 @@ bool runFuzzEntry(Module &M) {
   /* Folded classify-and-sig: single pass over the 64 KB cov_map that
    * classifies every byte AND returns a 32-bit FNV-1a hash so the host
    * can dedup crash-verifies by signature. */
-  FunctionCallee ClassifyAndSig = M.getOrInsertFunction(
-    "__coqui_classify_counts_and_sig",
-    FunctionType::get(i32, {i8p}, false));
-  FunctionCallee VirginCmp = M.getOrInsertFunction(
-    "__coqui_virgin_compare_and_flag",
-    FunctionType::get(voidT, {i8p, i8p, i8p}, false));
+  /* Fused classify + hash + virgin-compare + zero: single pass over
+   * the coverage map instead of two separate traversals. */
+  FunctionCallee ClassifyVirginFused = M.getOrInsertFunction(
+    "__coqui_classify_virgin_fused",
+    FunctionType::get(i32, {i8p, i8p, i8p}, false));
 
   /* 4. Declare the virgin_map as an extern global [65536 x i8].
    *
@@ -366,21 +365,12 @@ bool runFuzzEntry(Module &M) {
 
   /* cov = __coqui_cov_base() */
   Value *cov = Builder.CreateCall(CovBase, {}, "cov");
-  /* sig = __coqui_classify_counts_and_sig(cov) */
-  Value *sig = Builder.CreateCall(ClassifyAndSig, {cov}, "sig");
+  /* Fused: classify + hash + virgin-compare + zero in one pass. */
+  Value *sig = Builder.CreateCall(ClassifyVirginFused,
+                                  {cov, VirginMap, noveltyArg}, "sig");
 
-  /* clk_d: after classify_counts_and_sig */
   Value *clkD = Builder.CreateCall(Clock64, {}, "clk_d");
-
-  /* PHASE_VIRGIN_CMP = 5 */
-  Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 5)});
-
-  /* With opaque pointers, VirginMap (ptr to [65536 x i8]) is already
-     an i8* — no bitcast needed; pass directly as i8p. */
-  Builder.CreateCall(VirginCmp, {cov, VirginMap, noveltyArg});
-
-  /* clk_e: after virgin_compare */
-  Value *clkE = Builder.CreateCall(Clock64, {}, "clk_e");
+  Value *clkE = clkD;
 
   /* Atomically accumulate per-phase cycle deltas into __coqui_kernel_timing.
    * Slot 0: memory_init, 1: fuzz_execute, 2: classify+sig, 3: virgin_compare,
