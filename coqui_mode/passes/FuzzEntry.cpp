@@ -77,16 +77,13 @@ bool runFuzzEntry(Module &M) {
     "__coqui_classify_virgin_fused",
     FunctionType::get(i32, {i8p, i8p, i8p}, false));
 
-  /* 4. Declare the virgin_map as an extern global [65536 x i8].
-   *
-   * Alignment must be at least 8 bytes. __coqui_virgin_compare_and_flag
-   * casts this pointer to `_Atomic u64 *` and issues atom.or.b64 through
-   * it; on sm_75+ any 64-bit atomic at a non-8-byte-aligned address
-   * produces CUDA_ERROR_MISALIGNED_ADDRESS. Without an explicit Align(8)
-   * here, LLVM emits `.align 1 .b8 __coqui_virgin_map[65536]` in PTX and
-   * the CUDA driver is not required to over-align the symbol even when
-   * allocating a 64 KB chunk. */
-  ArrayType *VirginArrTy = ArrayType::get(i8, 65536);
+  /* 4. Declare the virgin_map sized to __coqui_edge_count.
+   * Alignment >= 8 for atom.or.b64. */
+  unsigned virginSize = 65536;
+  if (auto *GV = M.getGlobalVariable("__coqui_edge_count"))
+    if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer()))
+      virginSize = CI->getZExtValue();
+  ArrayType *VirginArrTy = ArrayType::get(i8, virginSize);
   GlobalVariable *VirginMap = M.getGlobalVariable("__coqui_virgin_map", true);
   if (!VirginMap) {
     VirginMap = new GlobalVariable(

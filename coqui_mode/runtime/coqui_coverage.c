@@ -236,17 +236,15 @@ static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
  *
  * Returns the FNV-1a crash signature (same semantics as classify_counts_
  * and_sig). Sets novelty_bitmap bit if any new coverage is found. */
-__attribute__((nothrow))
-/* Compile-time edge count set by Coverage pass. Limits iteration to
- * only the used portion of the map (e.g., 799 edges → 100 u64 words
- * instead of 8192). Weak default = full map for cubins built without
- * the Coverage pass. */
+/* Edge count set by EdgeCount pre-pass. Weak default = full 64KB map. */
 __attribute__((weak))
+u32 __coqui_edge_count = COQUI_COV_MAP_SIZE;
 
+__attribute__((nothrow))
 u32 __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
-    const u32 n = COQUI_COV_MAP_SIZE / 8;
+    const u32 n = (__coqui_edge_count + 7) / 8;
     const u32 mask = __coqui_active_mask();
     int novel = 0;
     u32 h = COQUI_FNV32_OFFSET;

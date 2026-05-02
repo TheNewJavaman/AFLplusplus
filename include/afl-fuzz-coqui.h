@@ -113,6 +113,7 @@ typedef struct coqui_ctx {
   u32 max_input_size;  /* snapshot of afl->max_length (with fallback) */
   u32 byte_budget;     /* size of each h_input_bytes buffer */
   u32 map_size;        /* snapshot of afl->fsrv.map_size */
+  u32 cov_map_size;    /* GPU coverage map size (from __coqui_edge_count) */
 
   u64 oversized_count; /* inputs skipped because they alone exceed byte_budget */
   u64 launch_count;    /* batches launched so far */

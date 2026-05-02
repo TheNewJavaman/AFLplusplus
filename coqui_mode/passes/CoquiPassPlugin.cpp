@@ -26,6 +26,7 @@ struct CoquiPass : public PassInfoMixin<CoquiPass> {
     bool Changed = false;
 
     /* Pass order from coqui internals spec §3.2 */
+    Changed |= coqui::runEdgeCount(M);        /* FIRST: count BBs for dynamic map sizing */
     Changed |= coqui::runRejectInlineAsm(M);
     /* RejectSyscall: hard-reject for GPU-impossible syscalls
      * (dlopen/socket/mmap/...). Runs early so user code containing

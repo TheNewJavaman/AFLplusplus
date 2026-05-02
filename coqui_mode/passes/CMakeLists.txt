@@ -30,6 +30,7 @@ set(COQUI_PASS_SOURCES
     Complex.cpp
     StaticGlobals.cpp
     GlobalCtors.cpp
+    EdgeCount.cpp
     MemoryLayout.cpp
     Coverage.cpp
     Asan.cpp
