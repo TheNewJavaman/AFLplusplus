@@ -45,7 +45,7 @@ static constexpr uint64_t kStackCanary = 0xCA7A1C0FFEE0DE50ULL;
  * typically allow 256KB (driver caps based on max-resident-threads × #SMs vs
  * device .local memory). Conservative 256KB fits commonly seen Turing/Ampere
  * driver budgets. coqui-cc may grow this into a CLI flag (--total-cap) later. */
-static constexpr unsigned kCovMapSize      = 65536;
+static constexpr unsigned kCovMapFallback   = 65536;
 static constexpr unsigned kDefaultStackSize = 32768;
 static constexpr unsigned kTotalBudget     = 262144;
 
@@ -85,11 +85,20 @@ bool runMemoryLayout(Module &M) {
   /* Resolve real stack size: prefer --coqui-stack-size CLI if set, otherwise
    * default constant. Guard against a value that would leave nothing for heap. */
   unsigned realStack = RealStackSizeOpt;
-  if (realStack + kCovMapSize >= kTotalBudget) {
-    report_fatal_error(
-        "[coqui-cc] MemoryLayout: --coqui-stack-size + 64KB cov exceeds 256KB budget");
+
+  /* Read the edge count set by runEdgeCount (pre-pass). Falls back to
+   * 64KB if the pre-pass didn't run (shouldn't happen in practice). */
+  unsigned covMapSize = kCovMapFallback;
+  if (auto *GV = M.getGlobalVariable("__coqui_edge_count")) {
+    if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer()))
+      covMapSize = CI->getZExtValue();
   }
-  const unsigned remaining  = kTotalBudget - kCovMapSize - realStack;
+
+  if (realStack + covMapSize >= kTotalBudget) {
+    report_fatal_error(
+        "[coqui-cc] MemoryLayout: --coqui-stack-size + cov exceeds budget");
+  }
+  const unsigned remaining  = kTotalBudget - covMapSize - realStack;
   const unsigned heapSize   = (remaining * 8) / 9;
   const unsigned shadowSize = heapSize / 8;
   const unsigned usableHeap = heapSize; /* heap + shadow are separate allocas */
@@ -134,7 +143,7 @@ bool runMemoryLayout(Module &M) {
   Builder.CreateStore(ConstantInt::get(i64, kStackCanary), CanarySlot);
 
   AllocaInst *CovAlloca = Builder.CreateAlloca(
-      ArrayType::get(i8, kCovMapSize), nullptr, "cov_map");
+      ArrayType::get(i8, covMapSize), nullptr, "cov_map");
   CovAlloca->setAlignment(Align(8));
 
   AllocaInst *HeapAlloca = Builder.CreateAlloca(
@@ -145,10 +154,9 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
-  /* Zero the coverage map at kernel entry; each thread accumulates fresh. */
   Builder.CreateMemSet(CovAlloca,
                        ConstantInt::get(i8, 0),
-                       static_cast<uint64_t>(kCovMapSize),
+                       static_cast<uint64_t>(covMapSize),
                        MaybeAlign(Align(8)));
 
   /* Compute tid and base byte offset into the pool for this thread. */

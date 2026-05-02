@@ -119,11 +119,11 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
   CUdeviceptr d_virgin;
   size_t virgin_sz;
   CUCHECK(cuModuleGetGlobal(&d_virgin, &virgin_sz, mod, "__coqui_virgin_map"));
-  if (virgin_sz != 65536) {
-    FATAL("__coqui_virgin_map symbol size %zu != 64KB", virgin_sz);
-  }
   ctx->d_virgin_map = (unsigned long long)d_virgin;
-  CUCHECK(cuMemsetD8(d_virgin, 0, 65536));
+  ctx->cov_map_size = (u32)virgin_sz;
+  CUCHECK(cuMemsetD8(d_virgin, 0, virgin_sz));
+  OKF("coqui coverage map: %zu bytes (dynamic, matches edge count)",
+      virgin_sz);
 
   /* Bind __coqui_kernel_timing[5] — 5 u64 slots accumulating per-phase
    * cycles across all threads in the batch. The kernel atomic-adds its
@@ -289,7 +289,7 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
    * leaves; libjpeg-turbo benefits from a smaller heap (frees the rest for
    * call-chain headroom). */
   unsigned int stack_size = getenv_u32("AFL_COQUI_STACK_SIZE", 65536);
-  unsigned int cov = 65536;
+  unsigned int cov = ctx->cov_map_size;
   if (stack_size + cov >= total_budget) {
     FATAL("--stack-size %u + 64KB coverage >= total_budget %u",
           stack_size, total_budget);

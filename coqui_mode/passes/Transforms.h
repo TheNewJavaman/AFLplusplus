@@ -67,6 +67,7 @@ bool runStaticGlobals(llvm::Module &M);
  * wires a call into __coqui_fuzz_kernel right before the user harness. No-op
  * for modules without ctors (the runtime's weak fallback resolves cleanly). */
 bool runGlobalCtors(llvm::Module &M);
+bool runEdgeCount(llvm::Module &M);
 bool runMemoryLayout(llvm::Module &M);
 bool runCoverage(llvm::Module &M);
 bool runAsanGlobals(llvm::Module &M);
