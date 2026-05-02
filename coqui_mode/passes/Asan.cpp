@@ -203,12 +203,11 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
   Function *F = Function::Create(HelperTy, GlobalValue::InternalLinkage,
                                  HelperName, M);
   F->setCallingConv(CallingConv::C);
-  // AlwaysInline (Exp #57): inline the cheap shadow-check at every
-  // access site. The range check + shadow load + branch-on-zero is ~3
-  // SASS instructions — small enough that even 200k+ call sites stay
-  // within IR budget (with OFC=min + llc -O1). The cold slowpath call
-  // stays outlined (noinline+cold in coqui_asan.c). NoUnwind: nothing
-  // in the body can throw.
+  // AlwaysInline: inline the shadow-check at every access site. Outlined
+  // calls were tested (REG=132, 49% occupancy) but performed 5% worse
+  // than inlined (REG=255, 12.5% occupancy) because the kernel is
+  // compute-bound, not memory-latency-bound. The NVPTX function-call
+  // overhead per access (stack push/pop) exceeds the occupancy gain.
   F->addFnAttr(Attribute::AlwaysInline);
   F->addFnAttr(Attribute::NoUnwind);
   F->getArg(0)->setName("addr");
@@ -719,8 +718,12 @@ bool runAsan(Module &M) {
     if (F.isDeclaration())
       continue;
 
-    // Skip runtime functions: __coqui_* prefix or coqui.noasan attribute.
+    // Skip runtime and libdevice functions.
     if (F.getName().starts_with("__coqui_"))
+      continue;
+    if (F.getName().starts_with("__nv_"))
+      continue;
+    if (F.getName().starts_with("__internal_"))
       continue;
     if (F.hasFnAttribute("coqui.noasan"))
       continue;

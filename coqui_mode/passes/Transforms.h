@@ -56,6 +56,11 @@ bool runLibc(llvm::Module &M);
 bool runVariadic(llvm::Module &M);
 bool runReloc(llvm::Module &M);
 bool runMath(llvm::Module &M);
+/* MemIntrinsics: replace llvm.memcpy/memset/memmove intrinsics with calls to
+ * __coqui_memcpy_fast / __coqui_memset_fast / __coqui_memmove_fast which use
+ * 8-byte word transfers. LLVM's NVPTX backend otherwise lowers these to
+ * single-byte copy loops. */
+bool runMemIntrinsics(llvm::Module &M);
 bool runComplex(llvm::Module &M);
 bool runStaticGlobals(llvm::Module &M);
 /* runGlobalCtors lowers @llvm.global_ctors into __coqui_global_init() and

@@ -48,6 +48,8 @@ bool runRejectInlineAsm(Module &M) {
 
   for (Function &F : M) {
     if (F.getName().starts_with("__coqui_")) continue;   /* trust runtime */
+    if (F.getName().starts_with("__nv_")) continue;      /* trust libdevice */
+    if (F.getName().starts_with("__internal_")) continue; /* libdevice helpers */
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
         CallInst *CI = dyn_cast<CallInst>(&I);

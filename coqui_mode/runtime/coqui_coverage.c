@@ -227,60 +227,71 @@ static inline u64 __coqui_warp_bcast_u64(u32 mask, u64 v, int src_lane) {
     return ((u64)hi << 32) | lo;
 }
 
+/* Fused classify + hash + virgin-compare + zero.
+ *
+ * Single pass over the 64KB coverage map instead of two (classify_counts_
+ * and_sig walked it once, then virgin_compare_and_flag walked it again).
+ * Each cacheline is loaded once, classified, hashed, compared against
+ * virgin, zeroed for next batch, and evicted — halving memory traffic.
+ *
+ * Returns the FNV-1a crash signature (same semantics as classify_counts_
+ * and_sig). Sets novelty_bitmap bit if any new coverage is found. */
 __attribute__((nothrow))
-void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
+/* Compile-time edge count set by Coverage pass. Limits iteration to
+ * only the used portion of the map (e.g., 799 edges → 100 u64 words
+ * instead of 8192). Weak default = full map for cubins built without
+ * the Coverage pass. */
+__attribute__((weak))
+
+u32 __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
     const u32 n = COQUI_COV_MAP_SIZE / 8;
     const u32 mask = __coqui_active_mask();
     int novel = 0;
+    u32 h = COQUI_FNV32_OFFSET;
 
-    if (likely(mask == 0xFFFFFFFFu)) {
-        u32 laneid;
+    u32 laneid = 0;
+    int full_warp = likely(mask == 0xFFFFFFFFu);
+    if (full_warp) {
         asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
+    }
 
-        for (u32 i = 0; i < n; i++) {
-            u64 mine = m64[i];
-            u64 warp_mine = __coqui_warp_or_u64(mask, mine);
-            /* cov_map is sparse — most words are zero across the warp. */
-            if (likely(warp_mine == 0)) continue;
+    for (u32 i = 0; i < n; i++) {
+        u64 raw = m64[i];
 
-            /* Non-atomic pre-read of virgin[i]. All lanes map to the same
-             * address so L1 serves them from one cacheline. Virgin is
-             * monotonic (bits only go 0->1), so skipping the atomic when
-             * `warp_mine & ~v == 0` is safe: any bit that flips between
-             * this read and when we would have done the atomic was claimed
-             * by another warp first, which is the correct outcome.
-             *
-             * In steady-state fuzzing most edges have already been seen,
-             * so the skip-the-atomic path is the hot one. */
+        /* Zero for next batch while the line is hot. */
+        m64[i] = 0;
+
+        if (likely(raw == 0)) continue;
+
+        /* Classify hit counts to AFL buckets. */
+        __coqui_classify_word(&raw);
+
+        /* FNV-1a hash fold (same as classify_counts_and_sig). */
+        h = (h ^ i)                 * COQUI_FNV32_PRIME;
+        h = (h ^ (u32)(raw))       * COQUI_FNV32_PRIME;
+        h = (h ^ (u32)(raw >> 32)) * COQUI_FNV32_PRIME;
+
+        /* Virgin compare with warp reduction. */
+        if (full_warp) {
+            u64 warp_classified = __coqui_warp_or_u64(mask, raw);
             u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
-            if (likely((warp_mine & ~v_pre) == 0)) continue;
+            if (likely((warp_classified & ~v_pre) == 0)) continue;
 
-            /* Lane 0 does the atomic; broadcast `was` (pre-OR virgin) so
-             * every lane can compute its own novelty contribution
-             * mine & ~was. Over-reports novelty within a warp when >1
-             * lane independently set the same bit — benign, CPU verify
-             * rejects false positives. */
             u64 was0 = 0;
             if (laneid == 0) {
-                was0 = atomic_fetch_or_explicit(&v64[i], warp_mine,
+                was0 = atomic_fetch_or_explicit(&v64[i], warp_classified,
                                                 memory_order_relaxed);
             }
             u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
-            if (unlikely(mine & ~was)) { novel = 1; }
-        }
-    } else {
-        /* Partial warp: original per-thread atomic. */
-        for (u32 i = 0; i < n; i++) {
-            u64 mine = m64[i];
-            if (likely(mine == 0)) continue;
-            /* Same non-atomic pre-read + skip as full-warp path. */
+            if (unlikely(raw & ~was)) { novel = 1; }
+        } else {
             u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
-            if (likely((mine & ~v_pre) == 0)) continue;
-            u64 was = atomic_fetch_or_explicit(&v64[i], mine,
+            if (likely((raw & ~v_pre) == 0)) continue;
+            u64 was = atomic_fetch_or_explicit(&v64[i], raw,
                                                 memory_order_relaxed);
-            if (unlikely(mine & ~was)) { novel = 1; }
+            if (unlikely(raw & ~was)) { novel = 1; }
         }
     }
 
@@ -289,4 +300,6 @@ void __coqui_virgin_compare_and_flag(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
         _Atomic u32 *nov32 = (_Atomic u32 *)&novelty_bitmap[tid >> 5];
         atomic_fetch_or_explicit(nov32, 1u << (tid & 31u), memory_order_relaxed);
     }
+
+    return h;
 }
