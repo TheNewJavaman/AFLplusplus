@@ -360,8 +360,15 @@ bool runFuzzEntry(Module &M) {
   /* PHASE_BUCKETING = 4 */
   Builder.CreateCall(SetPhase, {tid, ConstantInt::get(i8, 4)});
 
-  /* cov = __coqui_cov_base() */
-  Value *cov = Builder.CreateCall(CovBase, {}, "cov");
+  /* cov = __coqui_cov_ptr[tid] — same source as Coverage instrumentation */
+  GlobalVariable *CovPtrArr = M.getGlobalVariable("__coqui_cov_ptr");
+  if (!CovPtrArr) {
+    ArrayType *AT = ArrayType::get(i8p, 65536);
+    CovPtrArr = new GlobalVariable(M, AT, false, GlobalValue::ExternalLinkage,
+                                   nullptr, "__coqui_cov_ptr");
+  }
+  Value *covPtrSlot = Builder.CreateGEP(i8p, CovPtrArr, {tid}, "cov_ptr_slot");
+  Value *cov = Builder.CreateLoad(i8p, covPtrSlot, true, "cov");
   /* Fused: classify + hash + virgin-compare + zero in one pass. */
   Value *sig = Builder.CreateCall(ClassifyVirginFused,
                                   {cov, VirginMap, noveltyArg}, "sig");

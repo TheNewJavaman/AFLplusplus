@@ -29,6 +29,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -154,10 +155,17 @@ bool runMemoryLayout(Module &M) {
       ArrayType::get(i8, shadowSize), nullptr, "shadow");
   ShadowAlloca->setAlignment(Align(8));
 
+  /* Volatile memset forces the NVPTX backend to keep the alloca alive.
+   * Without volatile, llc eliminates the 824-byte alloca because its
+   * only uses are: (1) volatile store of address to slot pool, (2) memset.
+   * Neither creates a "real" use in the backend's view. Making the memset
+   * volatile ensures the alloca participates in a volatile memory operation
+   * that the backend cannot eliminate. */
   Builder.CreateMemSet(CovAlloca,
                        ConstantInt::get(i8, 0),
                        static_cast<uint64_t>(covMapSize),
-                       MaybeAlign(Align(8)));
+                       MaybeAlign(Align(8)),
+                       /*isVolatile=*/true);
 
   /* Compute tid and base byte offset into the pool for this thread. */
   Value *tid     = Builder.CreateCall(Tid, {}, "tid");
@@ -165,12 +173,24 @@ bool runMemoryLayout(Module &M) {
                                      ConstantInt::get(i32, SLOT_STRIDE),
                                      "tid_off");
 
-  /* Store cov_alloca pointer at offset OFF_COV_BASE */
+  /* Store cov_alloca pointer at offset OFF_COV_BASE (legacy slot pool) */
   Value *covOffI32 = Builder.CreateAdd(base32,
                                        ConstantInt::get(i32, OFF_COV_BASE),
                                        "cov_off");
   Value *covSlot = Builder.CreateGEP(i8, Pool, covOffI32, "cov_slot");
-  Builder.CreateStore(CovAlloca, covSlot);
+  Builder.CreateStore(CovAlloca, covSlot)->setVolatile(true);
+
+  /* Also store to dedicated __coqui_cov_ptr[tid] array. This is the
+   * pointer that Coverage instrumentation and the fused classify function
+   * actually use. The slot-pool path above is kept for heap_base/shadow_base. */
+  GlobalVariable *CovPtrArr = M.getGlobalVariable("__coqui_cov_ptr");
+  if (!CovPtrArr) {
+    ArrayType *AT = ArrayType::get(i8p, 65536);
+    CovPtrArr = new GlobalVariable(M, AT, false, GlobalValue::ExternalLinkage,
+                                   nullptr, "__coqui_cov_ptr");
+  }
+  Value *covPtrSlot = Builder.CreateGEP(i8p, CovPtrArr, {tid}, "cov_ptr_slot");
+  Builder.CreateStore(CovAlloca, covPtrSlot)->setVolatile(true);
 
   /* Store heap_alloca pointer at offset OFF_HEAP_BASE */
   Value *heapOffI32 = Builder.CreateAdd(base32,
@@ -198,14 +218,16 @@ bool runMemoryLayout(Module &M) {
     if (!F->isDeclaration())
       return;
     F->setLinkage(GlobalValue::InternalLinkage);
-    F->addFnAttr(Attribute::AlwaysInline);
+    F->addFnAttr(Attribute::NoInline);
     BasicBlock *BB = BasicBlock::Create(C, "entry", F);
     IRBuilder<> B(BB);
     Value *t     = B.CreateCall(Tid, {}, "tid");
     Value *b32   = B.CreateMul(t, ConstantInt::get(i32, SLOT_STRIDE), "tid_off");
     Value *off   = B.CreateAdd(b32, ConstantInt::get(i32, Offset), "off");
     Value *slotPtr = B.CreateGEP(i8, Pool, off, "slot_ptr");
-    B.CreateRet(B.CreateLoad(i8p, slotPtr, Name));
+    LoadInst *LI = B.CreateLoad(i8p, slotPtr, Name);
+    LI->setVolatile(true);
+    B.CreateRet(LI);
   };
 
   emitGetter("__coqui_cov_base",    OFF_COV_BASE);
@@ -219,7 +241,7 @@ bool runMemoryLayout(Module &M) {
         M.getOrInsertFunction("__coqui_heap_size", FT).getCallee());
     if (F->isDeclaration()) {
       F->setLinkage(GlobalValue::InternalLinkage);
-      F->addFnAttr(Attribute::AlwaysInline);
+      F->addFnAttr(Attribute::NoInline);
       BasicBlock *BB = BasicBlock::Create(C, "entry", F);
       IRBuilder<> B(BB);
       B.CreateRet(ConstantInt::get(i32, usableHeap));

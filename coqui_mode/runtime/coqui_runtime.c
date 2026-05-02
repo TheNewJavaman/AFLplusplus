@@ -13,6 +13,15 @@
 #include "coqui_runtime.h"
 #include "coqui_afl_mutate.h"
 
+/* Per-thread coverage map pointer. Written by MemoryLayout at kernel entry,
+ * read by Coverage instrumentation per-BB and by the fused classify function.
+ * Using a dedicated global (instead of the slot-pool getter) ensures all
+ * readers see the SAME pointer — the slot-pool approach was broken because
+ * LLVM's NVPTX backend eliminated the alloca when it couldn't prove the
+ * slot-pool store and getter-load aliases were connected. */
+__attribute__((visibility("default"), used))
+u8 *__coqui_cov_ptr[65536];
+
 /* Pointer to per-thread status array, set by kernel entry (FuzzEntry pass). */
 __attribute__((visibility("default")))
 __attribute__((used))

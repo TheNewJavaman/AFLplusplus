@@ -43,12 +43,23 @@ bool runCoverage(Module &M) {
   Type *voidT = Type::getVoidTy(C);
   Type *i8p = PointerType::get(C, 0);
 
-  FunctionType *GetBaseType = FunctionType::get(i8p, false);
-  FunctionCallee CovBase = M.getOrInsertFunction("__coqui_cov_base", GetBaseType);
-
   FunctionType *VoidNoArg = FunctionType::get(voidT, false);
   FunctionCallee CheckBudget = M.getOrInsertFunction(
       "__coqui_check_thread_budget", VoidNoArg);
+
+  FunctionType *TidT = FunctionType::get(i32, false);
+  FunctionCallee Tid = M.getOrInsertFunction("__coqui_fuzz_tid", TidT);
+
+  /* Read coverage map pointer from __coqui_cov_ptr[tid] — a dedicated
+   * per-thread global array written by MemoryLayout at kernel entry.
+   * This replaces __coqui_cov_base() to avoid the slot-pool aliasing
+   * bug where LLVM eliminated the alloca. */
+  GlobalVariable *CovPtrArr = M.getGlobalVariable("__coqui_cov_ptr");
+  if (!CovPtrArr) {
+    ArrayType *AT = ArrayType::get(i8p, 65536);
+    CovPtrArr = new GlobalVariable(M, AT, false, GlobalValue::ExternalLinkage,
+                                   nullptr, "__coqui_cov_ptr");
+  }
 
   uint32_t globalEdgeId = 0;
   uint32_t globalBBIdx = 0;
@@ -68,13 +79,14 @@ bool runCoverage(Module &M) {
       uint32_t edgeId = globalEdgeId % COV_MAP_SIZE;
       globalEdgeId++;
 
-      Value *covBase = B.CreateCall(GetBaseType, CovBase.getCallee(),
-                                    {}, "cov_base");
+      Value *tid = B.CreateCall(Tid, {}, "tid");
+      Value *covPtrSlot = B.CreateGEP(i8p, CovPtrArr, {tid}, "cov_ptr_slot");
+      Value *covBase = B.CreateLoad(i8p, covPtrSlot, true, "cov_base");
       Value *covPtr = B.CreateGEP(i8, covBase,
                                   ConstantInt::get(i32, edgeId), "cov_ptr");
-      Value *count = B.CreateLoad(i8, covPtr, "cov_count");
+      LoadInst *count = B.CreateLoad(i8, covPtr, true, "cov_count");
       Value *inc = B.CreateAdd(count, ConstantInt::get(i8, 1), "cov_inc");
-      B.CreateStore(inc, covPtr);
+      B.CreateStore(inc, covPtr)->setVolatile(true);
 
       if ((globalBBIdx % BUDGET_CHECK_STRIDE) == 0) {
         B.CreateCall(CheckBudget, {});

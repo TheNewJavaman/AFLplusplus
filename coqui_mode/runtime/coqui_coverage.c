@@ -98,6 +98,8 @@ u32 __coqui_classify_counts_and_sig(u8 *map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
     u32 h = COQUI_FNV32_OFFSET;
+
+
     /* Chunked 8-u64 (64-byte cacheline) walk. FNV semantics preserved:
      * each nonzero word still folds (i, lo, hi) in ascending-index order,
      * so the returned hash is byte-identical to the per-word variant. */
@@ -248,6 +250,7 @@ u32 __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     const u32 mask = __coqui_active_mask();
     int novel = 0;
     u32 h = COQUI_FNV32_OFFSET;
+
 
     u32 laneid = 0;
     int full_warp = likely(mask == 0xFFFFFFFFu);
