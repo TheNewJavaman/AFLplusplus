@@ -1594,8 +1594,6 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
     }
   }
 
-  if (ctx->gpu_mutate_active && ctx->launch_count <= 3) {
-
   /* Process flagged inputs (novelty bitmap bits set) */
   for (u32 word_i = 0; word_i < ctx->batch_size / 32; word_i++) {
     u32 bits = ((u32 *)b->h_novelty)[word_i];
