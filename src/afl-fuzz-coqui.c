@@ -1504,27 +1504,25 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
       u8 *input = b->h_input_bytes + b->h_offsets[i];
       u32 len = b->h_input_lens[i];
 
+      /* The GPU execution was incomplete — undo the submit-time
+       * total_execs/total_submits increment. The CPU rerun below is the
+       * real completion; re-add to total_execs (but not total_submits,
+       * since this is no longer a GPU-side exec). */
+      ctx->total_submits--;
+      afl->fsrv.total_execs--;
+
       if (tr == COQUI_TRAP_OOM) {
         oom_this_batch++;
-        u8 fault = rerun_gpu_failed_input(afl, input, len);
-        if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
-        oom_reruns_this_batch++;
       } else if (tr == COQUI_TRAP_STACK_OVERFLOW) {
         stack_ovf_this_batch++;
-        u8 fault = rerun_gpu_failed_input(afl, input, len);
-        if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
-        oom_reruns_this_batch++;
       } else if (tr == COQUI_TRAP_THREAD_BUDGET_EXHAUSTED) {
-        /* This thread exceeded AFL_COQUI_THREAD_BUDGET_US on the GPU.
-         * NOT a crash — the input simply ran past the per-thread time
-         * cap. Rerun on the CPU forkserver where the budget doesn't
-         * apply; the CPU will either complete normally (cheap) or
-         * also time out (FSRV_RUN_TMOUT — recorded normally). */
         budget_this_batch++;
-        u8 fault = rerun_gpu_failed_input(afl, input, len);
-        if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
-        oom_reruns_this_batch++;
       }
+
+      u8 fault = rerun_gpu_failed_input(afl, input, len);
+      afl->fsrv.total_execs++;
+      if (fault == FSRV_RUN_CRASH) ctx->cpu_rerun_crashes++;
+      oom_reruns_this_batch++;
     }
     ctx->oom_inputs_found += oom_this_batch;
     ctx->stack_overflow_inputs_found += stack_ovf_this_batch;
