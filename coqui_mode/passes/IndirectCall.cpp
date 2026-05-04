@@ -374,6 +374,9 @@ bool runIndirectCall(Module &M) {
   auto *TrapFnTy = FunctionType::get(VoidTy, {I8Ty}, false);
   FunctionCallee CoquiTrap =
       M.getOrInsertFunction("__coqui_trap_with_reason", TrapFnTy);
+  FunctionCallee CheckBudget = M.getOrInsertFunction(
+      "__coqui_check_thread_budget",
+      FunctionType::get(VoidTy, false));
   ConstantInt *TrapDevirt = ConstantInt::get(I8Ty, 13); // COQUI_TRAP_DEVIRT
 
   bool Changed = false;
@@ -488,6 +491,8 @@ bool runIndirectCall(Module &M) {
       }
 
       IRBuilder<> B(CurBB);
+      if (t > 0 && (t % 8) == 0)
+        B.CreateCall(CheckBudget, {});
       Value *Cmp = B.CreateICmpEQ(Callee, Target, "devirt.eq");
       B.CreateCondBr(Cmp, CallBB, NextBB);
 
