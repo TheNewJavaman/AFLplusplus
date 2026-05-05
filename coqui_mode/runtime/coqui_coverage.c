@@ -247,8 +247,16 @@ u32 __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
     const u32 n = (__coqui_edge_count + 7) / 8;
+    const u32 mask = __coqui_active_mask();
     int novel = 0;
     u32 h = COQUI_FNV32_OFFSET;
+
+
+    u32 laneid = 0;
+    int full_warp = likely(mask == 0xFFFFFFFFu);
+    if (full_warp) {
+        asm volatile("mov.u32 %0, %%laneid;" : "=r"(laneid));
+    }
 
     for (u32 i = 0; i < n; i++) {
         u64 raw = m64[i];
@@ -266,12 +274,26 @@ u32 __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
         h = (h ^ (u32)(raw))       * COQUI_FNV32_PRIME;
         h = (h ^ (u32)(raw >> 32)) * COQUI_FNV32_PRIME;
 
-        /* Virgin compare — per-thread atomic, no warp reduction. */
-        u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
-        if (likely((raw & ~v_pre) == 0)) continue;
-        u64 was = atomic_fetch_or_explicit(&v64[i], raw,
-                                            memory_order_relaxed);
-        if (unlikely(raw & ~was)) { novel = 1; }
+        /* Virgin compare with warp reduction. */
+        if (full_warp) {
+            u64 warp_classified = __coqui_warp_or_u64(mask, raw);
+            u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
+            if (likely((warp_classified & ~v_pre) == 0)) continue;
+
+            u64 was0 = 0;
+            if (laneid == 0) {
+                was0 = atomic_fetch_or_explicit(&v64[i], warp_classified,
+                                                memory_order_relaxed);
+            }
+            u64 was = __coqui_warp_bcast_u64(mask, was0, 0);
+            if (unlikely(raw & ~was)) { novel = 1; }
+        } else {
+            u64 v_pre = atomic_load_explicit(&v64[i], memory_order_relaxed);
+            if (likely((raw & ~v_pre) == 0)) continue;
+            u64 was = atomic_fetch_or_explicit(&v64[i], raw,
+                                                memory_order_relaxed);
+            if (unlikely(raw & ~was)) { novel = 1; }
+        }
     }
 
     if (unlikely(novel)) {
