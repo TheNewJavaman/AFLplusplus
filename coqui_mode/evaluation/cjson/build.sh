@@ -28,6 +28,7 @@ HARNESS_SRC="${SCRIPT_DIR}/harness.c"
 ARCH="${ARCH:-sm_75}"
 STACK_SIZE=131072          # 128 KB: cjson+sanitizer frames exceed 32KB default; headroom for StackSpill if needed
 SLAB_POOL_SIZE=2147483648  # 2 GiB: required for StackSpill runtime; non-zero enables slab binds in coqui_init
+THREAD_BUDGET_US=2000000   # 2s: +17% exec/s vs default 200ms (traps flat at 0.07%)
 
 # cJSON upstream pin (matches coqui's legacy fetch at v1.7.18)
 CJSON_COMMIT="acc76239bee01d8e9c858ae2cab296704e52d916"
@@ -109,3 +110,4 @@ echo
 echo "=== Build complete ==="
 ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
 echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"
+echo "  runtime: export AFL_COQUI_THREAD_BUDGET_US=${THREAD_BUDGET_US}"

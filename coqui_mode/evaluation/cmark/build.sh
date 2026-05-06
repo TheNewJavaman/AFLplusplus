@@ -30,6 +30,7 @@ HARNESS_SRC="${SCRIPT_DIR}/harness.c"
 ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768          # cmark's legacy coqui spec default
 SLAB_POOL_SIZE=0
+THREAD_BUDGET_US=2000000   # 2s: drops trap rate 46% → 0.05% (GPU verify=0 regardless)
 
 # cmark upstream pin (matches legacy nix spec: rev = tag 0.31.1)
 CMARK_OWNER="commonmark"
@@ -178,3 +179,4 @@ echo
 echo "=== Build complete ==="
 ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
 echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"
+echo "  runtime: export AFL_COQUI_THREAD_BUDGET_US=${THREAD_BUDGET_US}"

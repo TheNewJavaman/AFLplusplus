@@ -32,6 +32,7 @@ STUBS_SRC="${SCRIPT_DIR}/libxml2_stubs.c"
 ARCH="${ARCH:-sm_75}"
 STACK_SIZE=32768             # libxml2.nix sets --stack-size 32768
 SLAB_POOL_SIZE=2147483648    # 2 GiB — from libxml2.nix
+THREAD_BUDGET_US=1000000     # 1s: drops trap rate 4.7% → 0.04%
 
 # libxml2 upstream pin — matches nix/cpu-target-specs.nix (v2.13.4).
 XML2_OWNER="GNOME"
@@ -303,3 +304,4 @@ echo
 echo "=== Build complete ==="
 ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
 echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"
+echo "  runtime: export AFL_COQUI_THREAD_BUDGET_US=${THREAD_BUDGET_US}"
