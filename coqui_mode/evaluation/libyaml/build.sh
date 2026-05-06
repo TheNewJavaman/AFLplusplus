@@ -44,6 +44,7 @@ cd "${SCRIPT_DIR}"
 HARNESS_BASENAME="libyaml_parser_fuzzer"
 HARNESS_SRC="${SCRIPT_DIR}/harness.c"
 ARCH="${ARCH:-sm_75}"
+THREAD_BUDGET_US=500000    # 500ms: drops trap rate 12.5% → 1.1% (throughput ~neutral)
 
 # libyaml upstream pin (matches legacy coqui fetch at rev 0.2.5).
 LIBYAML_OWNER="yaml"
@@ -160,3 +161,4 @@ echo
 echo "=== Build complete ==="
 ls -la "${HARNESS_BASENAME}.cubin" "${HARNESS_BASENAME}.conf" "${CPU_OUT}" seeds
 echo "  conf:"; sed 's/^/    /' "${HARNESS_BASENAME}.conf"
+echo "  runtime: export AFL_COQUI_THREAD_BUDGET_US=${THREAD_BUDGET_US}"
