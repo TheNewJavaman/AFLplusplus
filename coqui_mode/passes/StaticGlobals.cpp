@@ -208,6 +208,20 @@ bool runStaticGlobals(Module &M) {
     if (GV->isConstant())
       continue;
 
+    // Skip globals with non-zero initializers. The per-thread pool is
+    // zeroed by the host (cuMemsetD8), so any global whose initializer
+    // contains non-zero data (e.g. function pointers, non-trivial
+    // defaults) would lose its initial values after pooling — the
+    // per-thread copy would read all-zeros instead. This caused cmark's
+    // DEFAULT_MEM_ALLOCATOR (which holds {xcalloc, xrealloc, free}
+    // function pointers) to be pooled with NULL pointers, making every
+    // allocation attempt hit the IndirectCall devirt trap immediately.
+    if (!GV->getInitializer()->isNullValue()) {
+      errs() << "[coqui-statics] skipping " << Name
+             << " (non-zero initializer would be lost in zeroed pool)\n";
+      continue;
+    }
+
     // Must be actually writable somewhere (otherwise leave shared).
     if (!hasStoreUses(GV))
       continue;
