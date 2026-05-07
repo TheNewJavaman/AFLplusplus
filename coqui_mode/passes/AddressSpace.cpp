@@ -49,6 +49,7 @@
 #include "Transforms.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -133,6 +134,12 @@ bool runAddressSpace(llvm::Module &M) {
   using namespace llvm;
 
   constexpr unsigned AS_Global = 1;
+  constexpr unsigned AS_Const  = 4;       /* NVPTX .const memory */
+  /* Budget for .const promotions: leave headroom below the 64KB hardware
+   * limit. The constant cache is shared with kernel arguments and
+   * compiler-generated constant data, so we cap usage at 32KB to avoid
+   * ptxas "constant memory limit exceeded" failures. */
+  constexpr uint64_t kConstBudget = 32u * 1024u;
 
   /* Phase 0: pick candidates. */
   SmallVector<GlobalVariable *> ToProcess;
@@ -161,21 +168,71 @@ bool runAddressSpace(llvm::Module &M) {
     return false;
   }
 
-  /* Phase 1: create AS=1 twins with null initializers. We set initializers
-   * in Phase 2 once every twin exists, so cross-references resolve to
-   * twins instead of stale AS=0 originals. */
-  DenseMap<GlobalVariable *, GlobalVariable *> OldToNew;
+  /* Pre-scan: identify read-only globals eligible for .const (AS=4).
+   * Criteria: isConstant(), has a non-zero initializer, sized type, and
+   * fits within the cumulative .const budget. Globals whose initializers
+   * reference other globals are excluded (cross-references between .const
+   * and .global require addrspacecast in initializer context, which NVPTX
+   * cannot lower). */
+  const DataLayout &DL = M.getDataLayout();
+  DenseSet<GlobalVariable *> ConstCandidates;
+  uint64_t ConstUsed = 0;
   for (GlobalVariable *GV : ToProcess) {
+    if (!GV->isConstant())
+      continue;
+    if (!GV->hasInitializer())
+      continue;
+    /* Skip zero-initialized constants: .const zero-fill has no advantage
+     * over .global since ptxas elides the store either way. */
+    if (GV->getInitializer()->isNullValue())
+      continue;
+    Type *Ty = GV->getValueType();
+    if (!Ty->isSized())
+      continue;
+    TypeSize TS = DL.getTypeAllocSize(Ty);
+    if (TS.isScalable())
+      continue;
+    uint64_t Sz = TS.getFixedValue();
+    if (Sz == 0 || Sz > 4096)
+      continue;   /* skip very large constants to preserve budget */
+    /* Skip globals whose initializers reference other globals (pointer
+     * members). The initializer walk is cheap: just check for
+     * GlobalValue references at depth 1. */
+    bool HasPtrRef = false;
+    if (auto *Init = GV->getInitializer()) {
+      for (unsigned i = 0, e = Init->getNumOperands(); i < e; ++i) {
+        if (isa<GlobalValue>(Init->getOperand(i))) {
+          HasPtrRef = true;
+          break;
+        }
+      }
+    }
+    if (HasPtrRef)
+      continue;
+    if (ConstUsed + Sz > kConstBudget)
+      continue;
+    ConstUsed += Sz;
+    ConstCandidates.insert(GV);
+  }
+
+  /* Phase 1: create twins. Read-only globals that fit the .const budget
+   * go to AS=4 (.const); everything else goes to AS=1 (.global). */
+  DenseMap<GlobalVariable *, GlobalVariable *> OldToNew;
+  unsigned ConstCount = 0;
+  for (GlobalVariable *GV : ToProcess) {
+    unsigned TargetAS = ConstCandidates.count(GV) ? AS_Const : AS_Global;
     auto *NewGV = new GlobalVariable(
         M, GV->getValueType(), GV->isConstant(), GV->getLinkage(),
         /*Initializer=*/nullptr, "", /*InsertBefore=*/nullptr,
-        GV->getThreadLocalMode(), AS_Global, GV->isExternallyInitialized());
+        GV->getThreadLocalMode(), TargetAS, GV->isExternallyInitialized());
 
     NewGV->setAlignment(GV->getAlign());
     NewGV->setSection(GV->getSection());
     NewGV->copyMetadata(GV, /*Offset=*/0);
 
     OldToNew[GV] = NewGV;
+    if (TargetAS == AS_Const)
+      ++ConstCount;
   }
 
   /* Phase 2: remap initializers so cross-references point at twins. */
@@ -210,7 +267,8 @@ bool runAddressSpace(llvm::Module &M) {
   }
 
   errs() << "[coqui] AddressSpaceTransform: promoted " << ToProcess.size()
-         << " global(s) from AS0 to AS1\n";
+         << " global(s) from AS0 (" << ConstCount << " to AS4/.const, "
+         << (ToProcess.size() - ConstCount) << " to AS1/.global)\n";
   return true;
 }
 

@@ -772,7 +772,7 @@ static void asan_memset_u8(void *dst, int c, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) d[i] = (u8)c;
 }
 
-static void asan_memcpy_u8(void *dst, const void *src, unsigned long n) {
+static void asan_memcpy_u8(void * __restrict__ dst, const void * __restrict__ src, unsigned long n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
     for (unsigned long i = 0; i < n; i++) d[i] = s[i];

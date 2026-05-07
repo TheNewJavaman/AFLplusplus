@@ -182,7 +182,7 @@ u32  __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap);
 /* Dedup hash of partial coverage at crash time (called from asan_report).
  * Uses the same FNV-1a algorithm as the classify_and_sig variant so
  * signatures are comparable across crashed and clean threads. */
-u32  __coqui_trace_sig(u8 *map);
+u32  __coqui_trace_sig(const u8 *map);
 
 /* prev_loc (per-thread, for AFL hash instrumentation) */
 u32 *__coqui_prev_loc_ptr(void);

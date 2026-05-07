@@ -54,7 +54,7 @@ static inline void __coqui_classify_word(u64 *w) {
  * LDG.E.128 instructions. Per-word classify semantics unchanged.
  * `nothrow`. */
 __attribute__((nothrow))
-void __coqui_classify_counts(u8 *map) {
+void __coqui_classify_counts(u8 * __restrict__ map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
     /* n_chunks is 8192 == multiple of 8 (1024 cachelines). */
@@ -94,7 +94,7 @@ void __coqui_classify_counts(u8 *map) {
  * from the hash is safe because the u32 index is always mixed in, so
  * two maps that differ only in which zeros are skipped can't collide. */
 __attribute__((nothrow))
-u32 __coqui_classify_counts_and_sig(u8 *map) {
+u32 __coqui_classify_counts_and_sig(u8 * __restrict__ map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;     /* 8192 words */
     u32 h = COQUI_FNV32_OFFSET;
@@ -180,7 +180,7 @@ u32 __coqui_classify_counts_and_sig(u8 *map) {
  * `pure, nothrow`: reads only the cov_map argument's memory and returns
  * a derived value with no side effects. */
 __attribute__((pure, nothrow))
-u32 __coqui_trace_sig(u8 *map) {
+u32 __coqui_trace_sig(const u8 * __restrict__ map) {
     u64 *m64 = (u64 *)map;
     const u32 n_chunks = COQUI_COV_MAP_SIZE / 8;
     u32 h = COQUI_FNV32_OFFSET;
@@ -241,7 +241,8 @@ __attribute__((weak))
 u32 __coqui_edge_count = COQUI_COV_MAP_SIZE;
 
 __attribute__((nothrow))
-u32 __coqui_classify_virgin_fused(u8 *map, u8 *virgin, u32 *novelty_bitmap) {
+u32 __coqui_classify_virgin_fused(u8 * __restrict__ map, u8 * __restrict__ virgin,
+                                   u32 * __restrict__ novelty_bitmap) {
     _Atomic u64 *v64 = (_Atomic u64 *)virgin;
     u64 *m64 = (u64 *)map;
     const u32 n = (__coqui_edge_count + 7) / 8;
