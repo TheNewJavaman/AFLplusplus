@@ -279,9 +279,17 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
         M, PtrTy, /*isConstant=*/false, GlobalValue::ExternalLinkage,
         Constant::getNullValue(PtrTy), "__coqui_slab_shadow");
   }
-  Value *SlabBasePtr = B.CreateLoad(PtrTy, SlabPoolGV, "slab_base");
+  // Slab pool base pointer and size are set once by the host (cuMemcpyHtoD)
+  // before kernel launch and never modified during execution. Mark loads
+  // with !invariant.load so LLVM can CSE/hoist them across the function.
+  MDNode *InvariantMD = MDNode::get(Ctx, {});
+  auto *SlabBaseLd = B.CreateLoad(PtrTy, SlabPoolGV, "slab_base");
+  SlabBaseLd->setMetadata(LLVMContext::MD_invariant_load, InvariantMD);
+  Value *SlabBasePtr = SlabBaseLd;
   Value *SlabBaseI64 = B.CreatePtrToInt(SlabBasePtr, I64Ty, "slab_base.i64");
-  Value *SlabSize = B.CreateLoad(I64Ty, SlabPoolSizeGV, "slab_size");
+  auto *SlabSizeLd = B.CreateLoad(I64Ty, SlabPoolSizeGV, "slab_size");
+  SlabSizeLd->setMetadata(LLVMContext::MD_invariant_load, InvariantMD);
+  Value *SlabSize = SlabSizeLd;
   Value *SlabRel = B.CreateSub(AddrI64, SlabBaseI64, "slab_rel");
   Value *InSlab = B.CreateICmpULT(SlabRel, SlabSize, "inslab");
   // 5/95 branch weight: most accesses are to the per-thread heap, so the
@@ -292,7 +300,9 @@ static llvm::Function *createSizedFastHelper(llvm::Module &M,
 
   // --- slab_shadow: check slab shadow byte ---
   B.SetInsertPoint(SlabShadowBB);
-  Value *SlabShadowBase = B.CreateLoad(PtrTy, SlabShadowGV, "slab_shadow_base");
+  auto *SlabShadowBaseLd = B.CreateLoad(PtrTy, SlabShadowGV, "slab_shadow_base");
+  SlabShadowBaseLd->setMetadata(LLVMContext::MD_invariant_load, InvariantMD);
+  Value *SlabShadowBase = SlabShadowBaseLd;
   Value *SlabShadowBaseI64 =
       B.CreatePtrToInt(SlabShadowBase, I64Ty, "slab_shadow_base.i64");
   Value *SlabShadowIdx =

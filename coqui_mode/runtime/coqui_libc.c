@@ -62,7 +62,7 @@ int __coqui_strncmp(const char *a, const char *b, unsigned long n) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-int __coqui_memcmp(const void *a, const void *b, unsigned long n) {
+int __coqui_memcmp(const void * __restrict__ a, const void * __restrict__ b, unsigned long n) {
     const unsigned char *p = (const unsigned char *)a;
     const unsigned char *q = (const unsigned char *)b;
     while (n--) {
@@ -88,20 +88,20 @@ char *__coqui_strrchr(const char *s, int c) {
     return (char *)last;
 }
 
-char *__coqui_strcpy(char *d, const char *s) {
+char *__coqui_strcpy(char * __restrict__ d, const char * __restrict__ s) {
     char *r = d;
     while ((*d++ = *s++));
     return r;
 }
 
-char *__coqui_strncpy(char *d, const char *s, unsigned long n) {
+char *__coqui_strncpy(char * __restrict__ d, const char * __restrict__ s, unsigned long n) {
     unsigned long i;
     for (i = 0; i < n && s[i]; i++) d[i] = s[i];
     for (; i < n; i++) d[i] = 0;
     return d;
 }
 
-char *__coqui_strcat(char *d, const char *s) {
+char *__coqui_strcat(char * __restrict__ d, const char * __restrict__ s) {
     char *r = d;
     while (*d) d++;
     while ((*d++ = *s++));
@@ -207,7 +207,7 @@ void *__coqui_memchr(const void *s, int c, unsigned long n) {
  * memcpy / memmove / memset — byte-loop versions (legacy, explicit calls)
  * ===========================================================================*/
 
-void *__coqui_memcpy(void *dst, const void *src, unsigned long n) {
+void *__coqui_memcpy(void * __restrict__ dst, const void * __restrict__ src, unsigned long n) {
     unsigned char *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
     for (unsigned long i = 0; i < n; i++) d[i] = s[i];
@@ -241,7 +241,7 @@ void *__coqui_memset(void *s, int c, unsigned long n) {
 
 /* --- 8-byte aligned variants (compiler proved both ptrs ≥ 8-aligned) --- */
 
-void *__coqui_memcpy_a8(void *dst, const void *src, unsigned long n) {
+void *__coqui_memcpy_a8(void * __restrict__ dst, const void * __restrict__ src, unsigned long n) {
     unsigned long *d8 = (unsigned long *)dst;
     const unsigned long *s8 = (const unsigned long *)src;
     unsigned long words = n >> 3;
@@ -289,7 +289,7 @@ void *__coqui_memset_a8(void *s, int c, unsigned long n) {
 
 /* --- 4-byte aligned variants (compiler proved both ptrs ≥ 4-aligned) --- */
 
-void *__coqui_memcpy_a4(void *dst, const void *src, unsigned long n) {
+void *__coqui_memcpy_a4(void * __restrict__ dst, const void * __restrict__ src, unsigned long n) {
     unsigned int *d4 = (unsigned int *)dst;
     const unsigned int *s4 = (const unsigned int *)src;
     unsigned long words = n >> 2;
@@ -873,7 +873,7 @@ int __coqui_wcsncmp(const int *a, const int *b, unsigned long n) {
     if (!n) return 0;
     return (*a > *b) - (*a < *b);
 }
-int *__coqui_wmemcpy(int *d, const int *s, unsigned long n) {
+int *__coqui_wmemcpy(int * __restrict__ d, const int * __restrict__ s, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) d[i] = s[i];
     return d;
 }
@@ -881,18 +881,18 @@ int *__coqui_wmemset(int *d, int c, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) d[i] = c;
     return d;
 }
-int *__coqui_wcscpy(int *d, const int *s) {
+int *__coqui_wcscpy(int * __restrict__ d, const int * __restrict__ s) {
     int *r = d;
     while ((*d++ = *s++));
     return r;
 }
-int *__coqui_wcsncpy(int *d, const int *s, unsigned long n) {
+int *__coqui_wcsncpy(int * __restrict__ d, const int * __restrict__ s, unsigned long n) {
     unsigned long i;
     for (i = 0; i < n && s[i]; i++) d[i] = s[i];
     for (; i < n; i++) d[i] = 0;
     return d;
 }
-int *__coqui_wcscat(int *d, const int *s) {
+int *__coqui_wcscat(int * __restrict__ d, const int * __restrict__ s) {
     int *r = d;
     while (*d) d++;
     while ((*d++ = *s++));
