@@ -9,12 +9,18 @@
  * This pass reads the alignment metadata that LLVM attaches to each
  * intrinsic and dispatches to alignment-specialized runtime functions:
  *
- *   both src+dst align ≥ 8  →  __coqui_memcpy_a8  (8-byte word loop)
- *   both src+dst align ≥ 4  →  __coqui_memcpy_a4  (4-byte word loop)
- *   otherwise               →  __coqui_memcpy      (byte loop)
+ *   both src+dst align >= 8  ->  __coqui_memcpy_a8  (8-byte word loop)
+ *   both src+dst align >= 4  ->  __coqui_memcpy_a4  (4-byte word loop)
+ *   otherwise                ->  __coqui_memcpy      (byte loop)
  *
  * Same scheme for memset (only dst alignment matters) and memmove.
- * No runtime alignment checks — the compiler already proved it.
+ * No runtime alignment checks --- the compiler already proved it.
+ *
+ * Constant-size optimization (<=64 bytes): when the length is a compile-time
+ * constant, the pass emits direct LLVM IR load/store sequences instead of a
+ * function call, saving ~8 PTX instructions of call overhead and the
+ * per-byte loop cost.  Memmove is always lowered to a function call because
+ * overlap semantics are complex.
  */
 
 #include "Transforms.h"
@@ -28,6 +34,97 @@
 using namespace llvm;
 
 namespace coqui {
+
+/// Maximum constant size (in bytes) eligible for inline expansion.
+static constexpr uint64_t kInlineThreshold = 64;
+
+/// Emit a sequence of load/store pairs to copy \p Size bytes from \p Src to
+/// \p Dst, using the widest type allowed by \p MinAlign.  The IRBuilder
+/// insertion point must already be set.
+static void emitInlineMemcpy(IRBuilder<> &B, Value *Dst, Value *Src,
+                             uint64_t Size, unsigned MinAlign) {
+  LLVMContext &C = B.getContext();
+  // Pick the widest word type the alignment supports.
+  unsigned WordBytes = MinAlign >= 8 ? 8 : MinAlign >= 4 ? 4 : 1;
+  Type *WordTy = Type::getIntNTy(C, WordBytes * 8);
+
+  uint64_t Off = 0;
+
+  // Main word-aligned copies.
+  while (Off + WordBytes <= Size) {
+    Value *SrcGEP = B.CreateInBoundsGEP(B.getInt8Ty(), Src,
+                                        B.getInt64(Off));
+    Value *DstGEP = B.CreateInBoundsGEP(B.getInt8Ty(), Dst,
+                                        B.getInt64(Off));
+    LoadInst *L = B.CreateAlignedLoad(WordTy, SrcGEP, Align(WordBytes));
+    B.CreateAlignedStore(L, DstGEP, Align(WordBytes));
+    Off += WordBytes;
+  }
+
+  // Handle any remainder bytes one at a time.
+  Type *I8Ty = Type::getInt8Ty(C);
+  while (Off < Size) {
+    Value *SrcGEP = B.CreateInBoundsGEP(I8Ty, Src, B.getInt64(Off));
+    Value *DstGEP = B.CreateInBoundsGEP(I8Ty, Dst, B.getInt64(Off));
+    LoadInst *L = B.CreateAlignedLoad(I8Ty, SrcGEP, Align(1));
+    B.CreateAlignedStore(L, DstGEP, Align(1));
+    Off++;
+  }
+}
+
+/// Emit a sequence of stores to set \p Size bytes at \p Dst to \p ByteVal,
+/// using the widest type allowed by \p DstAlign.
+static void emitInlineMemset(IRBuilder<> &B, Value *Dst, Value *ByteVal,
+                             uint64_t Size, unsigned DstAlign) {
+  LLVMContext &C = B.getContext();
+  unsigned WordBytes = DstAlign >= 8 ? 8 : DstAlign >= 4 ? 4 : 1;
+  Type *WordTy = Type::getIntNTy(C, WordBytes * 8);
+
+  // Replicate the byte value into the word type.
+  // e.g. for i32: val = byte | (byte<<8) | (byte<<16) | (byte<<24)
+  Value *WordVal;
+  if (WordBytes == 1) {
+    WordVal = ByteVal;
+    if (WordVal->getType() != Type::getInt8Ty(C))
+      WordVal = B.CreateTrunc(WordVal, Type::getInt8Ty(C));
+  } else {
+    // Ensure ByteVal is i8 first.
+    Value *Byte8 = ByteVal;
+    if (Byte8->getType() != Type::getInt8Ty(C))
+      Byte8 = B.CreateTrunc(Byte8, Type::getInt8Ty(C));
+    // Zero-extend to the word type.
+    WordVal = B.CreateZExt(Byte8, WordTy);
+    // Replicate by shifting and OR-ing.
+    for (unsigned Shift = 8; Shift < WordBytes * 8; Shift *= 2) {
+      Value *Shifted = B.CreateShl(WordVal, Shift);
+      WordVal = B.CreateOr(WordVal, Shifted);
+    }
+  }
+
+  uint64_t Off = 0;
+
+  // Main word-aligned stores.
+  while (Off + WordBytes <= Size) {
+    Value *DstGEP = B.CreateInBoundsGEP(B.getInt8Ty(), Dst,
+                                        B.getInt64(Off));
+    B.CreateAlignedStore(WordVal, DstGEP, Align(WordBytes));
+    Off += WordBytes;
+  }
+
+  // Remainder bytes.
+  Value *Byte8ForRemainder = nullptr;
+  Type *I8Ty = Type::getInt8Ty(C);
+  while (Off < Size) {
+    if (!Byte8ForRemainder) {
+      Byte8ForRemainder = ByteVal;
+      if (Byte8ForRemainder->getType() != I8Ty)
+        Byte8ForRemainder = B.CreateTrunc(Byte8ForRemainder, I8Ty);
+    }
+    Value *DstGEP = B.CreateInBoundsGEP(I8Ty, Dst, B.getInt64(Off));
+    B.CreateAlignedStore(Byte8ForRemainder, DstGEP, Align(1));
+    Off++;
+  }
+}
 
 bool runMemIntrinsics(Module &M) {
   LLVMContext &C = M.getContext();
@@ -57,6 +154,7 @@ bool runMemIntrinsics(Module &M) {
 
   SmallVector<Instruction *, 64> ToErase;
   unsigned A8 = 0, A4 = 0, A1 = 0;
+  unsigned InlineCpy = 0, InlineSet = 0;
 
   for (Function &F : M) {
     if (F.isDeclaration())
@@ -68,6 +166,19 @@ bool runMemIntrinsics(Module &M) {
           unsigned SrcA = MC->getSourceAlign().valueOrOne().value();
           unsigned MinA = std::min(DstA, SrcA);
 
+          // Constant-size inline expansion for small copies.
+          if (auto *CI = dyn_cast<ConstantInt>(MC->getLength())) {
+            uint64_t Size = CI->getZExtValue();
+            if (Size <= kInlineThreshold) {
+              IRBuilder<> B(MC);
+              emitInlineMemcpy(B, MC->getDest(), MC->getSource(), Size, MinA);
+              ToErase.push_back(MC);
+              InlineCpy++;
+              continue;
+            }
+          }
+
+          // Variable size or size > threshold: fall through to function call.
           FunctionCallee Fn = MinA >= 8 ? CpyA8 : MinA >= 4 ? CpyA4 : CpyA1;
           (MinA >= 8 ? A8 : MinA >= 4 ? A4 : A1)++;
 
@@ -79,6 +190,7 @@ bool runMemIntrinsics(Module &M) {
           ToErase.push_back(MC);
 
         } else if (auto *MM = dyn_cast<MemMoveInst>(&I)) {
+          // Never inline memmove (overlap semantics).
           unsigned DstA = MM->getDestAlign().valueOrOne().value();
           unsigned SrcA = MM->getSourceAlign().valueOrOne().value();
           unsigned MinA = std::min(DstA, SrcA);
@@ -96,6 +208,19 @@ bool runMemIntrinsics(Module &M) {
         } else if (auto *MS = dyn_cast<MemSetInst>(&I)) {
           unsigned DstA = MS->getDestAlign().valueOrOne().value();
 
+          // Constant-size inline expansion for small memsets.
+          if (auto *CI = dyn_cast<ConstantInt>(MS->getLength())) {
+            uint64_t Size = CI->getZExtValue();
+            if (Size <= kInlineThreshold) {
+              IRBuilder<> B(MS);
+              emitInlineMemset(B, MS->getDest(), MS->getValue(), Size, DstA);
+              ToErase.push_back(MS);
+              InlineSet++;
+              continue;
+            }
+          }
+
+          // Variable size or size > threshold: fall through to function call.
           FunctionCallee Fn = DstA >= 8 ? SetA8 : DstA >= 4 ? SetA4 : SetA1;
           (DstA >= 8 ? A8 : DstA >= 4 ? A4 : A1)++;
 
@@ -116,9 +241,11 @@ bool runMemIntrinsics(Module &M) {
   for (Instruction *I : ToErase)
     I->eraseFromParent();
 
-  if (A8 || A4 || A1)
+  if (A8 || A4 || A1 || InlineCpy || InlineSet)
     errs() << "[coqui-mem] Lowered mem intrinsics: "
-           << A8 << " @align8, " << A4 << " @align4, " << A1 << " @align1\n";
+           << A8 << " @align8, " << A4 << " @align4, " << A1 << " @align1"
+           << " | inlined: " << InlineCpy << " memcpy, "
+           << InlineSet << " memset\n";
 
   return !ToErase.empty();
 }
