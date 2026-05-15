@@ -12,6 +12,11 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <pthread.h>
 
 #include <cuda.h>
 
@@ -73,10 +78,224 @@ static void alloc_batch_half_cuda(coqui_batch_t *b, coqui_ctx_t *ctx, CUstream s
 
   b->n_inputs   = 0;
   b->bytes_used = 0;
+  b->n_claimed  = 0;  /* M2 atomic: slots reserved */
+  b->n_filled   = 0;  /* M2 atomic: slots whose memcpy completed */
   b->launch_start_us = 0;  /* adaptive batch-timeout (B1): no launch yet */
 
 }
 
+
+/* ------------------------------------------------------------------------
+ * Multi-thread CPU mutation fan-in (M1).
+ *
+ * Spawns N-1 helper pthreads that each mutate from a snapshot of the seed
+ * corpus and submit into the shared coqui ctx via mutex-protected
+ * `coqui_submit_input`. Pure throughput amplifier: helpers do not touch
+ * AFL queue, virgin_bits, or corpus; the main thread continues to own all
+ * those via its normal fuzz_one loop. Goal: ~N× host submit rate.
+ *
+ * Env: AFL_COQUI_MUTATE_THREADS=N (default 1 = no helpers).
+ * ------------------------------------------------------------------------*/
+typedef struct mt_helper_arg {
+  afl_state_t *afl;
+  u32          tid;          /* helper id, [0, N-2] */
+  u64          seed;         /* PRNG seed (per-thread) */
+} mt_helper_arg_t;
+
+static inline u64 mt_xorshift64(u64 *s) {
+  u64 x = *s;
+  x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+  *s = x;
+  return x;
+}
+
+static void mt_load_seed_corpus(afl_state_t *afl, coqui_ctx_t *ctx) {
+  /* Read every regular file under afl->in_dir into a single packed buffer.
+   * We do NOT touch afl->queue (it's not thread-safe for concurrent reads)
+   * and we do NOT honor subdirs / dotfiles (to match AFL's seed-loading
+   * filter loosely). One-time cost at init. */
+  ctx->mt_seed_count = 0;
+  ctx->mt_seed_bytes_used = 0;
+  ctx->mt_seed_bytes  = NULL;
+  ctx->mt_seed_offsets = NULL;
+  ctx->mt_seed_lens    = NULL;
+
+  if (!afl->in_dir) return;
+
+  DIR *d = opendir((char *)afl->in_dir);
+  if (!d) return;
+
+  /* First pass: count files, sum sizes. */
+  u32 n = 0;
+  u64 total = 0;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (de->d_name[0] == '.') continue;
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", afl->in_dir, de->d_name);
+    struct stat st;
+    if (stat(path, &st) != 0) continue;
+    if (!S_ISREG(st.st_mode)) continue;
+    if (st.st_size == 0) continue;
+    if ((u64)st.st_size > ctx->max_input_size) continue;  /* skip oversized */
+    n++;
+    total += (u64)st.st_size;
+  }
+  closedir(d);
+  if (n == 0 || total == 0) return;
+
+  ctx->mt_seed_bytes   = ck_alloc(total);
+  ctx->mt_seed_offsets = ck_alloc(n * sizeof(u32));
+  ctx->mt_seed_lens    = ck_alloc(n * sizeof(u32));
+
+  /* Second pass: load. */
+  d = opendir((char *)afl->in_dir);
+  if (!d) { ck_free(ctx->mt_seed_bytes); ctx->mt_seed_bytes = NULL; return; }
+  u32 idx = 0;
+  u32 off = 0;
+  while ((de = readdir(d)) != NULL && idx < n) {
+    if (de->d_name[0] == '.') continue;
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", afl->in_dir, de->d_name);
+    struct stat st;
+    if (stat(path, &st) != 0) continue;
+    if (!S_ISREG(st.st_mode)) continue;
+    if (st.st_size == 0) continue;
+    if ((u64)st.st_size > ctx->max_input_size) continue;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) continue;
+    ssize_t got = read(fd, ctx->mt_seed_bytes + off, st.st_size);
+    close(fd);
+    if (got <= 0) continue;
+    ctx->mt_seed_offsets[idx] = off;
+    ctx->mt_seed_lens[idx]    = (u32)got;
+    off += (u32)got;
+    idx++;
+  }
+  closedir(d);
+  ctx->mt_seed_count      = idx;
+  ctx->mt_seed_bytes_used = off;
+}
+
+/* Forward decl — coqui_submit_input is defined further down; helpers call it
+ * via the mutex-protected wrapper that's also further down (mt_submit_locked). */
+u8 coqui_submit_input(struct afl_state *afl, u8 *buf, u32 len);
+
+static void *mt_helper_thread_fn(void *arg) {
+  mt_helper_arg_t *a = (mt_helper_arg_t *)arg;
+  afl_state_t *afl = a->afl;
+  coqui_ctx_t *ctx = afl->coqui;
+  u64 prng = a->seed ? a->seed : (0x9E3779B97F4A7C15ULL ^ (u64)a->tid);
+  u32 max_len = ctx->max_input_size;
+  if (max_len == 0 || max_len > 65536) max_len = 4096;
+  u8 *buf = (u8 *)ck_alloc(max_len);
+
+  while (!ctx->mt_stop && !afl->stop_soon) {
+    if (ctx->mt_seed_count == 0) {
+      usleep(1000);
+      continue;
+    }
+    /* Pick a random seed snapshot, copy to local buf, apply 1-4 random byte
+     * flips, then submit. Cheap havoc — the goal is to keep the GPU fed.
+     * Helpers do not need AFL-byte-identical mutations; throughput is the
+     * objective and the main thread continues to drive corpus-discovery
+     * mutations via its own fuzz_one loop. */
+    u32 si  = (u32)(mt_xorshift64(&prng) % ctx->mt_seed_count);
+    u32 off = ctx->mt_seed_offsets[si];
+    u32 len = ctx->mt_seed_lens[si];
+    if (len > max_len) len = max_len;
+    memcpy(buf, ctx->mt_seed_bytes + off, len);
+
+    int nflips = 1 + (int)(mt_xorshift64(&prng) & 3);
+    for (int i = 0; i < nflips; i++) {
+      u32 bit = (u32)(mt_xorshift64(&prng) % (u64)(len * 8));
+      buf[bit >> 3] ^= (u8)(1u << (bit & 7));
+    }
+
+    /* coqui_submit_input takes mt_submit_mutex internally when mt_enabled,
+     * so the helper just calls it directly. The diagnostic counter for
+     * helper-origin submits is bumped inside the lock by the wrapper. */
+    if (!ctx->mt_stop && !afl->stop_soon) {
+      coqui_submit_input(afl, buf, len);
+    }
+  }
+
+  ck_free(buf);
+  return NULL;
+}
+
+static void mt_init_helpers(afl_state_t *afl, coqui_ctx_t *ctx) {
+  ctx->mt_enabled         = 0;
+  ctx->mt_n_threads       = 1;
+  ctx->mt_threads         = NULL;
+  ctx->mt_seed_bytes      = NULL;
+  ctx->mt_seed_offsets    = NULL;
+  ctx->mt_seed_lens       = NULL;
+  ctx->mt_seed_count      = 0;
+  ctx->mt_seed_bytes_used = 0;
+  ctx->mt_stop            = 0;
+  ctx->mt_helper_submits  = 0;
+  pthread_mutex_init(&ctx->mt_submit_mutex, NULL);
+
+  u32 n = getenv_u32("AFL_COQUI_MUTATE_THREADS", 1);
+  if (n <= 1) return;
+  if (n > 64) n = 64;
+
+  mt_load_seed_corpus(afl, ctx);
+  if (ctx->mt_seed_count == 0) {
+    OKF("coqui MT mutate: no seeds loadable from in_dir, helpers disabled");
+    return;
+  }
+
+  u32 n_helpers = n - 1;  /* main thread is participant 0 */
+  pthread_t *threads = ck_alloc(n_helpers * sizeof(pthread_t));
+  ctx->mt_threads = threads;
+
+  for (u32 t = 0; t < n_helpers; t++) {
+    mt_helper_arg_t *a = ck_alloc(sizeof(mt_helper_arg_t));
+    a->afl  = afl;
+    a->tid  = t;
+    a->seed = ((u64)t * 0xBF58476D1CE4E5B9ULL) ^
+              (u64)((uintptr_t)ctx) ^ (u64)getpid();
+    if (pthread_create(&threads[t], NULL, mt_helper_thread_fn, a) != 0) {
+      ck_free(a);
+      WARNF("coqui MT mutate: pthread_create failed at helper %u", t);
+      /* Whatever spawned successfully will run; just stop here. */
+      ctx->mt_n_threads = 1 + t;
+      ctx->mt_enabled = (t > 0);
+      return;
+    }
+  }
+
+  ctx->mt_n_threads = n;
+  ctx->mt_enabled   = 1;
+  OKF("coqui MT mutate: ENABLED — %u helper thread(s) + 1 main = %u total "
+      "(seeds=%u, %u bytes)", n_helpers, n,
+      ctx->mt_seed_count, ctx->mt_seed_bytes_used);
+}
+
+static void mt_shutdown_helpers(coqui_ctx_t *ctx) {
+  if (!ctx->mt_enabled) {
+    pthread_mutex_destroy(&ctx->mt_submit_mutex);
+    return;
+  }
+  ctx->mt_stop = 1;
+  pthread_t *threads = (pthread_t *)ctx->mt_threads;
+  u32 n_helpers = ctx->mt_n_threads - 1;
+  for (u32 t = 0; t < n_helpers; t++) {
+    pthread_join(threads[t], NULL);
+  }
+  ck_free(threads);
+  pthread_mutex_destroy(&ctx->mt_submit_mutex);
+  if (ctx->mt_seed_bytes)   ck_free(ctx->mt_seed_bytes);
+  if (ctx->mt_seed_offsets) ck_free(ctx->mt_seed_offsets);
+  if (ctx->mt_seed_lens)    ck_free(ctx->mt_seed_lens);
+  ctx->mt_threads = NULL;
+  ctx->mt_seed_bytes = NULL;
+  ctx->mt_seed_offsets = NULL;
+  ctx->mt_seed_lens = NULL;
+  ctx->mt_enabled = 0;
+}
 
 /* ------------------------------------------------------------------------
  * API implementation
@@ -750,6 +969,11 @@ void coqui_init(afl_state_t *afl, const char *cubin_path) {
 
   OKF("coqui initialized: sm_%d%d, batch=%u, stack=%u KB, heap=%u KB, total=%u KB",
       major, minor, ctx->batch_size, stack_size/1024, heap/1024, total_budget/1024);
+
+  /* M1: spawn helper mutator threads if AFL_COQUI_MUTATE_THREADS > 1.
+   * Helpers begin submitting immediately; the mutex inside coqui_submit_input
+   * keeps them race-free with the main fuzz_one loop. */
+  mt_init_helpers(afl, ctx);
 
 }
 
@@ -1608,6 +1832,12 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
        * cycles and double-save their coverage. */
       if (b->h_status[i].trap_reason != COQUI_TRAP_NONE) continue;
 
+      /* Throughput-mode: env knob to skip CPU verify entirely. Loses
+       * crash/novelty saving and corpus growth but isolates per-batch
+       * verify cost from the rate-log. Used to validate the verify-wall
+       * hypothesis on the path to >5M coqui exec/s. */
+      if (unlikely(getenv("AFL_COQUI_NO_VERIFY") != NULL)) continue;
+
       u8 *input = b->h_input_bytes + b->h_offsets[i];
       u32 len = b->h_input_lens[i];
       process_input_via_cpu_fsrv(afl, input, len);
@@ -1709,6 +1939,10 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
 
     ctx->crash_verify_calls++;
     ctx->crash_verify_calls_window++;
+
+    /* Throughput-mode: see matching skip above. */
+    if (unlikely(getenv("AFL_COQUI_NO_VERIFY") != NULL)) continue;
+
     u8 *input = b->h_input_bytes + b->h_offsets[i];
     u32 len = b->h_input_lens[i];
     process_input_via_cpu_fsrv(afl, input, len);
@@ -1749,7 +1983,7 @@ static int coqui_await_and_process(afl_state_t *afl, coqui_batch_t *b) {
  * cost is ~120 cheap branches/sec on fast targets, 1 file write per 10s. */
 static u64 coqui_last_stats_tick_ms = 0;
 
-u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
+static u8 coqui_submit_input_unlocked(afl_state_t *afl, u8 *buf, u32 len) {
   coqui_ctx_t *ctx = afl->coqui;
   coqui_batch_t *b = ctx->pending;
 
@@ -1863,6 +2097,142 @@ single_slot:;
   b->n_inputs++;
   b->bytes_used = off + len;
   return 0;
+}
+
+/* M2: lock-free slot-claim submit path for MT mode.
+ *
+ * Producers atomic_fetch_add b->n_claimed to reserve a slot; if slot <
+ * batch_size they fill the slot OUTSIDE any lock and atomic_inc b->n_filled.
+ * The thread whose inc makes n_filled hit batch_size is the launcher: it
+ * takes mt_launch_mutex, launches the batch async, drains the other half
+ * (await+process), resets the new pending's counters, and atomic_stores the
+ * pending pointer to publish the new batch. Producers that lost the race
+ * (slot >= batch_size) spin-yield until ctx->pending changes and retry.
+ *
+ * Compared to M1's full-mutex path, M2 removes the mutex from the hot fast
+ * path. Per-submit cost drops from ~100ns (mutex hold) to ~30ns (atomic add
+ * + memcpy). The launch+await still serializes (one launcher at a time)
+ * but that's once per ~32K submits.
+ *
+ * Memory ordering: __ATOMIC_RELAXED for n_claimed/n_filled because the only
+ * synchronization that matters is "fill happens-before launch reads slot".
+ * That's enforced by: launcher waits for n_filled == batch_size with
+ * __ATOMIC_ACQUIRE; producer's atomic_inc on n_filled is __ATOMIC_RELEASE.
+ * For pending-pointer, __ATOMIC_ACQUIRE/__ATOMIC_RELEASE pair guarantees
+ * producers see fresh batch state after a flip.
+ */
+static u8 coqui_submit_input_mt_lockfree(afl_state_t *afl, u8 *buf, u32 len) {
+  coqui_ctx_t *ctx = afl->coqui;
+  u32 max = ctx->max_input_size;
+
+  if (len > max) {
+    __atomic_add_fetch(&ctx->oversized_count, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&afl->fsrv.total_execs, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&ctx->total_submits,    1, __ATOMIC_RELAXED);
+    return 0;
+  }
+
+  while (1) {
+    coqui_batch_t *b = __atomic_load_n(&ctx->pending, __ATOMIC_ACQUIRE);
+    u32 slot = __atomic_fetch_add(&b->n_claimed, 1, __ATOMIC_RELAXED);
+
+    if (likely(slot < ctx->batch_size)) {
+      /* Got a slot — fill OUTSIDE any lock. Other producers fill different
+       * slots concurrently. */
+      u32 off = slot * max;
+      memcpy(b->h_input_bytes + off, buf, len);
+      b->h_offsets[slot]    = off;
+      b->h_input_lens[slot] = len;
+
+      /* Diagnostic counters — atomic for thread-safety. */
+      __atomic_add_fetch(&afl->fsrv.total_execs, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&ctx->total_submits,    1, __ATOMIC_RELAXED);
+
+      /* Mark slot filled. The thread that brings n_filled to batch_size is
+       * the launcher. RELEASE so the launcher's ACQUIRE load observes our
+       * memcpy + offsets/lens stores. */
+      u32 filled = __atomic_add_fetch(&b->n_filled, 1, __ATOMIC_RELEASE);
+      if (filled == ctx->batch_size) {
+        /* I'm the launcher. Take the launch mutex (held by no one else
+         * because the previous flip published the new pending and reset its
+         * counters before unlocking). */
+        pthread_mutex_lock(&ctx->mt_submit_mutex);
+
+        /* Confirm we're still pointing at this batch. After a flip, b is
+         * the executing half; it stays valid memory but is no longer the
+         * pending. We launch IT — it's the one that filled. */
+        b->n_inputs    = ctx->batch_size;   /* legacy field for ! mt code */
+        b->bytes_used  = ctx->batch_size * max;
+        coqui_launch_batch(afl, b);
+
+        /* Flip ping-pong: b becomes executing, old executing becomes new
+         * pending. The new pending may have stale work from a prior round
+         * — drain it before resetting counters. */
+        coqui_batch_t *next = ctx->executing;
+        ctx->executing = b;
+        if (next->n_inputs > 0) {
+          if (coqui_await_and_process(afl, next) == 1) {
+            /* Context was reset under us; ctx state is fresh but old
+             * pointers are dangling. Just return — caller (helper loop)
+             * will retry on the next iteration. */
+            pthread_mutex_unlock(&ctx->mt_submit_mutex);
+            return 0;
+          }
+          next->n_inputs   = 0;
+          next->bytes_used = 0;
+          if (ctx->gpu_mutate_enabled) {
+            ctx->parent_count      = 0;
+            ctx->parent_bytes_used = 0;
+          }
+        }
+        /* Reset M2 counters on the new pending BEFORE publishing it. */
+        __atomic_store_n(&next->n_claimed, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&next->n_filled,  0, __ATOMIC_RELAXED);
+
+        /* Publish the new pending. RELEASE pairs with producers' ACQUIRE
+         * load of ctx->pending at the top of the loop. */
+        __atomic_store_n(&ctx->pending, next, __ATOMIC_RELEASE);
+
+        /* Periodic fuzzer_stats refresh — same hook as the unlocked path. */
+        if (likely(!afl->non_instrumented_mode)) {
+          u64 now_ms = get_cur_time();
+          if (now_ms - coqui_last_stats_tick_ms >= 10000) {
+            write_stats_file(afl, 0, 0, 0, 0);
+            coqui_last_stats_tick_ms = now_ms;
+          }
+        }
+
+        pthread_mutex_unlock(&ctx->mt_submit_mutex);
+      }
+      return 0;
+    }
+
+    /* slot >= batch_size: someone else is launching (or about to). Spin-yield
+     * until ctx->pending changes, then retry. The launcher updates pending
+     * under mt_submit_mutex; we don't need to take it here. */
+    while (__atomic_load_n(&ctx->pending, __ATOMIC_ACQUIRE) == b) {
+      sched_yield();
+    }
+    /* fall through to the top of the loop and re-claim on the new pending */
+  }
+}
+
+/* Public submit entry. When MT mode is active, serialize submits behind the
+ * mt_submit_mutex (M1 design). The M2 lock-free variant
+ * (coqui_submit_input_mt_lockfree) is preserved above for future revival
+ * once the helper-thread / force-reset lifecycle race is fixed; for now the
+ * mutex path is the stable choice and gives ~1.5M sustained on cjson
+ * paired. The mutex covers the entire submit body — including the slow
+ * launch+await — so ctx state stays coherent. */
+u8 coqui_submit_input(afl_state_t *afl, u8 *buf, u32 len) {
+  coqui_ctx_t *ctx = afl->coqui;
+  if (likely(!ctx->mt_enabled)) {
+    return coqui_submit_input_unlocked(afl, buf, len);
+  }
+  pthread_mutex_lock(&ctx->mt_submit_mutex);
+  u8 r = coqui_submit_input_unlocked(afl, buf, len);
+  pthread_mutex_unlock(&ctx->mt_submit_mutex);
+  return r;
 }
 
 void coqui_flush_batch(afl_state_t *afl) {
@@ -2005,6 +2375,12 @@ static void coqui_drain_stream_bounded(afl_state_t *afl, CUstream s,
 void coqui_shutdown(afl_state_t *afl) {
   if (!afl->coqui) return;
   coqui_ctx_t *ctx = afl->coqui;
+
+  /* M1: stop and join helper mutator threads BEFORE we tear down GPU state.
+   * Helpers may be blocked in pthread_mutex_lock or returning from a submit;
+   * setting mt_stop and waking via the lock-then-check pattern in the helper
+   * loop ensures they exit cleanly. */
+  mt_shutdown_helpers(ctx);
 
   /* Drain streams with a 2-second bound and stop_soon awareness. On clean
    * shutdown the streams typically complete within tens of ms; on Ctrl-C

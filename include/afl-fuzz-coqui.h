@@ -12,6 +12,7 @@
 #define _HAVE_AFL_FUZZ_COQUI_H
 
 #include <sys/time.h>
+#include <pthread.h>
 
 #include "types.h"
 #include "forkserver.h"
@@ -90,9 +91,17 @@ typedef struct coqui_batch {
   void *stream;
   void *completion_event;
 
-  /* Fill state. */
-  u32 n_inputs;    /* slots used so far */
+  /* Fill state. n_inputs is the legacy plain counter used by the single-
+   * thread / launch path. n_claimed and n_filled are the M2 lock-free
+   * counters used when mt_enabled — producers atomic_fetch_add n_claimed to
+   * pick a slot, then atomic_inc n_filled after the memcpy. The launcher
+   * (whoever sees n_filled reach batch_size after their inc) flips. The
+   * legacy n_inputs is set to batch_size by the launcher just before
+   * coqui_launch_batch so the rest of the host code is unchanged. */
+  u32 n_inputs;    /* slots used so far (legacy / single-thread path) */
   u32 bytes_used;  /* bytes consumed in h_input_bytes (unaligned cursor) */
+  u32 n_claimed;   /* M2 atomic: slots reserved by atomic_fetch_add */
+  u32 n_filled;    /* M2 atomic: slots whose memcpy completed */
 
   /* Adaptive batch-timeout (B1): wall-clock timestamp at cuEventRecord. Used
    * by coqui_await_and_process to compute healthy-batch latency. Per-batch
@@ -329,6 +338,27 @@ typedef struct coqui_ctx {
   unsigned long long  d_a_extras_cnt;      /* CUdeviceptr — __coqui_a_extras_cnt */
   u32                 last_extras_cnt;     /* cached: last synced extras_cnt */
   u32                 last_a_extras_cnt;   /* cached: last synced a_extras_cnt */
+
+  /* Multi-thread CPU mutation fan-in (M1).
+   *
+   * When AFL_COQUI_MUTATE_THREADS=N (N>1), N-1 helper pthreads run a simple
+   * havoc-style mutation loop in parallel with the main fuzz_one loop, all
+   * submitting into this same ctx via `coqui_submit_input`. The submit
+   * fast-path is serialized by `mt_submit_mutex`. Helpers do not touch the
+   * AFL queue or bitmap; they mutate from a snapshot of the seed corpus
+   * grabbed at init. The main thread continues to own corpus growth, queue
+   * mutation, and CPU verify of novelty. */
+  u8                  mt_enabled;          /* 1 if helper threads spawned */
+  u32                 mt_n_threads;        /* total participants incl. main */
+  pthread_mutex_t     mt_submit_mutex;     /* serializes coqui_submit_input */
+  void               *mt_threads;          /* pthread_t[] for helpers */
+  u8                 *mt_seed_bytes;       /* pinned snapshot of seed corpus */
+  u32                *mt_seed_offsets;
+  u32                *mt_seed_lens;
+  u32                 mt_seed_count;
+  u32                 mt_seed_bytes_used;
+  volatile u8         mt_stop;             /* signals helpers to exit */
+  u64                 mt_helper_submits;   /* diagnostic — submits from helpers */
 } coqui_ctx_t;
 
 /* Per-thread trace stripe geometry. Must match
